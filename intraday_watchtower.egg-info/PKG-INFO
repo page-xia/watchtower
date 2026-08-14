@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: intraday-watchtower
+Version: 0.1.0
+Summary: Local intraday A-share watchboard for sector strength, core stock attacks, and T+0 decision signals.
+Requires-Python: >=3.10
+Requires-Dist: fastapi>=0.111
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: pydantic>=2.7
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: httpx>=0.27
+Requires-Dist: easy-tdx>=1.20.6
+Provides-Extra: dev
+Requires-Dist: playwright>=1.50; extra == "dev"
+Requires-Dist: pytest>=8.2; extra == "dev"

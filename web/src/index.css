@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* 专业盯盘终端 · 深夜主题（A股惯例：红涨绿跌） */
+    --background: 222 30% 5%;
+    --foreground: 220 15% 90%;
+    --card: 222 26% 7.5%;
+    --card-foreground: 220 15% 90%;
+    --popover: 222 28% 8%;
+    --popover-foreground: 220 15% 90%;
+    --primary: 210 90% 55%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 18% 14%;
+    --secondary-foreground: 220 15% 85%;
+    --muted: 220 16% 12%;
+    --muted-foreground: 220 10% 52%;
+    --accent: 220 18% 16%;
+    --accent-foreground: 220 15% 92%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 220 15% 15%;
+    --input: 220 15% 18%;
+    --ring: 210 90% 55%;
+    --radius: 0.5rem;
+
+    /* 行情语义色 */
+    --up: 354 88% 58%;          /* 涨 / 买入 · 红 */
+    --up-dim: 354 60% 22%;
+    --down: 152 76% 42%;        /* 跌 / 卖出 · 绿 */
+    --down-dim: 152 50% 16%;
+    --flat: 220 10% 55%;
+    --gold: 40 95% 55%;         /* 重点 / 龙头 */
+    --cyan: 187 85% 53%;
+
+    --sidebar-background: 222 26% 7%;
+    --sidebar-foreground: 220 15% 88%;
+    --sidebar-primary: 210 90% 55%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 18% 14%;
+    --sidebar-accent-foreground: 220 15% 88%;
+    --sidebar-border: 220 15% 14%;
+    --sidebar-ring: 210 90% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "tnum" 1, "cv03" 1;
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: hsl(220 15% 20%); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: hsl(220 15% 28%); }
+  ::-webkit-scrollbar-track { background: transparent; }
+}
+
+@layer utilities {
+  .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+  .panel-title { @apply text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground; }
+  .terminal-panel { @apply rounded-lg border border-border bg-card; }
+}

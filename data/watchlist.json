@@ -1,0 +1,72 @@
+[
+  {
+    "code": "300209",
+    "name": "行云科技",
+    "themes": [
+      "X250602"
+    ],
+    "core": false,
+    "position": false,
+    "notes": ""
+  },
+  {
+    "code": "600206",
+    "name": "有研新材",
+    "themes": [
+      "X400101"
+    ],
+    "core": false,
+    "position": false,
+    "notes": ""
+  },
+  {
+    "code": "603629",
+    "name": "利通电子",
+    "themes": [],
+    "core": false,
+    "position": false,
+    "notes": ""
+  },
+  {
+    "code": "301520",
+    "name": "万邦医药",
+    "themes": [
+      "X270402"
+    ],
+    "core": false,
+    "position": false,
+    "notes": ""
+  },
+  {
+    "code": "000938",
+    "name": "紫光股份",
+    "themes": [],
+    "core": false,
+    "position": false,
+    "notes": ""
+  },
+  {
+    "code": "300938",
+    "name": "信测标准",
+    "themes": [],
+    "core": false,
+    "position": false,
+    "notes": ""
+  },
+  {
+    "code": "600667",
+    "name": "太极实业",
+    "themes": [],
+    "core": false,
+    "position": false,
+    "notes": ""
+  },
+  {
+    "code": "603259",
+    "name": "药明康德",
+    "themes": [],
+    "core": false,
+    "position": false,
+    "notes": ""
+  }
+]
