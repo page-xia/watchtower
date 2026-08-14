@@ -1,0 +1,19 @@
+# Copy this file to ts2db_config.yaml for local secrets.
+# AppSettings reads ts2db_config.yaml by default, or WATCH_CONFIG_FILE if set.
+
+# Tushare / EOD ingest
+tushare_token: ""
+
+# Optional AI providers. The first non-empty provider wins.
+cf_base_url: ""
+cf_key: ""
+cf_model_id: ""
+deepseek-key: ""
+zhipu_key: ""
+bailian_key: ""
+huoshan_key: ""
+
+# Optional message ingest token
+news_api_key: ""
+message_ingest_token: ""
+watch_ingest_token: ""
