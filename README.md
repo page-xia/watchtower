@@ -76,7 +76,7 @@ WATCH_OPENING_WINDOW_ENGINE=1
 WATCH_PERSISTENCE_BACKEND=cloudbase_nosql
 WATCH_CLOUDBASE_ENV_ID=server-d2g7x597t019f5cb0
 WATCH_CLOUDBASE_STATE_COLLECTION=watchtower_state
-WATCH_DARK_POOL=0
+WATCH_DARK_POOL=1
 ```
 
 需要在 CloudBase 控制台准备 NoSQL 集合 `watchtower_state`，并在云托管服务环境变量里配置服务端 token：
@@ -92,7 +92,7 @@ WATCH_CLOUDBASE_DATABASE_INSTANCE=(default)
 WATCH_CLOUDBASE_DATABASE_NAME=(default)
 ```
 
-云端会保存自选股、持仓、最新 dashboard 快照和开盘窗口菱形标记。容器重启后，服务优先从 NoSQL 恢复这些状态；服务保持活跃时，后台采集器会继续按行情源重新构建本地轨迹缓存。若希望减少冷启动和空档，CloudRun 建议设置最小实例数 `MinNum=1`；如果为了省成本设为 `0`，冷启动后仍能从 NoSQL 恢复轻量状态，但运行期 SQLite 缓存需要重新采集。
+云端会保存自选股、持仓、最新 dashboard 快照、官方板块成员缓存和开盘窗口菱形标记。容器重启后，服务优先从 NoSQL 恢复这些状态；服务保持活跃时，后台采集器会继续按行情源重新构建本地轨迹缓存。暗盘资金开启后只在独立慢循环里读取有界股票池，不进入 5 秒全市场刷新链路。若希望减少冷启动和空档，CloudRun 建议设置最小实例数 `MinNum=1`；如果为了省成本设为 `0`，冷启动后仍能从 NoSQL 恢复轻量状态，但运行期 SQLite 缓存需要重新采集。
 
 ## 竞价与盘口能力
 
@@ -195,6 +195,20 @@ GET /api/messages/status
 
 `G:\\ai\\lh\\zsxq` 的每日 08:00 `message-cache-sync-daemon` 已支持在上游同步成功后自动调用这个推送脚本。调度器从 `WATCH_INGEST_TOKEN`、`WATCH_TARGET_URL`、`WATCH_PUSH_SCRIPT` 和 `WATCH_PUSH_PYTHON` 读取连接信息；token 不写入 Windows 计划任务命令或同步日志。若未配置 token，调度记录会明确显示“未配置 WATCH_INGEST_TOKEN”，不会误报已经推送。
 
+## `ts2db_config.yaml` 说明
+
+建议先复制 `ts2db_config.example.yaml` 再按需填写。这个文件不是核心看板的必需项；不配置时，网页看板和行情读取仍可运行，只是 AI 分析、Tushare 收盘落库和消息 ingest 相关能力不可用。
+
+| 字段 | 必要性 | 说明 |
+| --- | --- | --- |
+| `tushare_token` | 必需（仅 `scripts/ingest_eod_tushare.py`） | 拉取 Tushare 收盘 EOD 数据。 |
+| `cf_base_url` + `cf_key` | 需要成组配置，二选一即可 | CloudBase AI 代理。`cf_model_id` 可选。 |
+| `deepseek-key` / `zhipu_key` / `bailian_key` / `huoshan_key` | 至少填一组即可 | 选择一个直连 AI 提供方。 |
+| `message_ingest_token` / `watch_ingest_token` | 可选 | 消息推送备用配置；生产更建议用 `WATCH_INGEST_TOKEN` 环境变量。 |
+| `news_api_key` | 可选 / 预留 | 当前只用于状态展示，主功能不依赖。 |
+
+如果这些 AI 提供方都不填，AI 分析接口会保持不可用，但主看板不受影响。
+
 ## 关键文件
 
 - `data/watchlist.json`：网页自选股持久化文件；默认不参与全市场股票板扫描。
@@ -203,7 +217,8 @@ GET /api/messages/status
 - `data/runtime/watchtower_messages.sqlite`：盯盘系统自己的消息库，由 ingest API 写入。
 - `data/runtime/auction_snapshots.jsonl`：交易日内可行动竞价候选的采样轨迹。
 - `data/runtime/opening_decisions.jsonl`：盘中保存的真实开盘检查点快照，供收盘后复盘。
-- `ts2db_config.yaml`：本地密钥配置，仅后端读取。
+- `ts2db_config.example.yaml`：空模板，复制成 `ts2db_config.yaml` 后再填写。
+- `ts2db_config.yaml`：本地密钥配置，仅在对应功能启用时需要；具体必需/可选项见上文。
 
 ## 验证
 
