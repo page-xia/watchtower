@@ -2,6 +2,7 @@ import { useCallback, useMemo } from "react"
 import type { EChartsOption } from "echarts"
 import { useECharts } from "@/hooks/useECharts"
 import { pctClass, fmtPct } from "@/lib/format"
+import { chartPalette, useTheme } from "@/lib/theme"
 import { cn } from "@/lib/utils"
 
 export interface SectorFlowSeriesData {
@@ -28,9 +29,6 @@ function sectorColor(name: string): string {
   return `hsl(${hue} 82% 58%)`
 }
 
-const GRID = "hsl(220 15% 14%)"
-const AXIS = "hsl(220 10% 45%)"
-
 /** 板块资金动能走势：顶层板块的分钟级动能曲线。点击曲线/末端标签/底部图例联动「板块强弱」 */
 export function SectorFlowChart({
   series,
@@ -43,6 +41,8 @@ export function SectorFlowChart({
 }) {
   const usable = (series ?? []).filter((s) => (s.points ?? []).length >= 2)
   const hasSelected = selected != null && usable.some((s) => s.name === selected)
+  const theme = useTheme()
+  const pal = useMemo(() => chartPalette(theme), [theme])
 
   // 后端推送的是「每分钟净流入」差分值（零轴附近噪声大，十条线堆在一起看不出强弱）。
   // 图上重积分为累计动能曲线：强者持续上行、弱者下行，分化一目了然。
@@ -75,22 +75,22 @@ export function SectorFlowChart({
       tooltip: {
         trigger: "axis",
         confine: true,
-        backgroundColor: "hsl(222 28% 9%)",
-        borderColor: "hsl(220 15% 20%)",
-        textStyle: { color: "hsl(220 15% 85%)", fontSize: 10 },
+        backgroundColor: pal.tooltipBg,
+        borderColor: pal.tooltipBorder,
+        textStyle: { color: pal.tooltipText, fontSize: 10 },
       },
       xAxis: {
         type: "category",
         data: times,
-        axisLine: { lineStyle: { color: GRID } },
+        axisLine: { lineStyle: { color: pal.grid } },
         axisTick: { show: false },
-        axisLabel: { color: AXIS, fontSize: 9, interval: Math.ceil(times.length / 5) },
+        axisLabel: { color: pal.axis, fontSize: 9, interval: Math.ceil(times.length / 5) },
         splitLine: { show: false },
       },
       yAxis: {
         scale: true,
-        axisLabel: { color: AXIS, fontSize: 9 },
-        splitLine: { lineStyle: { color: GRID, type: "dashed" } },
+        axisLabel: { color: pal.axis, fontSize: 9 },
+        splitLine: { lineStyle: { color: pal.grid, type: "dashed" } },
       },
       series: cumulative.map((s, i) => ({
         name: s.name,
@@ -120,7 +120,7 @@ export function SectorFlowChart({
                 silent: true,
                 symbol: "none",
                 label: { show: false },
-                lineStyle: { color: "hsl(220 10% 30%)", type: "dashed", width: 1 },
+                lineStyle: { color: pal.markLine, type: "dashed", width: 1 },
                 data: [{ yAxis: 0 }],
               }
             : undefined,
@@ -128,7 +128,7 @@ export function SectorFlowChart({
         emphasis: { disabled: true },
       })),
     }
-  }, [cumulative, hasSelected, selected])
+  }, [cumulative, hasSelected, selected, pal])
 
   // 点击曲线 → 联动板块强弱切换；再点同一板块取消
   const handleClick = useCallback(

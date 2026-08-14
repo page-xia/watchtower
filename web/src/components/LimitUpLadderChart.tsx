@@ -2,11 +2,7 @@ import { useCallback, useMemo } from "react"
 import type { EChartsOption } from "echarts"
 import { useECharts } from "@/hooks/useECharts"
 import type { SectorRank } from "@/types/api"
-
-const GRID = "hsl(220 15% 14%)"
-const AXIS = "hsl(220 10% 45%)"
-const UP = "hsl(354 88% 58%)"
-const GOLD = "hsl(40 95% 55%)"
+import { chartPalette, useTheme } from "@/lib/theme"
 
 interface LimitUpLadderChartProps {
   sectors: SectorRank[]
@@ -30,6 +26,8 @@ export function LimitUpLadderChart({ sectors, selected = null, onSelect }: Limit
     [sectors],
   )
   const hasSelected = selected != null && ranked.some((s) => s.name === selected)
+  const theme = useTheme()
+  const pal = useMemo(() => chartPalette(theme), [theme])
 
   const option = useMemo<EChartsOption | null>(() => {
     if (!ranked.length) return null
@@ -44,9 +42,9 @@ export function LimitUpLadderChart({ sectors, selected = null, onSelect }: Limit
       grid: { left: 4, right: 34, top: 4, bottom: 4, containLabel: true },
       tooltip: {
         trigger: "item",
-        backgroundColor: "hsl(222 28% 9%)",
-        borderColor: "hsl(220 15% 20%)",
-        textStyle: { color: "hsl(220 15% 85%)", fontSize: 10 },
+        backgroundColor: pal.tooltipBg,
+        borderColor: pal.tooltipBorder,
+        textStyle: { color: pal.tooltipText, fontSize: 10 },
         formatter: (p: unknown) => {
           const s = ranked[(p as { dataIndex?: number }).dataIndex ?? 0]
           if (!s) return ""
@@ -66,9 +64,9 @@ export function LimitUpLadderChart({ sectors, selected = null, onSelect }: Limit
         data: ranked.map((s) => s.name),
         // 让板块名标签也能触发点击事件，联动板块强弱
         triggerEvent: true,
-        axisLine: { lineStyle: { color: GRID } },
+        axisLine: { lineStyle: { color: pal.grid } },
         axisTick: { show: false },
-        axisLabel: { color: "hsl(220 15% 75%)", fontSize: 10 },
+        axisLabel: { color: pal.axisStrong, fontSize: 10 },
       },
       series: [
         {
@@ -76,7 +74,7 @@ export function LimitUpLadderChart({ sectors, selected = null, onSelect }: Limit
           type: "bar" as const,
           stack: "limit",
           data: ranked.map((s) => ({ value: s.limit_up_count, itemStyle: dim(s.name) })),
-          itemStyle: { color: UP, borderRadius: [0, 0, 0, 0] },
+          itemStyle: { color: pal.up, borderRadius: [0, 0, 0, 0] },
           // 禁用悬停高亮态：当前 ECharts 版本 emphasis 重绘会丢柱子填充色（悬浮变透明）
           emphasis: { disabled: true },
           barWidth: "58%",
@@ -93,13 +91,13 @@ export function LimitUpLadderChart({ sectors, selected = null, onSelect }: Limit
           type: "bar" as const,
           stack: "limit",
           data: ranked.map((s) => ({ value: s.opened_limit_count, itemStyle: dim(s.name) })),
-          itemStyle: { color: GOLD, borderRadius: [0, 2, 2, 0] },
+          itemStyle: { color: pal.gold, borderRadius: [0, 2, 2, 0] },
           emphasis: { disabled: true },
           label: {
             show: true,
             position: "right" as const,
             fontSize: 9,
-            color: AXIS,
+            color: pal.axis,
             formatter: (p: { dataIndex?: number }) => {
               const s = ranked[p.dataIndex ?? 0]
               return s ? `${s.limit_up_count}+${s.opened_limit_count}` : ""
@@ -108,7 +106,7 @@ export function LimitUpLadderChart({ sectors, selected = null, onSelect }: Limit
         },
       ],
     }
-  }, [ranked, hasSelected, selected])
+  }, [ranked, hasSelected, selected, pal])
 
   // 点击柱子（series）或板块名（yAxis）→ 联动板块强弱切换；再点同一板块取消
   const handleClick = useCallback(

@@ -4,6 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>日内盯盘终端</title>
+    <script>
+      try {
+        if (localStorage.getItem("terminal-theme") === "light") document.documentElement.classList.add("light")
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

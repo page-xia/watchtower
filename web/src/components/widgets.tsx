@@ -1,6 +1,7 @@
 import { memo } from "react"
 import { cn } from "@/lib/utils"
 import { signalTone, TONE_STYLES, pctClass, fmtPct } from "@/lib/format"
+import { chartPalette, useTheme } from "@/lib/theme"
 import type { MiniChart } from "@/types/api"
 
 /** 信号徽章：买T 红 / 减T卖T 绿 / 观察 金 */
@@ -29,6 +30,8 @@ export const Sparkline = memo(function Sparkline({
   width?: number
   height?: number
 }) {
+  const theme = useTheme()
+  const pal = chartPalette(theme)
   if (!mini || !mini.price_pcts || mini.price_pcts.length < 2) {
     return <div style={{ width, height }} className="flex items-center justify-center text-[10px] text-muted-foreground/50">无分时</div>
   }
@@ -60,7 +63,7 @@ export const Sparkline = memo(function Sparkline({
   const y = (v: number) => height - 2 - ((v - min) / span) * (height - 4)
   const line = pts.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ")
   const up = (mini.latest_change_pct ?? pts[pts.length - 1]) >= 0
-  const stroke = up ? "hsl(354 88% 58%)" : "hsl(152 76% 42%)"
+  const stroke = up ? pal.up : pal.down
   const zeroY = y(0)
   const areaPts = `1,${zeroY.toFixed(1)} ${line} ${(width - 1).toFixed(1)},${zeroY.toFixed(1)}`
   const vwapLine = vwaps.length === pts.length ? vwaps.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ") : null
@@ -73,9 +76,9 @@ export const Sparkline = memo(function Sparkline({
           <stop offset="100%" stopColor={stroke} stopOpacity="0.02" />
         </linearGradient>
       </defs>
-      <line x1="0" y1={zeroY} x2={width} y2={zeroY} stroke="hsl(220 15% 25%)" strokeDasharray="2 3" strokeWidth="0.6" />
+      <line x1="0" y1={zeroY} x2={width} y2={zeroY} stroke={pal.zeroLine} strokeDasharray="2 3" strokeWidth="0.6" />
       <polygon points={areaPts} fill={`url(#${gid})`} stroke="none" />
-      {vwapLine && <polyline points={vwapLine} fill="none" stroke="hsl(40 95% 55% / 0.55)" strokeWidth="0.8" strokeDasharray="2 2" />}
+      {vwapLine && <polyline points={vwapLine} fill="none" stroke={pal.goldA(0.55)} strokeWidth="0.8" strokeDasharray="2 2" />}
       <polyline points={line} fill="none" stroke={stroke} strokeWidth="1.2" strokeLinejoin="round" strokeLinecap="round" />
     </svg>
   )

@@ -44,6 +44,47 @@
     --sidebar-border: 220 15% 14%;
     --sidebar-ring: 210 90% 55%;
   }
+
+  /* 白天主题：在 <html> 上加 .light 即切换（默认 :root 为深夜主题） */
+  :root.light {
+    --background: 220 20% 97%;
+    --foreground: 222 30% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 30% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 30% 12%;
+    --primary: 210 90% 44%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 16% 92%;
+    --secondary-foreground: 222 25% 18%;
+    --muted: 220 16% 93%;
+    --muted-foreground: 220 10% 42%;
+    --accent: 220 16% 90%;
+    --accent-foreground: 222 25% 15%;
+    --destructive: 0 72% 45%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 220 14% 85%;
+    --input: 220 14% 82%;
+    --ring: 210 90% 44%;
+
+    /* 行情语义色：白底上压深一档保证对比度 */
+    --up: 354 78% 46%;           /* 涨 / 买入 · 红 */
+    --up-dim: 354 70% 92%;
+    --down: 152 70% 30%;         /* 跌 / 卖出 · 绿 */
+    --down-dim: 152 45% 90%;
+    --flat: 220 10% 45%;
+    --gold: 38 92% 40%;          /* 重点 / 龙头 */
+    --cyan: 187 85% 34%;
+
+    --sidebar-background: 220 18% 95%;
+    --sidebar-foreground: 222 30% 14%;
+    --sidebar-primary: 210 90% 44%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 16% 90%;
+    --sidebar-accent-foreground: 222 25% 15%;
+    --sidebar-border: 220 14% 85%;
+    --sidebar-ring: 210 90% 44%;
+  }
 }
 
 @layer base {
@@ -55,8 +96,8 @@
     font-feature-settings: "tnum" 1, "cv03" 1;
   }
   ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-thumb { background: hsl(220 15% 20%); border-radius: 4px; }
-  ::-webkit-scrollbar-thumb:hover { background: hsl(220 15% 28%); }
+  ::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground) / 0.5); }
   ::-webkit-scrollbar-track { background: transparent; }
 }
 

@@ -3,11 +3,10 @@ import type { EChartsOption } from "echarts"
 import { useECharts } from "@/hooks/useECharts"
 import type { IndexMinutesResponse } from "@/types/api"
 import { fmtPct, pctClass } from "@/lib/format"
+import { chartPalette, useTheme } from "@/lib/theme"
 import { cn } from "@/lib/utils"
 
 const COLORS = ["hsl(40 95% 55%)", "hsl(187 85% 53%)", "hsl(320 70% 62%)", "hsl(265 80% 65%)"]
-const GRID = "hsl(220 15% 14%)"
-const AXIS = "hsl(220 10% 45%)"
 
 /**
  * 指数共振图：三指数分钟涨跌幅叠加。
@@ -15,6 +14,8 @@ const AXIS = "hsl(220 10% 45%)"
  */
 export function IndexResonanceChart({ data }: { data: IndexMinutesResponse | null }) {
   const usable = (data?.indices ?? []).filter((s) => s.points.length >= 2)
+  const theme = useTheme()
+  const pal = useMemo(() => chartPalette(theme), [theme])
 
   const option = useMemo<EChartsOption | null>(() => {
     if (!usable.length) return null
@@ -28,23 +29,23 @@ export function IndexResonanceChart({ data }: { data: IndexMinutesResponse | nul
       grid: { left: 38, right: 10, top: 10, bottom: 20 },
       tooltip: {
         trigger: "axis",
-        backgroundColor: "hsl(222 28% 9%)",
-        borderColor: "hsl(220 15% 20%)",
-        textStyle: { color: "hsl(220 15% 85%)", fontSize: 10 },
+        backgroundColor: pal.tooltipBg,
+        borderColor: pal.tooltipBorder,
+        textStyle: { color: pal.tooltipText, fontSize: 10 },
         valueFormatter: (v: unknown) => (typeof v === "number" ? `${v > 0 ? "+" : ""}${v.toFixed(2)}%` : "--"),
       },
       xAxis: {
         type: "category",
         data: times,
-        axisLine: { lineStyle: { color: GRID } },
+        axisLine: { lineStyle: { color: pal.grid } },
         axisTick: { show: false },
-        axisLabel: { color: AXIS, fontSize: 9, interval: Math.ceil(times.length / 6) },
+        axisLabel: { color: pal.axis, fontSize: 9, interval: Math.ceil(times.length / 6) },
         splitLine: { show: false },
       },
       yAxis: {
         scale: true,
-        axisLabel: { color: AXIS, fontSize: 9, formatter: (v: number) => `${v.toFixed(1)}%` },
-        splitLine: { lineStyle: { color: GRID, type: "dashed" } },
+        axisLabel: { color: pal.axis, fontSize: 9, formatter: (v: number) => `${v.toFixed(1)}%` },
+        splitLine: { lineStyle: { color: pal.grid, type: "dashed" } },
       },
       series: usable.map((s, i) => ({
         name: s.name,
@@ -61,13 +62,13 @@ export function IndexResonanceChart({ data }: { data: IndexMinutesResponse | nul
                 silent: true,
                 symbol: "none",
                 label: { show: false },
-                lineStyle: { color: "hsl(220 10% 38%)", type: "solid" as const, width: 1 },
+                lineStyle: { color: pal.markLine, type: "solid" as const, width: 1 },
                 data: [{ yAxis: 0 }],
               }
             : undefined,
       })),
     }
-  }, [usable])
+  }, [usable, pal])
 
   const ref = useECharts(option)
   const turning = data?.index_turning

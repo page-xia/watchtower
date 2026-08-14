@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react"
-import { RefreshCw, Radio, Snowflake } from "lucide-react"
+import { RefreshCw, Radio, Snowflake, Sun, Moon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { StatusDot } from "@/components/widgets"
 import { SearchBox } from "@/components/SearchBox"
+import { useTheme, toggleTheme } from "@/lib/theme"
 import { cn } from "@/lib/utils"
 
 interface TopBarProps {
@@ -26,6 +27,7 @@ const DATA_MODE_LABEL: Record<string, string> = {
 
 export function TopBar({ connected, updatedAt, dataMode, frozen, decisionStage, onRefresh, refreshing, onOpenDetail, watchlistCodes = [] }: TopBarProps) {
   const [clock, setClock] = useState("")
+  const theme = useTheme()
   useEffect(() => {
     const tick = () => {
       const d = new Date()
@@ -83,6 +85,16 @@ export function TopBar({ connected, updatedAt, dataMode, frozen, decisionStage, 
       <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={onRefresh} disabled={refreshing}>
         <RefreshCw className={cn("h-3 w-3", refreshing && "animate-spin")} />
         刷新
+      </Button>
+
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-7 w-7 px-0"
+        onClick={toggleTheme}
+        title={theme === "dark" ? "切换到白天模式" : "切换到夜晚模式"}
+      >
+        {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
       </Button>
     </header>
   )

@@ -1,10 +1,13 @@
 import { TrendingUp, TrendingDown, Flame, Zap } from "lucide-react"
 import type { MarketState, IndexQuote, IndexMinutesResponse } from "@/types/api"
 import { fmtAmount, fmtPct, fmtPrice, pctClass } from "@/lib/format"
+import { chartPalette, useTheme } from "@/lib/theme"
 import { cn } from "@/lib/utils"
 
 /** 指数分时线 + 量柱：量柱半透明铺满走势区高度，画在走势线下面，走势线置顶 */
 function IndexMinuteLine({ points }: { points: { time: string; change_pct: number; vol?: number }[] }) {
+  const theme = useTheme()
+  const pal = chartPalette(theme)
   if (!points || points.length < 2) {
     return <div className="flex h-full items-center justify-center text-[9px] text-muted-foreground/50">分时加载中…</div>
   }
@@ -18,7 +21,7 @@ function IndexMinuteLine({ points }: { points: { time: string; change_pct: numbe
   const step = W / (values.length - 1)
   const path = values.map((v, i) => `${i === 0 ? "M" : "L"} ${(i * step).toFixed(1)} ${y(v).toFixed(1)}`).join(" ")
   const latest = values[values.length - 1]
-  const color = latest >= 0 ? "hsl(354 88% 58%)" : "hsl(152 76% 42%)"
+  const color = latest >= 0 ? pal.up : pal.down
   const zeroY = y(0)
   const vols = points.map((p) => Math.max(p.vol ?? 0, 0))
   const maxV = Math.max(...vols, 1)
@@ -38,11 +41,11 @@ function IndexMinuteLine({ points }: { points: { time: string; change_pct: numbe
             y={H - h}
             width={Math.max(bw * 0.8, 0.5)}
             height={h}
-            fill={up ? `hsl(354 88% 58% / ${alpha.toFixed(2)})` : `hsl(152 76% 42% / ${alpha.toFixed(2)})`}
+            fill={up ? pal.upA(Number(alpha.toFixed(2))) : pal.downA(Number(alpha.toFixed(2)))}
           />
         )
       })}
-      <line x1="0" y1={zeroY} x2={W} y2={zeroY} stroke="hsl(220 10% 42%)" strokeWidth="0.6" strokeDasharray="3 3" />
+      <line x1="0" y1={zeroY} x2={W} y2={zeroY} stroke={pal.axis} strokeWidth="0.6" strokeDasharray="3 3" />
       <path d={path} fill="none" stroke={color} strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
     </svg>
   )
@@ -83,6 +86,8 @@ function IndexCard({ idx, minutes }: { idx: IndexQuote; minutes?: { time: string
 
 /** 情绪分仪表（半环） */
 function EmotionGauge({ score }: { score: number }) {
+  const theme = useTheme()
+  const pal = chartPalette(theme)
   const v = Math.max(0, Math.min(100, score))
   const angle = (v / 100) * 180
   const rad = ((180 - angle) * Math.PI) / 180
@@ -95,7 +100,7 @@ function EmotionGauge({ score }: { score: number }) {
   const color = `hsl(${152 + (v / 100) * 202} 80% 55%)`
   return (
     <svg width="72" height="40" viewBox="0 0 72 40" className="block">
-      <path d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`} fill="none" stroke="hsl(220 15% 18%)" strokeWidth="5" strokeLinecap="round" />
+      <path d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`} fill="none" stroke={pal.gaugeTrack} strokeWidth="5" strokeLinecap="round" />
       <path
         d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${nx} ${ny}`}
         fill="none"
@@ -103,10 +108,10 @@ function EmotionGauge({ score }: { score: number }) {
         strokeWidth="5"
         strokeLinecap="round"
       />
-      <text x={cx} y={cy - 4} textAnchor="middle" className="fill-foreground text-[15px] font-bold" style={{ fontSize: 15, fontWeight: 700, fill: "hsl(220 15% 90%)" }}>
+      <text x={cx} y={cy - 4} textAnchor="middle" style={{ fontSize: 15, fontWeight: 700, fill: pal.textStrong }}>
         {v}
       </text>
-      <text x={cx} y={cy + 10} textAnchor="middle" style={{ fontSize: 8, fill: "hsl(220 10% 52%)" }}>
+      <text x={cx} y={cy + 10} textAnchor="middle" style={{ fontSize: 8, fill: pal.textMuted }}>
         情绪分
       </text>
     </svg>

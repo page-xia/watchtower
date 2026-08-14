@@ -3,12 +3,8 @@ import type { EChartsOption } from "echarts"
 import { useECharts } from "@/hooks/useECharts"
 import type { SectorRank } from "@/types/api"
 import { fmtPct, pctClass } from "@/lib/format"
+import { chartPalette, useTheme } from "@/lib/theme"
 import { cn } from "@/lib/utils"
-
-const GRID = "hsl(220 15% 14%)"
-const AXIS = "hsl(220 10% 45%)"
-const UP = "hsl(354 88% 58%)"
-const DOWN = "hsl(152 76% 42%)"
 
 function fmtYi(v: number): string {
   return `${v > 0 ? "+" : ""}${v.toFixed(1)}亿`
@@ -35,6 +31,8 @@ export function SectorNetInflowChart({ sectors, selected = null, onSelect }: Sec
     return [...inflow, ...outflow.reverse()].reverse()
   }, [sectors])
   const hasSelected = selected != null && ranked.some((s) => s.name === selected)
+  const theme = useTheme()
+  const pal = useMemo(() => chartPalette(theme), [theme])
 
   const option = useMemo<EChartsOption | null>(() => {
     if (!ranked.length) return null
@@ -47,9 +45,9 @@ export function SectorNetInflowChart({ sectors, selected = null, onSelect }: Sec
       grid: { left: 4, right: 46, top: 4, bottom: 4, containLabel: true },
       tooltip: {
         trigger: "item",
-        backgroundColor: "hsl(222 28% 9%)",
-        borderColor: "hsl(220 15% 20%)",
-        textStyle: { color: "hsl(220 15% 85%)", fontSize: 10 },
+        backgroundColor: pal.tooltipBg,
+        borderColor: pal.tooltipBorder,
+        textStyle: { color: pal.tooltipText, fontSize: 10 },
         formatter: (p: unknown) => {
           const s = ranked[(p as { dataIndex?: number }).dataIndex ?? 0]
           if (!s) return ""
@@ -67,9 +65,9 @@ export function SectorNetInflowChart({ sectors, selected = null, onSelect }: Sec
         data: ranked.map((s) => s.name),
         // 让板块名标签也能触发点击事件，联动板块强弱
         triggerEvent: true,
-        axisLine: { lineStyle: { color: GRID } },
+        axisLine: { lineStyle: { color: pal.grid } },
         axisTick: { show: false },
-        axisLabel: { color: "hsl(220 15% 75%)", fontSize: 10 },
+        axisLabel: { color: pal.axisStrong, fontSize: 10 },
       },
       series: [
         {
@@ -77,7 +75,7 @@ export function SectorNetInflowChart({ sectors, selected = null, onSelect }: Sec
           data: ranked.map((s) => ({
             value: s.flow_delta,
             itemStyle: {
-              color: s.flow_delta >= 0 ? UP : DOWN,
+              color: s.flow_delta >= 0 ? pal.up : pal.down,
               borderRadius: 2,
               // 选中联动：未选中的板块降透明度，选中的保持高亮
               ...(hasSelected && s.name !== selected ? { opacity: 0.3 } : null),
@@ -90,13 +88,13 @@ export function SectorNetInflowChart({ sectors, selected = null, onSelect }: Sec
             show: true,
             position: "right" as const,
             fontSize: 9,
-            color: AXIS,
+            color: pal.axis,
             formatter: (p: { value?: unknown }) => (typeof p.value === "number" ? fmtYi(p.value) : ""),
           },
         },
       ],
     }
-  }, [ranked, hasSelected, selected])
+  }, [ranked, hasSelected, selected, pal])
 
   // 点击柱子（series）或板块名（yAxis）→ 联动板块强弱切换；再点同一板块取消
   const handleClick = useCallback(
