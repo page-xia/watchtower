@@ -45,6 +45,8 @@ def test_app_settings_reads_cloudbase_persistence_environment(monkeypatch) -> No
     monkeypatch.setenv("WATCH_CLOUDBASE_ENV_ID", "server-d2g7x597t019f5cb0")
     monkeypatch.setenv("WATCH_CLOUDBASE_API_TOKEN", "token")
     monkeypatch.setenv("WATCH_CLOUDBASE_STATE_COLLECTION", "custom_state")
+    monkeypatch.setenv("WATCH_CLOUDBASE_MYSQL_INSTANCE", "default")
+    monkeypatch.setenv("WATCH_CLOUDBASE_MYSQL_SCHEMA", "server-d2g7x597t019f5cb0")
 
     settings = AppSettings()
 
@@ -52,7 +54,12 @@ def test_app_settings_reads_cloudbase_persistence_environment(monkeypatch) -> No
     assert settings.cloudbase_env_id == "server-d2g7x597t019f5cb0"
     assert settings.cloudbase_api_token == "token"
     assert settings.cloudbase_state_collection == "custom_state"
+    assert settings.message_store_backend == "cloudbase_mysql"
+    assert settings.cloudbase_mysql_instance == "default"
+    assert settings.cloudbase_mysql_schema == "server-d2g7x597t019f5cb0"
     assert settings.public_source_status["persistence_backend"] == "cloudbase_nosql"
+    assert settings.public_source_status["message_store_backend"] == "cloudbase_mysql"
+    assert settings.public_source_status["message_store_configured"] is True
     assert settings.public_source_status["cloud_persistence_configured"] is True
 
 

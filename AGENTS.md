@@ -1,5 +1,9 @@
 # Agent Notes
 
+## Frontend Theming
+
+- 前端（`web/`）支持白天/夜晚双主题，配色规范见 `docs/theme.md`。新增面板、图表或调整配色前先读它：一律走 CSS 变量 + `chartPalette(theme)`，不要在组件里写死 `hsl()` / hex 色值。
+
 ## Market Data Boundaries
 
 - 板块口径统一以 easy_tdx 官方板块（申万三级，`fetch_board_context` / `_stock_board_display_map`）为唯一标准，盘中与收盘后一致。Tushare 只提供个股级资金数值（moneyflow / block_trade），不参与板块分类；板块汇总一律用 easy_tdx 映射对个股数值归组，禁止混入东财/同花顺等第三方板块 taxonomy。手动主题（themes.yaml）是独立功能，不算板块口径。

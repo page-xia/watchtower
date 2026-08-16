@@ -114,7 +114,7 @@ def make_service(tmp_path, watchlist=None, themes=None):
         watchlist_store=MemoryWatchlistStore(watchlist),
         theme_store=MemoryThemeStore(themes),
         analysis_store=AnalysisStore(tmp_path / "analysis"),
-        message_store=MessageStore(tmp_path / "messages.sqlite"),
+        message_store=MessageStore(),
         trajectory_store=IntradayWatchtowerStore(tmp_path / "intraday.sqlite"),
     )
 

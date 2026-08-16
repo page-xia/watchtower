@@ -45,45 +45,45 @@
     --sidebar-ring: 210 90% 55%;
   }
 
-  /* 白天主题：在 <html> 上加 .light 即切换（默认 :root 为深夜主题） */
+  /* 白天主题：深蓝底 + 近白卡片 + 柔和投影，靠色差与阴影双层分层 */
   :root.light {
-    --background: 220 20% 97%;
-    --foreground: 222 30% 12%;
-    --card: 0 0% 100%;
-    --card-foreground: 222 30% 12%;
+    --background: 214 45% 89%;
+    --foreground: 215 45% 18%;
+    --card: 210 60% 99%;
+    --card-foreground: 215 45% 18%;
     --popover: 0 0% 100%;
-    --popover-foreground: 222 30% 12%;
-    --primary: 210 90% 44%;
+    --popover-foreground: 215 45% 18%;
+    --primary: 212 85% 46%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 220 16% 92%;
-    --secondary-foreground: 222 25% 18%;
-    --muted: 220 16% 93%;
-    --muted-foreground: 220 10% 42%;
-    --accent: 220 16% 90%;
-    --accent-foreground: 222 25% 15%;
+    --secondary: 213 40% 93%;
+    --secondary-foreground: 215 35% 22%;
+    --muted: 213 35% 93%;
+    --muted-foreground: 215 18% 42%;
+    --accent: 212 40% 91%;
+    --accent-foreground: 215 40% 18%;
     --destructive: 0 72% 45%;
     --destructive-foreground: 0 0% 98%;
-    --border: 220 14% 85%;
-    --input: 220 14% 82%;
-    --ring: 210 90% 44%;
+    --border: 213 28% 86%;
+    --input: 213 26% 83%;
+    --ring: 212 85% 46%;
 
-    /* 行情语义色：白底上压深一档保证对比度 */
+    /* 行情语义色：近白卡片上保持对比度 */
     --up: 354 78% 46%;           /* 涨 / 买入 · 红 */
     --up-dim: 354 70% 92%;
-    --down: 152 70% 30%;         /* 跌 / 卖出 · 绿 */
-    --down-dim: 152 45% 90%;
-    --flat: 220 10% 45%;
-    --gold: 38 92% 40%;          /* 重点 / 龙头 */
-    --cyan: 187 85% 34%;
+    --down: 152 68% 30%;         /* 跌 / 卖出 · 绿 */
+    --down-dim: 152 38% 90%;
+    --flat: 215 15% 45%;
+    --gold: 35 90% 42%;          /* 重点 / 龙头 */
+    --cyan: 190 85% 35%;
 
-    --sidebar-background: 220 18% 95%;
-    --sidebar-foreground: 222 30% 14%;
-    --sidebar-primary: 210 90% 44%;
+    --sidebar-background: 213 42% 92%;
+    --sidebar-foreground: 215 45% 18%;
+    --sidebar-primary: 212 85% 46%;
     --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 220 16% 90%;
-    --sidebar-accent-foreground: 222 25% 15%;
-    --sidebar-border: 220 14% 85%;
-    --sidebar-ring: 210 90% 44%;
+    --sidebar-accent: 212 40% 91%;
+    --sidebar-accent-foreground: 215 40% 18%;
+    --sidebar-border: 213 28% 86%;
+    --sidebar-ring: 212 85% 46%;
   }
 }
 
@@ -105,4 +105,12 @@
   .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
   .panel-title { @apply text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground; }
   .terminal-panel { @apply rounded-lg border border-border bg-card; }
+}
+
+/* 白天主题专属：给面板/卡片加柔和投影，配合底色色差形成层次 */
+:root.light .terminal-panel,
+:root.light .border.bg-card {
+  box-shadow:
+    0 2px 6px hsl(214 45% 60% / 0.14),
+    0 1px 2px hsl(214 45% 55% / 0.10);
 }

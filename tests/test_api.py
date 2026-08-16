@@ -193,6 +193,7 @@ def test_signal_detail_extras_endpoint_can_request_f10_fundamentals(monkeypatch)
             include_capital_flow=False,
             include_indicators=False,
             include_chanlun=False,
+            include_auction_history=True,
         ):
             assert code == "300476"
             assert sector == "PCB"
@@ -201,6 +202,7 @@ def test_signal_detail_extras_endpoint_can_request_f10_fundamentals(monkeypatch)
             assert include_capital_flow is False
             assert include_indicators is False
             assert include_chanlun is False
+            assert include_auction_history is True
             return SimpleNamespace(
                 model_dump=lambda mode="json": {
                     "code": code,

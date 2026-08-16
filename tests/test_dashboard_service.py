@@ -2,8 +2,10 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from app.config import AppSettings
-from app.data_sources import MarketSnapshot
+from app.data_sources import BoardContext, MarketSnapshot, china_now
 from app.models import (
     EventItem,
     FundamentalField,
@@ -14,6 +16,10 @@ from app.models import (
     MarketState,
     MessageEvent,
     MessageEventLink,
+    MessageEvidence,
+    MessageEvidenceBundle,
+    MessageStoreStatus,
+    MessageSyncRunStatus,
     MessageTopic,
     MiniIntradaySeries,
     OrderFlowObservation,
@@ -21,6 +27,7 @@ from app.models import (
     DetailDataPayload,
     Quote,
     ReplayMarker,
+    SectorFlowPoint,
     SectorFlowSeries,
     SectorSnapshot,
     SignalPhase,
@@ -32,8 +39,8 @@ from app.models import (
     TrendState,
     WatchlistItem,
     ZsxqMessageIngestRequest,
+    ZsxqMessageIngestResponse,
 )
-from app.message_store import MessageStore
 from app.services import DashboardContext, DashboardService
 from app.storage import AnalysisStore
 from app.trajectory_store import IntradayWatchtowerStore
@@ -70,6 +77,110 @@ class MemoryStateStore:
 
     def set_json(self, namespace: str, key: str, value) -> None:
         self.values[(namespace, key)] = value
+
+
+class MemoryMessageStore:
+    def __init__(self) -> None:
+        self.topics: dict[str, MessageTopic] = {}
+        self.events: dict[str, MessageEvent] = {}
+        self.links: list[MessageEventLink] = []
+        self.latest_run: MessageSyncRunStatus | None = None
+
+    def upsert_messages(self, payload: ZsxqMessageIngestRequest) -> ZsxqMessageIngestResponse:
+        for topic in payload.topics:
+            self.topics[topic.topic_id] = topic
+        for event in payload.events:
+            self.events[event.event_id] = event
+        link_keys = {(link.event_id, link.entity_type, link.code, link.name): link for link in self.links}
+        for link in payload.links:
+            link_keys[(link.event_id, link.entity_type, link.code, link.name)] = link
+        self.links = list(link_keys.values())
+        topic_count = len(payload.topics) if payload.reported_topic_count is None else payload.reported_topic_count
+        event_count = len(payload.events) if payload.reported_event_count is None else payload.reported_event_count
+        link_count = len(payload.links) if payload.reported_link_count is None else payload.reported_link_count
+        self.latest_run = MessageSyncRunStatus(
+            run_id=payload.run_id or "memory-run",
+            source=payload.source,
+            start=payload.start or "",
+            end=payload.end or "",
+            topic_count=topic_count,
+            event_count=event_count,
+            link_count=link_count,
+            status=payload.status,
+        )
+        return ZsxqMessageIngestResponse(
+            ok=True,
+            source=payload.source,
+            run_id=self.latest_run.run_id,
+            topic_count=topic_count,
+            event_count=event_count,
+            link_count=link_count,
+        )
+
+    def status(self, ingest_enabled: bool = False) -> MessageStoreStatus:
+        return MessageStoreStatus(
+            db_file="memory://messages",
+            ingest_enabled=ingest_enabled,
+            topic_count=len(self.topics),
+            event_count=len(self.events),
+            link_count=len(self.links),
+            latest_run=self.latest_run,
+        )
+
+    def evidence_for(
+        self,
+        code: str,
+        sector_terms: list[str] | None = None,
+        stock_limit: int = 8,
+        sector_limit: int = 8,
+    ) -> MessageEvidenceBundle:
+        stock: list[MessageEvidence] = []
+        sector: list[MessageEvidence] = []
+        terms = [str(term or "").strip() for term in (sector_terms or []) if str(term or "").strip()]
+        for link in self.links:
+            event = self.events.get(link.event_id)
+            topic = self.topics.get(event.topic_id) if event else None
+            if event is None or topic is None:
+                continue
+            evidence = MessageEvidence(
+                topic_id=topic.topic_id,
+                topic_title=topic.title,
+                topic_content=topic.content,
+                display_text=topic.media_summary or event.summary or topic.content,
+                create_time=topic.create_time,
+                owner_name=topic.owner_name,
+                has_files=topic.has_files,
+                has_images=topic.has_images,
+                media_summary=topic.media_summary,
+                event_id=event.event_id,
+                event_title=event.title,
+                event_summary=event.summary,
+                event_type=event.event_type,
+                direction=str(event.direction or ""),
+                confidence=event.confidence,
+                impact_strength=event.impact_strength,
+                valid_from=event.valid_from,
+                expires_at=event.expires_at,
+                keywords=event.keywords,
+                entity_type=link.entity_type,
+                code=link.code,
+                name=link.name,
+                role=link.role,
+                relevance=link.relevance,
+                impact=link.impact,
+            )
+            if link.entity_type == "stock" and link.code == str(code).zfill(6):
+                stock.append(evidence.model_copy(update={"match_scope": "stock"}))
+            if link.entity_type in {"sector", "theme"} and any(term in link.name for term in terms):
+                sector.append(evidence.model_copy(update={"match_scope": "sector"}))
+        return MessageEvidenceBundle(stock=stock[:stock_limit], sector=sector[:sector_limit])
+
+
+class FailingMessageStore(MemoryMessageStore):
+    db_file = "cloudbase_mysql://server-d2g7x597t019f5cb0/default/server-d2g7x597t019f5cb0"
+
+    def status(self, ingest_enabled: bool = False) -> MessageStoreStatus:
+        raise RuntimeError("mysql connection refused")
 
 
 class FakeAIClient:
@@ -113,7 +224,7 @@ def make_service(tmp_path, max_signals_per_group=10):
         theme_store=MemoryThemeStore(),
         analysis_store=AnalysisStore(tmp_path),
         ai_client=FakeAIClient(),
-        message_store=MessageStore(tmp_path / "messages.sqlite"),
+        message_store=MemoryMessageStore(),
         trajectory_store=IntradayWatchtowerStore(tmp_path / "intraday.sqlite"),
     )
 
@@ -137,6 +248,20 @@ def test_trajectory_cleanup_once_per_day_is_throttled(tmp_path, monkeypatch) -> 
     assert second["skipped"] == "already_cleaned_today"
     assert third["deleted_rows"] == 2
     assert calls == [(3, True), (3, True)]
+
+
+def test_message_status_returns_fallback_when_message_store_fails(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("WATCH_INGEST_TOKEN", "unit-token")
+    service = make_service(tmp_path)
+    service.message_store = FailingMessageStore()
+
+    status = service.message_status()
+
+    assert status["db_file"] == FailingMessageStore.db_file
+    assert status["ingest_enabled"] is True
+    assert status["topic_count"] == 0
+    assert status["event_count"] == 0
+    assert status["link_count"] == 0
 
 
 def test_trajectory_cleanup_background_skips_when_existing_run_is_active(tmp_path, monkeypatch) -> None:
@@ -1165,6 +1290,11 @@ def test_signal_detail_includes_message_evidence_and_ai_source(tmp_path, monkeyp
                     topic_id="topic-300476",
                     title="胜宏科技消息",
                     content="服务器PCB订单改善。",
+                    media_summary=(
+                        "【附件投研要点】\n"
+                        "- 涉及个股 胜宏科技(300476，核心直接标的，权重0.92)。\n"
+                        "- 核心逻辑：AI服务器PCB订单继续改善，产能利用率提升。"
+                    ),
                     create_time="2026-08-06T09:45:00+08:00",
                 )
             ],
@@ -1233,7 +1363,130 @@ def test_signal_detail_includes_message_evidence_and_ai_source(tmp_path, monkeyp
     assert detail.message_evidence.sector
     assert detail.message_evidence.stock[0].event_title == "PCB订单改善"
     assert source["message_evidence"]["stock"][0]["code"] == "300476"
+    assert "核心逻辑：AI服务器PCB订单继续改善" in source["message_evidence"]["stock"][0]["summary"]
     assert source["message_evidence"]["sector"][0]["name"] == "PCB/CCL/电子布"
+    assert any("核心逻辑：AI服务器PCB订单继续改善" in item for item in service._message_basis(detail))
+
+
+def test_signal_detail_extras_matches_messages_with_easy_tdx_board_names(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+    service.message_store.upsert_messages(
+        ZsxqMessageIngestRequest(
+            run_id="detail-message-tdx-board-run",
+            topics=[
+                MessageTopic(
+                    topic_id="topic-688549",
+                    title="中巨芯消息",
+                    content="电子化学品国产替代推进。",
+                    create_time="2026-08-07T09:45:00+08:00",
+                )
+            ],
+            events=[
+                MessageEvent(
+                    event_id="event-688549",
+                    topic_id="topic-688549",
+                    title="电子化学品催化",
+                    summary="中巨芯受益电子化学品板块催化。",
+                    event_type="板块催化",
+                    direction=1,
+                    confidence=0.88,
+                    impact_strength=0.74,
+                    valid_from="2026-08-07T09:45:00+08:00",
+                    keywords=["电子化学品", "中巨芯"],
+                )
+            ],
+            links=[
+                MessageEventLink(
+                    event_id="event-688549",
+                    entity_type="sector",
+                    code="X4006",
+                    name="电子化学品",
+                    role="easy_tdx申万三级",
+                    relevance=0.9,
+                    impact=0.8,
+                )
+            ],
+        )
+    )
+    quote_item = quote("688549", "中巨芯-U", ["X4006"])
+    current_signal = signal("688549", "中巨芯-U", "X4006", SignalType.WATCH, 66)
+    context = DashboardContext(
+        watchlist=[],
+        themes=[],
+        snapshot=MarketSnapshot(
+            quotes=[quote_item],
+            indices=[],
+            data_mode="closed_static",
+            source_status={"active_source": "test", "trade_date": "20260807"},
+        ),
+        market=market(),
+        sectors=[],
+        sector_flow=[],
+        signals_all=[current_signal],
+        core_watch=[current_signal],
+        events=[],
+        source_status={
+            "signal_scope": "full_market",
+            "quote_count": 1,
+            "signal_count_total": 1,
+            "trade_date": "20260807",
+        },
+    )
+
+    def tdx_sector(name: str, board_code: str, board_level: int) -> SectorSnapshot:
+        return sector(name, "688549").model_copy(
+            update={
+                "board_code": board_code,
+                "board_level": board_level,
+                "board_source": "easy_tdx_mac_board_ranking",
+            }
+        )
+
+    board_contexts = {
+        1: BoardContext(
+            board_level=1,
+            source="easy_tdx_mac_board_ranking",
+            available=True,
+            fetched_at="2026-08-07T09:45:00",
+            sectors=[tdx_sector("电子", "X1000", 1)],
+            name_to_code={"电子": "X1000"},
+            code_to_name={"X1000": "电子"},
+            members_by_code={"X1000": ["688549"]},
+        ),
+        2: BoardContext(
+            board_level=2,
+            source="easy_tdx_mac_board_ranking",
+            available=True,
+            fetched_at="2026-08-07T09:45:00",
+            sectors=[tdx_sector("半导体", "X3006", 2)],
+            name_to_code={"半导体": "X3006"},
+            code_to_name={"X3006": "半导体"},
+            members_by_code={"X3006": ["688549"]},
+        ),
+        3: BoardContext(
+            board_level=3,
+            source="easy_tdx_mac_board_ranking",
+            available=True,
+            fetched_at="2026-08-07T09:45:00",
+            sectors=[tdx_sector("电子化学品", "X4006", 3)],
+            name_to_code={"电子化学品": "X4006"},
+            code_to_name={"X4006": "电子化学品"},
+            members_by_code={"X4006": ["688549"]},
+        ),
+    }
+    monkeypatch.setattr(service, "_get_context", lambda: context)
+    monkeypatch.setattr(service.data_source, "fetch_board_context", lambda board_level=3: board_contexts[int(board_level)])
+
+    payload = service.signal_detail_extras(
+        "688549",
+        sector="X4006",
+        trade_date="20260807",
+        include_auction_history=False,
+    )
+
+    assert payload.sector == "电子化学品"
+    assert payload.selected_sector == "X4006"
+    assert [item.name for item in payload.message_evidence.sector] == ["电子化学品"]
 
 
 def test_signal_detail_extras_fetches_f10_only_when_requested(tmp_path, monkeypatch) -> None:
@@ -1427,6 +1680,142 @@ def test_signal_detail_extras_does_not_load_chart_or_transaction_data(tmp_path, 
     assert "replay_points" not in dumped
     assert "markers" not in dumped
     assert "transaction_flow" not in dumped
+
+
+def test_signal_detail_extras_can_skip_auction_history(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+    quote_item = quote("300476", "胜宏科技", ["PCB"])
+    current_signal = signal("300476", "胜宏科技", "PCB", SignalType.BUY_T, 88)
+    context = DashboardContext(
+        watchlist=[],
+        themes=[],
+        snapshot=MarketSnapshot(
+            quotes=[quote_item],
+            indices=[],
+            data_mode="closed_static",
+            source_status={"active_source": "test", "trade_date": "20260806"},
+        ),
+        market=market(),
+        sectors=[sector("PCB", "300476")],
+        sector_flow=[],
+        signals_all=[current_signal],
+        core_watch=[current_signal],
+        events=[],
+        source_status={
+            "signal_scope": "full_market",
+            "quote_count": 1,
+            "signal_count_total": 1,
+            "trade_date": "20260806",
+        },
+    )
+    monkeypatch.setattr(service, "_get_context", lambda: context)
+
+    def forbidden(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("auction history should be skippable for the initial extras payload")
+
+    monkeypatch.setattr(service.data_source, "auction_history", forbidden)
+
+    payload = service.signal_detail_extras(
+        "300476",
+        sector="PCB",
+        trade_date="20260806",
+        include_auction_history=False,
+    )
+
+    assert payload.auction_history == []
+
+
+def test_signal_detail_extras_keeps_response_when_message_evidence_fails(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+    quote_item = quote("300476", "胜宏科技", ["PCB"])
+    current_signal = signal("300476", "胜宏科技", "PCB", SignalType.BUY_T, 88)
+    context = DashboardContext(
+        watchlist=[],
+        themes=[],
+        snapshot=MarketSnapshot(
+            quotes=[quote_item],
+            indices=[],
+            data_mode="closed_static",
+            source_status={"active_source": "test", "trade_date": "20260806"},
+        ),
+        market=market(),
+        sectors=[sector("PCB", "300476")],
+        sector_flow=[],
+        signals_all=[current_signal],
+        core_watch=[current_signal],
+        events=[],
+        source_status={
+            "signal_scope": "full_market",
+            "quote_count": 1,
+            "signal_count_total": 1,
+            "trade_date": "20260806",
+        },
+    )
+    monkeypatch.setattr(service, "_get_context", lambda: context)
+
+    def fail_evidence(**kwargs):  # noqa: ARG001
+        raise RuntimeError("cloudbase mysql timeout")
+
+    monkeypatch.setattr(service.message_store, "evidence_for", fail_evidence)
+
+    payload = service.signal_detail_extras(
+        "300476",
+        sector="PCB",
+        trade_date="20260806",
+        include_auction_history=False,
+    )
+
+    assert payload.code == "300476"
+    assert payload.message_evidence == MessageEvidenceBundle()
+    # 详情 extras 不再加载 message_status（大表 count=exact，前端不消费），
+    # 同步状态走 /api/messages/status。
+    assert payload.message_status is None
+
+
+def test_signal_detail_extras_keeps_response_when_message_status_fails(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+    quote_item = quote("300476", "胜宏科技", ["PCB"])
+    current_signal = signal("300476", "胜宏科技", "PCB", SignalType.BUY_T, 88)
+    context = DashboardContext(
+        watchlist=[],
+        themes=[],
+        snapshot=MarketSnapshot(
+            quotes=[quote_item],
+            indices=[],
+            data_mode="closed_static",
+            source_status={"active_source": "test", "trade_date": "20260806"},
+        ),
+        market=market(),
+        sectors=[sector("PCB", "300476")],
+        sector_flow=[],
+        signals_all=[current_signal],
+        core_watch=[current_signal],
+        events=[],
+        source_status={
+            "signal_scope": "full_market",
+            "quote_count": 1,
+            "signal_count_total": 1,
+            "trade_date": "20260806",
+        },
+    )
+    monkeypatch.setattr(service, "_get_context", lambda: context)
+
+    def fail_status(*, ingest_enabled: bool = False):  # noqa: ARG001
+        raise RuntimeError("cloudbase mysql timeout")
+
+    monkeypatch.setattr(service.message_store, "status", fail_status)
+
+    payload = service.signal_detail_extras(
+        "300476",
+        sector="PCB",
+        trade_date="20260806",
+        include_auction_history=False,
+    )
+
+    assert payload.code == "300476"
+    assert payload.message_evidence == MessageEvidenceBundle()
+    # extras 已不加载 message_status，status 故障不再影响详情扩展接口。
+    assert payload.message_status is None
 
 
 def test_index_detail_uses_index_minute_series(tmp_path, monkeypatch) -> None:
@@ -1698,7 +2087,7 @@ def test_sector_flow_deferred_frozen_restores_cloud_state(tmp_path, monkeypatch)
                     "heat_score": 80,
                     "final_value": 1.2,
                     "change_pct": 2.2,
-                    "points": [{"time": "09:31", "value": 0.4}, {"time": "09:32", "value": 0.8}],
+                    "points": [{"time": "14:59", "value": 0.4}, {"time": "15:00", "value": 0.8}],
                 }
             ],
         },
@@ -1717,7 +2106,7 @@ def test_sector_flow_deferred_frozen_restores_cloud_state(tmp_path, monkeypatch)
     )
 
     assert [item.name for item in series] == ["PCB"]
-    assert [point.time for point in series[0].points] == ["09:31", "09:32"]
+    assert [point.time for point in series[0].points] == ["14:59", "15:00"]
 
 
 def test_sector_flow_deferred_frozen_builds_once_when_cloud_state_empty(tmp_path, monkeypatch) -> None:
@@ -1880,11 +2269,160 @@ def test_live_sector_flow_proxy_falls_back_to_l1_active_volume(tmp_path, monkeyp
     )
 
     assert [item.name for item in series] == ["PCB"]
-    assert series[0].flow_basis == "每分钟净流入(全成员成交额增量×方向，缺省用L1主动量)"
+    assert series[0].flow_basis == "每分钟净流入(全成员L1主动量差，缺省用成交额增量×方向)"
     assert [point.value for point in series[0].points] == [3.0]
 
 
-def test_live_sector_flow_proxy_restores_cloud_state_on_cold_start(tmp_path, monkeypatch) -> None:
+def test_live_sector_flow_proxy_active_volume_is_primary_not_additive(tmp_path, monkeypatch) -> None:
+    """order_flow 可用时以 L1 主动量差为准，不再叠加成交额增量×方向（趋势日虚高根因）。"""
+    service = make_service(tmp_path)
+    sectors = [sector("PCB", "300476")]
+    first_quote = quote("300476", "胜宏科技", ["PCB"]).model_copy(
+        update={
+            "price": 10.0,
+            "open": 10.0,
+            "prev_close": 10.0,
+            "amount": 100_000_000,
+            "minute_amount": 0,
+            "order_flow": OrderFlowObservation(
+                available=True,
+                active_buy_volume=100_000,
+                active_sell_volume=50_000,
+            ),
+        }
+    )
+    second_quote = first_quote.model_copy(
+        update={
+            "price": 10.2,
+            "amount": 300_000_000,
+            "order_flow": OrderFlowObservation(
+                available=True,
+                active_buy_volume=160_000,
+                active_sell_volume=60_000,
+            ),
+        }
+    )
+
+    def snapshot_with(quote_item: Quote, clock_label: str) -> MarketSnapshot:
+        return MarketSnapshot(
+            quotes=[quote_item],
+            indices=[],
+            data_mode="live",
+            source_status={
+                "active_source": "easy_tdx",
+                "trade_date": "20260810",
+                "clock_label": clock_label,
+                "frozen": False,
+            },
+        )
+
+    monkeypatch.setattr(service, "_ensure_sector_flow_refresh", lambda *args, **kwargs: None)
+
+    first = service._sector_flow_for_context(
+        snapshot_with(first_quote, "09:31:00"),
+        sectors,
+        cache_namespace="unit-test-active-primary",
+        prefer_async=True,
+    )
+    second = service._sector_flow_for_context(
+        snapshot_with(second_quote, "09:32:00"),
+        sectors,
+        cache_namespace="unit-test-active-primary",
+        prefer_async=True,
+    )
+
+    # 首 tick：冷启动摊速 (100000-50000)×10×100/2 = 0.25 亿
+    assert [point.value for point in first[0].points] == [0.25]
+    # 次 tick：主动量差增量 (60000-10000)×10.2×100 = 0.51 亿；
+    # 若错误叠加成交额增量×方向（+2 亿）该点会变成 2.51。
+    assert [point.value for point in second[0].points] == [0.25, 0.51]
+
+
+def test_live_sector_flow_proxy_active_counter_reset_skips_tick(tmp_path, monkeypatch) -> None:
+    """外/内盘计数器回退时跳过该 tick，不得把全天累计净额摊进当前分钟。"""
+    service = make_service(tmp_path)
+    sectors = [sector("PCB", "300476")]
+    base_quote = quote("300476", "胜宏科技", ["PCB"]).model_copy(
+        update={
+            "price": 10.0,
+            "open": 10.0,
+            "prev_close": 10.0,
+            "amount": 100_000_000,
+            "minute_amount": 0,
+            "order_flow": OrderFlowObservation(
+                available=True,
+                active_buy_volume=1_000_000,
+                active_sell_volume=500_000,
+            ),
+        }
+    )
+
+    def snapshot_with(quote_item: Quote, clock_label: str) -> MarketSnapshot:
+        return MarketSnapshot(
+            quotes=[quote_item],
+            indices=[],
+            data_mode="live",
+            source_status={
+                "active_source": "easy_tdx",
+                "trade_date": "20260810",
+                "clock_label": clock_label,
+                "frozen": False,
+            },
+        )
+
+    monkeypatch.setattr(service, "_ensure_sector_flow_refresh", lambda *args, **kwargs: None)
+
+    first = service._sector_flow_for_context(
+        snapshot_with(base_quote, "10:00:00"),
+        sectors,
+        cache_namespace="unit-test-active-reset",
+        prefer_async=True,
+    )
+    reset_quote = base_quote.model_copy(
+        update={
+            "price": 10.1,
+            "amount": 160_000_000,
+            "order_flow": OrderFlowObservation(
+                available=True,
+                active_buy_volume=100_000,  # 计数器回退：远小于上一轮的 1_000_000
+                active_sell_volume=50_000,
+            ),
+        }
+    )
+    second = service._sector_flow_for_context(
+        snapshot_with(reset_quote, "10:01:00"),
+        sectors,
+        cache_namespace="unit-test-active-reset",
+        prefer_async=True,
+    )
+    resumed_quote = reset_quote.model_copy(
+        update={
+            "price": 10.1,
+            "amount": 200_000_000,
+            "order_flow": OrderFlowObservation(
+                available=True,
+                active_buy_volume=130_000,
+                active_sell_volume=55_000,
+            ),
+        }
+    )
+    third = service._sector_flow_for_context(
+        snapshot_with(resumed_quote, "10:02:00"),
+        sectors,
+        cache_namespace="unit-test-active-reset",
+        prefer_async=True,
+    )
+
+    # 首 tick：冷启动摊速 (1e6-5e5)×10×100/31 ≈ 0.16 亿
+    assert [point.value for point in first[0].points] == [0.16]
+    # 回退 tick：跳过，不新增分钟桶，也不摊入全天累计（旧逻辑会写入 ≈1.45 亿）
+    assert [point.value for point in second[0].points] == [0.16]
+    # 恢复 tick：以回退后的新基线取增量 (30000-5000)×10.1×100 = 0.25 亿
+    assert [point.value for point in third[0].points] == [0.16, 0.25]
+
+
+def test_sector_flow_cloud_legacy_basis_rejected(tmp_path, monkeypatch) -> None:
+    """旧口径（成交额增量×方向）持久化的云端记录拒绝加载，避免历史虚高数据回潮。"""
     service = make_service(tmp_path)
     cloud = MemoryStateStore()
     service.state_store = cloud
@@ -1901,12 +2439,228 @@ def test_live_sector_flow_proxy_restores_cloud_state_on_cold_start(tmp_path, mon
             "frozen": False,
         },
     )
-    cache_key = "20260810|live|easy_tdx|unit-test-live-cloud-flow"
+    cache_key = "20260810|live|easy_tdx|unit-test-legacy-cloud"
     cloud.set_json(
         "sector_flow",
         cache_key,
         {
             "trade_date": "20260810",
+            "series": [
+                {
+                    "name": "PCB",
+                    "heat_score": 80,
+                    "final_value": 109.0,
+                    "change_pct": 2.2,
+                    "flow_basis": "每分钟净流入(全成员成交额增量×方向，缺省用L1主动量)",
+                    "points": [{"time": "09:31", "value": 50.0}, {"time": "09:32", "value": 59.0}],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(service, "_ensure_sector_flow_refresh", lambda *args, **kwargs: None)
+
+    series = service._sector_flow_for_context(
+        snapshot,
+        sectors,
+        cache_namespace="unit-test-legacy-cloud",
+        prefer_async=True,
+    )
+
+    assert [item.name for item in series] == ["PCB"]
+    values = [point.value for point in series[0].points]
+    assert 50.0 not in values and 59.0 not in values
+
+
+def test_active_net_truth_total_sums_member_order_flow(tmp_path) -> None:
+    """真值 = 全成员 (外盘-内盘)×价格×100，单位亿元；覆盖不全时按成员数外推。"""
+    service = make_service(tmp_path)
+    members = ["300476", "300308", "000001", "000002", "000003"]
+    covered_quote = quote("300476", "胜宏科技", ["PCB"]).model_copy(
+        update={
+            "price": 10.0,
+            "order_flow": OrderFlowObservation(
+                available=True,
+                active_buy_volume=70_000,
+                active_sell_volume=20_000,
+            ),
+        }
+    )
+    other_covered = quote("300308", "中际旭创", ["PCB"]).model_copy(
+        update={
+            "price": 20.0,
+            "order_flow": OrderFlowObservation(
+                available=True,
+                active_buy_volume=30_000,
+                active_sell_volume=50_000,
+            ),
+        }
+    )
+    no_flow = quote("000001", "平安银行", ["PCB"])
+    quotes_by_code = {"300476": covered_quote, "300308": other_covered, "000001": no_flow}
+
+    # 覆盖 2/5 < 80%：不定标
+    assert service._active_net_truth_total(members, quotes_by_code) is None
+
+    # 覆盖 4/5 = 80%：两只 +0.5 亿、两只 -0.4 亿，合计 0.2 亿，外推 ×5/4 = 0.25 亿
+    more = {
+        "000002": covered_quote.model_copy(update={"code": "000002"}),
+        "000003": other_covered.model_copy(update={"code": "000003"}),
+    }
+    truth = service._active_net_truth_total(members, {**quotes_by_code, **more})
+    assert truth == pytest.approx(0.25)
+
+
+def test_anchor_series_to_truth_scales_shape_and_final_value(tmp_path) -> None:
+    """收盘后定标：分钟形态按比例缩放，final_value 收敛到 L1 主动净额真值。"""
+    service = make_service(tmp_path)
+    series = SectorFlowSeries(
+        name="光纤光缆",
+        heat_score=80,
+        final_value=70.11,
+        change_pct=3.0,
+        points=[
+            SectorFlowPoint(time="09:31", value=30.0),
+            SectorFlowPoint(time="09:32", value=40.11),
+        ],
+        flow_basis="每分钟净流入(全成员成交额增量×方向)",
+    )
+
+    anchored = service._anchor_series_to_truth(series, 46.12)
+
+    assert anchored.final_value == 46.12
+    assert anchored.flow_basis == "每分钟净流入(分钟形态×L1主动量定标)"
+    ratio = 46.12 / 70.11
+    assert [point.value for point in anchored.points] == [
+        round(30.0 * ratio, 4),
+        round(40.11 * ratio, 4),
+    ]
+    # 形状不变：各分钟占比与符号保持一致
+    assert anchored.points[0].value / anchored.points[1].value == pytest.approx(30.0 / 40.11)
+
+
+def test_anchor_series_to_truth_skips_conflict_and_missing_truth(tmp_path) -> None:
+    """方向矛盾或真值缺失时保留原曲线，不强行定标。"""
+    service = make_service(tmp_path)
+    series = SectorFlowSeries(
+        name="光纤光缆",
+        heat_score=80,
+        final_value=70.11,
+        change_pct=3.0,
+        points=[
+            SectorFlowPoint(time="09:31", value=30.0),
+            SectorFlowPoint(time="09:32", value=40.11),
+        ],
+        flow_basis="每分钟净流入(全成员成交额增量×方向)",
+    )
+
+    conflict = service._anchor_series_to_truth(series, -46.12)
+    assert conflict is series or conflict.final_value == 70.11
+    assert conflict.flow_basis == "每分钟净流入(全成员成交额增量×方向)"
+
+    missing = service._anchor_series_to_truth(series, None)
+    assert missing.final_value == 70.11
+
+    out_of_range = service._anchor_series_to_truth(series, 70.11 * 5)
+    assert out_of_range.final_value == 70.11
+
+
+def test_sector_flow_cloud_rejects_incomplete_history_for_past_date(tmp_path) -> None:
+    """历史交易日的云端记录若未覆盖到尾盘（残缺回灌），拒绝加载并触发重建。"""
+    service = make_service(tmp_path)
+    cloud = MemoryStateStore()
+    service.state_store = cloud
+    cache_key = "20260814|live|easy_tdx|unit-test-incomplete-cloud"
+
+    def record(last_time: str) -> dict:
+        return {
+            "trade_date": "20260814",
+            "series": [
+                {
+                    "name": "PCB",
+                    "heat_score": 80,
+                    "final_value": 56.79,
+                    "change_pct": 2.2,
+                    "flow_basis": "每分钟净流入代理(分钟成交额加权)",
+                    "points": [
+                        {"time": "09:31", "value": 10.0},
+                        {"time": last_time, "value": 46.79},
+                    ],
+                }
+            ],
+        }
+
+    cloud.set_json("sector_flow", cache_key, record("10:38"))
+    assert service._load_sector_flow_cloud(cache_key, "20260814") == []
+
+    cloud.set_json("sector_flow", cache_key, record("15:00"))
+    loaded = service._load_sector_flow_cloud(cache_key, "20260814")
+    assert [item.name for item in loaded] == ["PCB"]
+
+
+def test_anchor_flow_list_to_active_net_anchors_loaded_cloud_record(tmp_path) -> None:
+    """云端旧口径记录加载时按快照外/内盘计数器定标到 L1 主动净额真值。"""
+    service = make_service(tmp_path)
+    sector_item = sector("PCB", "300476")
+    loaded = SectorFlowSeries(
+        name="PCB",
+        heat_score=80,
+        final_value=70.11,
+        change_pct=2.2,
+        points=[
+            SectorFlowPoint(time="14:59", value=30.0),
+            SectorFlowPoint(time="15:00", value=40.11),
+        ],
+        flow_basis="每分钟净流入代理(分钟成交额加权)",
+    )
+    live_quote = quote("300476", "胜宏科技", ["PCB"]).model_copy(
+        update={
+            "price": 10.0,
+            "order_flow": OrderFlowObservation(
+                available=True,
+                active_buy_volume=4_712_000,
+                active_sell_volume=100_000,
+            ),
+        }
+    )
+
+    anchored = service._anchor_flow_list_to_active_net([loaded], [sector_item], [live_quote])
+
+    # 单成员板块真值：(4712000-100000)×10×100/1e8 = 46.12 亿
+    assert anchored[0].final_value == 46.12
+    assert anchored[0].flow_basis == "每分钟净流入(分钟形态×L1主动量定标)"
+    assert anchored[0].points[-1].time == "15:00"
+
+    # 已锚定记录重复加载不二次缩放
+    again = service._anchor_flow_list_to_active_net(anchored, [sector_item], [live_quote])
+    assert again[0].final_value == 46.12
+    assert [point.value for point in again[0].points] == [point.value for point in anchored[0].points]
+
+
+def test_live_sector_flow_proxy_restores_cloud_state_on_cold_start(tmp_path, monkeypatch) -> None:
+    service = make_service(tmp_path)
+    cloud = MemoryStateStore()
+    service.state_store = cloud
+    sectors = [sector("PCB", "300476")]
+    live_quote = quote("300476", "胜宏科技", ["PCB"])
+    # 盘中冷启动播种只发生在当日：完整性闸门对当日不完整曲线放行
+    today = china_now().strftime("%Y%m%d")
+    snapshot = MarketSnapshot(
+        quotes=[live_quote],
+        indices=[],
+        data_mode="live",
+        source_status={
+            "active_source": "easy_tdx",
+            "trade_date": today,
+            "clock_label": "09:33:00",
+            "frozen": False,
+        },
+    )
+    cache_key = f"{today}|live|easy_tdx|unit-test-live-cloud-flow"
+    cloud.set_json(
+        "sector_flow",
+        cache_key,
+        {
+            "trade_date": today,
             "series": [
                 {
                     "name": "PCB",
@@ -2106,12 +2860,13 @@ def test_live_sector_flow_proxy_continues_after_cloud_seed(tmp_path, monkeypatch
         update={"price": 10.5, "open": 10.0, "prev_close": 10.0, "amount": 100_000_000, "minute_amount": 3_000_000}
     )
     second_quote = first_quote.model_copy(update={"price": 10.6, "amount": 130_000_000, "minute_amount": 4_000_000})
-    cache_key = "20260810|live|easy_tdx|unit-test-live-cloud-continues"
+    today = china_now().strftime("%Y%m%d")
+    cache_key = f"{today}|live|easy_tdx|unit-test-live-cloud-continues"
     cloud.set_json(
         "sector_flow",
         cache_key,
         {
-            "trade_date": "20260810",
+            "trade_date": today,
             "series": [
                 {
                     "name": "PCB",
@@ -2131,7 +2886,7 @@ def test_live_sector_flow_proxy_continues_after_cloud_seed(tmp_path, monkeypatch
             data_mode="live",
             source_status={
                 "active_source": "easy_tdx",
-                "trade_date": "20260810",
+                "trade_date": today,
                 "clock_label": clock_label,
                 "frozen": False,
             },

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import type { BoardItem, StockBoard, TerminalPayload } from "@/types/api"
+import { shouldReconnectTerminalStream, type MarketRefreshPolicy } from "@/lib/marketRefresh"
+import { useDocumentHidden } from "@/hooks/useDocumentHidden"
 
 export interface TerminalStreamParams {
   sector?: string | null
@@ -31,6 +33,15 @@ interface DeltaMessage {
   data?: TerminalPayload
   sections?: Record<string, unknown> & { board?: BoardDelta }
 }
+
+interface MarketPhaseMessage {
+  type: "market_phase"
+  market_session?: string
+  traffic_mode?: string
+  refresh_policy?: MarketRefreshPolicy
+}
+
+type StreamMessage = DeltaMessage | MarketPhaseMessage
 
 const REPLACE_SECTIONS = [
   "market",
@@ -99,11 +110,17 @@ export function useTerminalStream(params: TerminalStreamParams): TerminalStreamS
   const [lastMessageAt, setLastMessageAt] = useState<number | null>(null)
   const [nonce, setNonce] = useState(0)
   const dataRef = useRef<TerminalPayload | null>(null)
+  const streamPolicyRef = useRef<MarketRefreshPolicy | null>(null)
+  const documentHidden = useDocumentHidden()
   dataRef.current = data
 
   const refresh = useCallback(() => setNonce((n) => n + 1), [])
 
   useEffect(() => {
+    if (documentHidden) {
+      setConnected(false)
+      return
+    }
     let ws: WebSocket | null = null
     let closed = false
     let retry = 0
@@ -114,14 +131,24 @@ export function useTerminalStream(params: TerminalStreamParams): TerminalStreamS
       ws = new WebSocket(buildStreamUrl(params))
       ws.onopen = () => {
         retry = 0
+        streamPolicyRef.current = null
         setConnected(true)
         setError(null)
       }
       ws.onmessage = (event) => {
-        let message: DeltaMessage
+        let message: StreamMessage
         try {
-          message = JSON.parse(event.data as string) as DeltaMessage
+          message = JSON.parse(event.data as string) as StreamMessage
         } catch {
+          return
+        }
+        if (message.type === "market_phase") {
+          streamPolicyRef.current =
+            message.refresh_policy ?? {
+              market_session: message.market_session,
+              traffic_mode: message.traffic_mode,
+              should_stream: false,
+            }
           return
         }
         if (message.type === "snapshot" && message.data) {
@@ -141,6 +168,7 @@ export function useTerminalStream(params: TerminalStreamParams): TerminalStreamS
       ws.onclose = () => {
         setConnected(false)
         if (closed) return
+        if (!shouldReconnectTerminalStream(dataRef.current, streamPolicyRef.current)) return
         const delay = Math.min(1000 * 2 ** retry, 10000)
         retry += 1
         retryTimer = window.setTimeout(connect, delay)
@@ -154,7 +182,7 @@ export function useTerminalStream(params: TerminalStreamParams): TerminalStreamS
       ws?.close()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params.sector, params.boardLevel, params.sort, params.page, params.pageSize, params.watchlistCodes?.join(","), nonce])
+  }, [documentHidden, params.sector, params.boardLevel, params.sort, params.page, params.pageSize, params.watchlistCodes?.join(","), nonce])
 
   return { data, connected, error, lastMessageAt, refresh }
 }

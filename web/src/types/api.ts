@@ -201,6 +201,22 @@ export interface SourceStatus {
   scan_scope?: string
   analysis_provider?: string
   full_market_refresh_seconds?: number
+  market_session?: string
+  is_trading_window?: boolean
+  refresh_policy?: MarketRefreshPolicy
+  [key: string]: unknown
+}
+
+export interface MarketRefreshPolicy {
+  market_session?: string
+  is_trading_window?: boolean
+  traffic_mode?: string
+  should_poll?: boolean
+  should_stream?: boolean
+  poll_interval_ms?: number | null
+  stream_interval_seconds?: number | null
+  final_refresh?: boolean
+  next_open_at?: string
   [key: string]: unknown
 }
 
@@ -445,10 +461,15 @@ export interface MessageEvidence {
   topic_id: string
   topic_title: string
   topic_content: string
+  display_text?: string
   create_time: string
   owner_name: string
   likes: number
   readers: number
+  comments?: number
+  has_files?: boolean
+  has_images?: boolean
+  media_summary?: string
   event_id: string
   event_title: string
   event_summary: string
@@ -457,8 +478,11 @@ export interface MessageEvidence {
   confidence: number
   impact_strength: number
   keywords: string[]
+  entity_type?: string
+  code?: string
   role: string
   relevance: number
+  impact?: number
   match_scope: string
   name?: string
 }
@@ -537,6 +561,9 @@ export interface IndexMinutesResponse {
   index_slope_pct: number
   amount_expanding: boolean
   indices: IndexMinuteSeries[]
+  market_session?: string
+  is_trading_window?: boolean
+  refresh_policy?: MarketRefreshPolicy
 }
 
 // ---- 暗盘资金 ----
@@ -585,6 +612,8 @@ export interface DarkPoolPayload {
   as_of: string
   session: string
   enabled: boolean
+  is_trading_window?: boolean
+  refresh_policy?: MarketRefreshPolicy
   intraday: {
     available: boolean
     refreshed_at?: string

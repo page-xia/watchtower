@@ -1461,30 +1461,53 @@ class EasyTdxMarketDataSource:
             try:
                 snapshot = self.close_source.fetch_seed(universe)
             except Exception as exc:
+                # 日K seed 偶发失败时沿用最近一次成功的 seed：否则 trade_date 会
+                # 回退成自然日（周末/深夜得到空日期），详情分时图随之查空消失。
+                if self._seed_snapshot_cache is not None:
+                    _, _, cached = self._seed_snapshot_cache
+                    return cached, True
                 return self._unavailable_seed_snapshot(now, exc), False
         else:
             try:
                 snapshot = self.close_source.fetch(universe)
             except Exception as exc:
+                if self._seed_snapshot_cache is not None:
+                    _, _, cached = self._seed_snapshot_cache
+                    return cached, True
                 return self._unavailable_seed_snapshot(now, exc), False
         self._seed_snapshot_cache = (cache_key, int(time.time()), snapshot)
         return snapshot, False
 
-    @staticmethod
-    def _unavailable_seed_snapshot(now: datetime, exc: Exception) -> MarketSnapshot:
+    def _unavailable_seed_snapshot(self, now: datetime, exc: Exception) -> MarketSnapshot:
+        # seed 完全不可用时，trade_date 也要锚到最近真实交易日，而不是自然日
+        # （周末/节假日用 today 会让详情分时、回放全部查成空日期）。TDX 日K在
+        # 周末/深夜维护窗口常常不可用，依次回退：日K接口 → 纯本地星期推算。
+        trade_date = self._latest_weekday(now)
+        try:
+            trade_date = self.close_source._latest_trade_date()
+        except Exception:
+            pass
         return MarketSnapshot(
             quotes=[],
             indices=[],
             data_mode="unavailable",
             source_status={
                 "active_source": "unavailable",
-                "trade_date": now.strftime("%Y%m%d"),
+                "trade_date": trade_date,
                 "clock_label": now.strftime("%H:%M:%S"),
                 "frozen": False,
                 "seed_error": jsonable_market_value(exc, max_text=240),
                 "note": "easy_tdx 日K seed 不可用；实时行情继续使用 L1 quote 快照。",
             },
         )
+
+    @staticmethod
+    def _latest_weekday(now: datetime) -> str:
+        """无网络兜底：最近一个工作日（周一~周五；节假日无法本地识别，可接受）。"""
+        day = now.date()
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
+        return day.strftime("%Y%m%d")
 
     def _should_fetch_current_auction(self, now: datetime) -> bool:
         if now.weekday() >= 5:

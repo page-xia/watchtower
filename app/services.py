@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite, log10
+import logging
+from math import ceil, isfinite, log10
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +20,7 @@ from app.data_sources import (
     market_session,
     normalize_board_level,
 )
+from app.market_schedule import market_refresh_policy
 from app.message_store import MessageStore
 from app.dark_pool import DarkPoolMonitor
 from app.opening7 import opening_decision_markers
@@ -35,6 +37,7 @@ from app.models import (
     MarketState,
     MessageDetailPayload,
     MessageEvidenceBundle,
+    MessageStoreStatus,
     MiniIntradayMarker,
     MiniIntradaySeries,
     OpeningDecisionPayload,
@@ -80,6 +83,9 @@ from app.storage import (
     WatchlistStore,
 )
 from app.trajectory_store import IntradayWatchtowerStore
+
+
+logger = logging.getLogger(__name__)
 
 
 MINI_CHART_SOURCE_ROWS = 1200
@@ -151,7 +157,7 @@ class DashboardService:
         self.theme_store = theme_store or ThemeStore(settings.themes_file)
         self.analysis_store = analysis_store or AnalysisStore(settings.data_dir / "runtime" / "analysis")
         self.ai_client = ai_client or AIAnalysisClient(settings)
-        self.message_store = message_store or MessageStore(settings.message_db_file)
+        self.message_store = message_store or MessageStore.from_settings(settings)
         self.position_store = position_store or self._build_position_store(settings)
         self.trajectory_store = trajectory_store or IntradayWatchtowerStore(
             settings.intraday_watchtower_db_file,
@@ -253,6 +259,13 @@ class DashboardService:
         # _trend_states_for_detail 对每个分钟点重跑日线趋势公式，chart/overlay
         # 两个接口各算一遍；尾点变化（新分钟/新价格）时自动失效重算。
         self._trend_states_cache: dict[tuple[str, str, int, str, float], tuple[float, list[dict[str, Any]]]] = {}
+        # 详情页基础上下文和分钟源的短 TTL 单飞缓存。
+        self._signal_detail_context_cache: dict[str, tuple[float, SignalDetailContext]] = {}
+        self._signal_detail_context_cache_lock = threading.Lock()
+        self._signal_detail_context_build_locks: dict[str, threading.Lock] = {}
+        self._detail_minute_rows_cache: dict[str, tuple[float, SharedMinuteChartRows]] = {}
+        self._detail_minute_rows_cache_lock = threading.Lock()
+        self._detail_minute_rows_build_locks: dict[str, threading.Lock] = {}
         # 详情页单票公式行缓存：轨迹库文件大、行按时间交错落盘，单票 180 行
         # 实际是随机页读，盘中与后台批量读写叠加时可能卡数秒。数据本身每
         # background_collector_seconds 才更新一次，短 TTL 内存缓存即可。
@@ -317,7 +330,12 @@ class DashboardService:
 
     def dark_pool_payload(self) -> dict[str, Any]:
         """暗盘资金面板数据：只读缓存/本地库，绝不在请求路径发行情请求。"""
-        return self.dark_pool_monitor.payload()
+        payload = self.dark_pool_monitor.payload()
+        policy = self._market_refresh_policy()
+        payload["session"] = policy["market_session"]
+        payload["is_trading_window"] = policy["is_trading_window"]
+        payload["refresh_policy"] = policy
+        return payload
 
     def terminal(
         self,
@@ -484,6 +502,41 @@ class DashboardService:
                     store.pop(oldest, None)
                     build_locks.pop(oldest, None)
             return payload
+
+    @staticmethod
+    def _cached_value(
+        store: dict[str, tuple[float, Any]],
+        store_lock: threading.Lock,
+        build_locks: dict[str, threading.Lock],
+        cache_key: str,
+        ttl: float | None,
+        builder: Callable[[], Any],
+        max_entries: int,
+    ) -> Any:
+        """Shared short-TTL cache for read-only dataclasses / lists.
+
+        Unlike `_cached_payload`, this helper does not deep-copy the cached
+        object. It is only suitable for values treated as immutable by callers.
+        """
+        now = time.time()
+        with store_lock:
+            cached = store.get(cache_key)
+            if cached is not None and (ttl is None or now - cached[0] <= ttl):
+                return cached[1]
+            build_lock = build_locks.setdefault(cache_key, threading.Lock())
+        with build_lock:
+            with store_lock:
+                cached = store.get(cache_key)
+                if cached is not None and (ttl is None or time.time() - cached[0] <= ttl):
+                    return cached[1]
+            value = builder()
+            with store_lock:
+                store[cache_key] = (time.time(), value)
+                while len(store) > max_entries:
+                    oldest = min(store, key=lambda key: store[key][0])
+                    store.pop(oldest, None)
+                    build_locks.pop(oldest, None)
+            return value
 
     def _terminal_cache_key(
         self,
@@ -730,32 +783,60 @@ class DashboardService:
         include_capital_flow: bool = False,
         include_indicators: bool = False,
         include_chanlun: bool = False,
+        include_auction_history: bool = True,
         client_watchlist: list[WatchlistItem] | None = None,
     ) -> SignalDetailExtrasPayload:
         info = self._signal_detail_context(code, sector=sector, trade_date=trade_date, client_watchlist=client_watchlist)
-        analysis = self.analysis_store.load(info.quote.code, info.actual_trade_date)
-        message_evidence = self.message_store.evidence_for(
-            code=info.quote.code,
-            sector_terms=self._message_evidence_terms(
-                info.quote,
-                info.signal,
-                info.sector_snapshot,
-                info.selected_sector,
+        sector_terms = self._message_evidence_terms(
+            info.quote,
+            info.signal,
+            info.sector_snapshot,
+            info.selected_sector,
+        )
+        loaders: dict[str, Callable[[], Any]] = {
+            "analysis": lambda: self.analysis_store.load(info.quote.code, info.actual_trade_date),
+            # message_status（大表 count=exact）前端详情页并不消费，不再随 extras 加载；
+            # 需要时走 /api/messages/status（独立 300s 缓存）。
+            "message_evidence": lambda: self.message_store.evidence_for(
+                code=info.quote.code,
+                sector_terms=sector_terms,
             ),
-        )
-        message_status = self.message_store.status(
-            ingest_enabled=bool(self.settings.message_ingest_token)
-        )
-        auction_history = self.data_source.auction_history(
-            info.quote.code,
-            info.actual_trade_date,
-        )
-        fundamentals = self.data_source.fetch_fundamentals(info.quote.code) if include_fundamentals else None
-        capital_flow = self.data_source.fetch_capital_flow(info.quote.code) if include_capital_flow else None
-        technical_indicators = (
-            self.data_source.fetch_technical_indicators(info.quote.code) if include_indicators else None
-        )
-        chanlun = self.data_source.fetch_chanlun(info.quote.code) if include_chanlun else None
+        }
+        if include_auction_history:
+            loaders["auction_history"] = lambda: self.data_source.auction_history(
+                info.quote.code,
+                info.actual_trade_date,
+            )
+        if include_fundamentals:
+            loaders["fundamentals"] = lambda: self.data_source.fetch_fundamentals(info.quote.code)
+        if include_capital_flow:
+            loaders["capital_flow"] = lambda: self.data_source.fetch_capital_flow(info.quote.code)
+        if include_indicators:
+            loaders["technical_indicators"] = lambda: self.data_source.fetch_technical_indicators(info.quote.code)
+        if include_chanlun:
+            loaders["chanlun"] = lambda: self.data_source.fetch_chanlun(info.quote.code)
+
+        results: dict[str, Any] = {}
+        if len(loaders) == 1:
+            key, loader = next(iter(loaders.items()))
+            results[key] = self._load_signal_detail_extra(key, loader, info)
+        else:
+            with ThreadPoolExecutor(max_workers=min(6, len(loaders))) as executor:
+                future_by_key = {
+                    executor.submit(self._load_signal_detail_extra, key, loader, info): key
+                    for key, loader in loaders.items()
+                }
+                for future in as_completed(future_by_key):
+                    key = future_by_key[future]
+                    results[key] = future.result()
+
+        analysis = results.get("analysis")
+        message_evidence = results.get("message_evidence", MessageEvidenceBundle())
+        auction_history = results.get("auction_history", [])
+        fundamentals = results.get("fundamentals")
+        capital_flow = results.get("capital_flow")
+        technical_indicators = results.get("technical_indicators")
+        chanlun = results.get("chanlun")
         research_status, research_note = self._research_validation_status()
         payload = SignalDetailExtrasPayload(
             code=info.quote.code,
@@ -768,7 +849,6 @@ class DashboardService:
             position=info.position,
             auction_history=auction_history,
             message_evidence=message_evidence,
-            message_status=message_status,
             analysis=analysis,
             research_status=research_status,
             research_note=research_note,
@@ -782,6 +862,39 @@ class DashboardService:
         if chanlun is not None:
             payload.chanlun = chanlun
         return payload
+
+    def _load_signal_detail_extra(
+        self,
+        key: str,
+        loader: Callable[[], Any],
+        info: SignalDetailContext,
+    ) -> Any:
+        try:
+            return loader()
+        except AssertionError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "signal detail extras loader failed: key=%s code=%s trade_date=%s error=%r",
+                key,
+                info.quote.code,
+                info.actual_trade_date,
+                exc,
+                exc_info=True,
+            )
+            return self._signal_detail_extra_fallback(key)
+
+    def _signal_detail_extra_fallback(self, key: str) -> Any:
+        if key == "message_evidence":
+            return MessageEvidenceBundle()
+        if key == "message_status":
+            return MessageStoreStatus(
+                db_file=str(getattr(self.message_store, "db_file", "")),
+                ingest_enabled=bool(self.settings.message_ingest_token),
+            )
+        if key == "auction_history":
+            return []
+        return None
 
     def message_detail(self, event_id: str) -> MessageDetailPayload:
         payload = self.message_store.message_detail(
@@ -1167,6 +1280,9 @@ class DashboardService:
             "index_slope_pct": float(getattr(context.market, "index_slope_pct", 0.0) or 0.0),
             "amount_expanding": bool(context.market.amount_expanding),
             "indices": indices,
+            "market_session": market_session(),
+            "is_trading_window": is_trading_window(),
+            "refresh_policy": self._market_refresh_policy(),
         }
 
     def analyze_watchlist_item(
@@ -1676,10 +1792,78 @@ class DashboardService:
         }
 
     def ingest_zsxq_messages(self, payload: ZsxqMessageIngestRequest) -> ZsxqMessageIngestResponse:
-        return self.message_store.upsert_messages(payload)
+        response = self.message_store.upsert_messages(payload)
+        # 首次同步后自举一次全量预建（物化表为空时），之后每次同步只增量刷新受影响实体。
+        self._maybe_prebuild_message_evidence()
+        return response
+
+    def _maybe_prebuild_message_evidence(self) -> None:
+        if getattr(self, "_message_evidence_prebuild_checked", False):
+            return
+        self._message_evidence_prebuild_checked = True
+        if not self.message_store.available or self.message_store.evidence_cache_has_rows("sector"):
+            return
+        self.prebuild_message_evidence()
+
+    def prebuild_message_evidence(self) -> dict[str, Any]:
+        """后台全量预建物化证据：全部申万一/二/三级板块词 + 自选股/持仓个股。
+
+        一次性把读路径的 like 全表扫描收敛到后台，之后每只股票的首次详情
+        加载都是物化表上的 1~2 次索引查询。已在运行时不重复触发。
+        """
+        lock = getattr(self, "_message_evidence_prebuild_lock", None)
+        if lock is None:
+            lock = self._message_evidence_prebuild_lock = threading.Lock()
+        if not lock.acquire(blocking=False):
+            return {"ok": False, "status": "already_running"}
+
+        def run() -> None:
+            try:
+                sector_terms = sorted(
+                    {
+                        str(name or "").strip()
+                        for level in (1, 2, 3)
+                        for name in self._stock_board_display_map_for_level(level).values()
+                        if str(name or "").strip()
+                    }
+                )
+                stock_codes = sorted(
+                    {
+                        str(item.code).zfill(6)
+                        for item in [*self.list_watchlist(), *self.list_positions()]
+                        if str(item.code or "").strip()
+                    }
+                )
+                result = self.message_store.refresh_entities(
+                    stock_codes=stock_codes,
+                    sector_terms=sector_terms,
+                )
+                logger.info(
+                    "message evidence prebuild finished: stocks=%d sectors=%d terms=%d",
+                    result.get("stock", 0),
+                    result.get("sector", 0),
+                    len(sector_terms),
+                )
+            except Exception as exc:
+                logger.warning("message evidence prebuild failed: error=%r", exc, exc_info=True)
+            finally:
+                lock.release()
+
+        threading.Thread(target=run, name="message-evidence-prebuild", daemon=True).start()
+        return {"ok": True, "status": "started"}
 
     def message_status(self) -> dict[str, Any]:
-        return self.message_store.status(ingest_enabled=bool(self.settings.message_ingest_token)).model_dump(mode="json")
+        try:
+            status = self.message_store.status(ingest_enabled=bool(self.settings.message_ingest_token))
+        except AssertionError:
+            raise
+        except Exception as exc:
+            logger.warning("message status loader failed: error=%r", exc, exc_info=True)
+            status = MessageStoreStatus(
+                db_file=str(getattr(self.message_store, "db_file", "")),
+                ingest_enabled=bool(self.settings.message_ingest_token),
+            )
+        return status.model_dump(mode="json")
 
     def market_capabilities(self) -> dict[str, Any]:
         now = china_now()
@@ -1688,12 +1872,25 @@ class DashboardService:
             "server_clock": now.strftime("%Y-%m-%d %H:%M:%S"),
             "market_session": market_session(now),
             "is_trading_window": is_trading_window(now),
+            "refresh_policy": self._market_refresh_policy(now),
         }
+
+    def _market_refresh_policy(self, now: Any | None = None) -> dict[str, Any]:
+        return market_refresh_policy(
+            now,
+            live_interval_seconds=self.settings.stream_live_interval_seconds,
+            static_interval_seconds=self.settings.stream_static_interval_seconds,
+        )
 
     def _public_market_capability_status(self) -> dict[str, Any]:
         """Add non-secret source capability labels to dashboard payloads."""
         capabilities = self.data_source.capabilities()
+        now = china_now()
+        policy = self._market_refresh_policy(now)
         return {
+            "market_session": policy["market_session"],
+            "is_trading_window": policy["is_trading_window"],
+            "refresh_policy": policy,
             "quote_capability": str(capabilities.get("quote_protocol") or ""),
             "quote_depth": bool(capabilities.get("quote_depth")),
             "order_book_capability": (
@@ -1884,6 +2081,7 @@ class DashboardService:
         if self.opening_window_engine is not None:
             self.opening_window_engine.stop()
         self.trajectory_store.close()
+        self.message_store.close()
 
     # -------------------------------------------------- opening window diamonds
     def start_opening_window_engine(self) -> None:
@@ -2436,6 +2634,7 @@ class DashboardService:
         if not callable(loader):
             return []
         quote_list = list(quotes or [])
+        quotes_by_code = {quote.code: quote for quote in quote_list if getattr(quote, "code", "")}
         result: list[SectorFlowSeries] = []
         for sector in sectors:
             if not sector.name:
@@ -2515,20 +2714,25 @@ class DashboardService:
             if len(points) < 2:
                 continue
             result.append(
-                SectorFlowSeries(
-                    name=sector.name,
-                    heat_score=sector.heat_score,
-                    # final_value 统一为「今日累计动能」（采样压缩前的全量分钟求和），
-                    # 供三分支一致排序；points 仍是每分钟净流入，前端自行积分。
-                    final_value=round(cum_total, 2),
-                    change_pct=sector.avg_change_pct,
-                    leader_code=sector.leader_code,
-                    leader_name=sector.leader_name,
-                    core_codes=list(sector.core_codes),
-                    reasons=list(sector.reasons),
-                    points=points,
-                    flow_basis="每分钟净流入(全成员成交额增量×方向)",
-                    sample_codes=sorted(member_codes)[:3],
+                # 总量锚定到当日 L1 主动净额真值：分钟形态保留，成交额口径的
+                # 趋势日虚高被收敛；真值不可得或方向矛盾时保持原口径。
+                self._anchor_series_to_truth(
+                    SectorFlowSeries(
+                        name=sector.name,
+                        heat_score=sector.heat_score,
+                        # final_value 统一为「今日累计动能」（采样压缩前的全量分钟求和），
+                        # 供三分支一致排序；points 仍是每分钟净流入，前端自行积分。
+                        final_value=round(cum_total, 2),
+                        change_pct=sector.avg_change_pct,
+                        leader_code=sector.leader_code,
+                        leader_name=sector.leader_name,
+                        core_codes=list(sector.core_codes),
+                        reasons=list(sector.reasons),
+                        points=points,
+                        flow_basis="每分钟净流入(全成员成交额增量×方向)",
+                        sample_codes=sorted(member_codes)[:3],
+                    ),
+                    self._active_net_truth_total(member_codes, quotes_by_code),
                 )
             )
         return result
@@ -5175,6 +5379,9 @@ class DashboardService:
         if frozen or not live_mode:
             cloud_flow = self._load_sector_flow_cloud(cache_key, trade_date)
             if cloud_flow:
+                cloud_flow = self._anchor_flow_list_to_active_net(
+                    cloud_flow, sectors, getattr(snapshot, "quotes", None), member_code_loader
+                )
                 with self._sector_flow_lock:
                     self._sector_flow_cache_by_key[cache_key] = (now, cloud_flow)
                 return cloud_flow
@@ -5224,6 +5431,9 @@ class DashboardService:
             if not cached and not proxy_has_points:
                 cloud_flow = self._load_sector_flow_cloud(cache_key, trade_date)
                 if cloud_flow:
+                    cloud_flow = self._anchor_flow_list_to_active_net(
+                        cloud_flow, sectors, getattr(snapshot, "quotes", None), member_code_loader
+                    )
                     self._seed_sector_flow_proxy_state(cache_key, trade_date, cloud_flow)
                     with self._sector_flow_lock:
                         self._sector_flow_cache_by_key[cache_key] = (now, cloud_flow)
@@ -5307,7 +5517,7 @@ class DashboardService:
                     if len(rows) > 240:
                         del rows[: len(rows) - 240]
                 entry["prev"] = entry["last"]
-                entry["last"] = (quote.price, quote.amount)
+                entry["last"] = (quote.price, quote.amount, time_label)
         return time_label
 
     def _sector_flow_needs_opening_backfill(
@@ -5375,11 +5585,12 @@ class DashboardService:
     ) -> list[SectorFlowSeries]:
         """从全市场 tick 缓存聚合「板块每分钟净流入」曲线，零网络请求。
 
-        口径：全成员 Σ(本 tick 成交额增量 × tick 价格方向) / 1e8——与外部板块
-        资金流排名可比的总量口径，不做代表股抽样、不做平均、不加偏向系数。
+        口径：全成员 Σ(本 tick L1 主动买卖量差 × 价格) / 1e8——与外部板块
+        资金流排名同口径（计数器单调累计、跨采集中断自对齐）；order_flow 缺失的个股
+        回退「成交额增量 × tick 价格方向」并按空窗分钟摊薄。不做代表股抽样、不做平均、不加偏向系数。
         每次刷新先把快照并入 tick 缓存，再把各成员股本 tick 的净额累进当前
         分钟桶；跨分钟自动开新桶，每个点的值就是该分钟的净流入（亿），不做
-        跨分钟累计。冷启动由本地轨迹按同一口径回灌当日分钟历史。
+        跨分钟累计。冷启动由本地轨迹回灌当日分钟历史。
         """
         trade_date = str(snapshot.source_status.get("trade_date") or china_now().strftime("%Y%m%d"))
         # 成员口径与回灌/轨迹分支一致：热度 top-N ∪ 资金净流入 top-5 + 滞回。
@@ -5422,17 +5633,26 @@ class DashboardService:
                     if quote is None or quote.price <= 0:
                         continue
                     tick_entry = self._quote_tick_cache.get(code) or {}
+                    # 主口径：L1 主动买卖量差（外/内盘累计计数器的相邻增量×价格）。
+                    # 计数器随交易日单调累计，跨采集中断自动对齐该缺口内的真实净
+                    # 主动量，与外部板块资金流排名同口径。成交额增量×方向只在
+                    # order_flow 缺失时回退——趋势日它会把每个采样窗口的毛成交额
+                    # 按单一方向定号，累计虚高真值 2 倍以上。
                     active_net_amount = self._active_quote_net_amount(quote, tick_entry, time_label)
-                    prev_price, prev_amount = tick_entry.get("prev") or (None, None)
+                    if active_net_amount is not None:
+                        if active_net_amount:
+                            step_total += active_net_amount
+                            active_codes += 1
+                        continue
+                    prev_tick = tick_entry.get("prev") or (None, None, "")
+                    prev_price, prev_amount = prev_tick[0], prev_tick[1]
+                    prev_label = prev_tick[2] if len(prev_tick) > 2 else ""
                     base_prev = prev_price or (quote.open if quote.open > 0 else 0) or quote.prev_close or quote.price
                     if prev_amount is not None and quote.amount >= prev_amount > 0:
                         delta_amount = quote.amount - prev_amount
                     else:
                         delta_amount = max(float(quote.minute_amount or 0), 0)
                     if delta_amount <= 0:
-                        if active_net_amount:
-                            step_total += active_net_amount
-                            active_codes += 1
                         continue
                     # 走平沿用上一方向：平推的连续成交占全天大头，丢掉会把曲线
                     #  biased 向反转 tick、放大锯齿（与轨迹回灌同一规则）
@@ -5443,12 +5663,16 @@ class DashboardService:
                     else:
                         direction = int(tick_entry.get("dir") or 0)
                     if direction == 0:
-                        if active_net_amount:
-                            step_total += active_net_amount
-                            active_codes += 1
                         continue
                     tick_entry["dir"] = direction
-                    step_total += delta_amount * direction
+                    step_amount = delta_amount * direction
+                    # 相邻观测跨度过大（采集中断/故障恢复）时，成交额增量是整个
+                    # 空窗期的总量，按空窗分钟数（封顶 5）摊薄，与轨迹回灌同一规则，
+                    # 避免空窗毛成交额被单一方向一次性定号。
+                    gap_minutes = self._minutes_between(prev_label, time_label) if prev_label else 0
+                    if gap_minutes > 2:
+                        step_amount /= min(gap_minutes, 5)
+                    step_total += step_amount
                     active_codes += 1
 
                 points_map = state["points"].setdefault(sector.name, {})
@@ -5474,7 +5698,7 @@ class DashboardService:
                         core_codes=list(sector.core_codes),
                         reasons=list(sector.reasons),
                         points=[SectorFlowPoint(time=label, value=round(value, 2)) for label, value in ordered],
-                        flow_basis="每分钟净流入(全成员成交额增量×方向，缺省用L1主动量)",
+                        flow_basis="每分钟净流入(全成员L1主动量差，缺省用成交额增量×方向)",
                         sample_codes=sorted(member_codes)[:3],
                     )
                 )
@@ -5483,21 +5707,31 @@ class DashboardService:
             return series_list
 
     @staticmethod
-    def _active_quote_net_amount(quote: Quote, tick_entry: dict[str, Any], time_label: str) -> float:
+    def _active_quote_net_amount(quote: Quote, tick_entry: dict[str, Any], time_label: str) -> float | None:
+        """L1 主动买卖量差的本 tick 增量（元）。
+
+        返回 None 表示 order_flow 不可用，调用方回退「成交额增量×方向」口径；
+        返回 0 表示口径可用但本 tick 无净增量（含计数器回退跳变：跳过而不是
+        把全天累计摊进当前分钟——趋势日那种摊法会单次虚增上亿）。
+        """
         flow = getattr(quote, "order_flow", None)
         if flow is None or not getattr(flow, "available", False) or quote.price <= 0:
-            return 0.0
+            return None
         buy_volume = float(getattr(flow, "active_buy_volume", 0.0) or 0.0)
         sell_volume = float(getattr(flow, "active_sell_volume", 0.0) or 0.0)
         if buy_volume + sell_volume <= 0:
-            return 0.0
+            return None
         previous = tick_entry.get("active_last")
         tick_entry["active_last"] = (buy_volume, sell_volume)
         if previous:
             prev_buy, prev_sell = previous
-            if buy_volume >= prev_buy and sell_volume >= prev_sell:
-                net_volume = (buy_volume - prev_buy) - (sell_volume - prev_sell)
-                return net_volume * quote.price * 100
+            if buy_volume < prev_buy or sell_volume < prev_sell:
+                # 计数器回退（源切换/字段重基）：本 tick 跳过，下一轮恢复增量语义。
+                return 0.0
+            net_volume = (buy_volume - prev_buy) - (sell_volume - prev_sell)
+            return net_volume * quote.price * 100
+        # 当日首次观测（冷启动/中途并入成员）：把已错过时段的累计净主动量
+        # 按已交易分钟数摊成均速归入当前分钟，量级有界。
         elapsed = DashboardService._elapsed_session_minutes_for_label(time_label)
         net_volume = buy_volume - sell_volume
         return net_volume * quote.price * 100 / max(1, elapsed)
@@ -5518,6 +5752,100 @@ class DashboardService:
         if current <= 15 * 60:
             return 120 + max(1, current - (13 * 60) + 1)
         return 240
+
+    @staticmethod
+    def _active_net_truth_total(member_codes: list[str], quotes_by_code: dict[str, Quote]) -> float | None:
+        """全成员当日 L1 主动买卖净额真值（亿元）。
+
+        取 order_flow 外/内盘计数器差：Σ((active_buy - active_sell) × price × 100)。
+        这是与盘中实时口径一致的真值；分钟线/轨迹的「成交额增量×方向」在趋势日
+        会把被动成交也按收盘价方向定号，总量系统性虚高，需要向它收敛。
+        覆盖率不足 80% 时返回 None，调用方保留原曲线不定标；
+        覆盖不全时按成员数等比外推缺失成员。
+        """
+        members = [str(code) for code in member_codes if code]
+        if not members:
+            return None
+        covered_sum = 0.0
+        covered = 0
+        for code in members:
+            quote = quotes_by_code.get(code)
+            if quote is None or quote.price <= 0:
+                continue
+            flow = getattr(quote, "order_flow", None)
+            if flow is None or not getattr(flow, "available", False):
+                continue
+            buy_volume = float(getattr(flow, "active_buy_volume", 0.0) or 0.0)
+            sell_volume = float(getattr(flow, "active_sell_volume", 0.0) or 0.0)
+            if buy_volume + sell_volume <= 0:
+                continue
+            covered += 1
+            covered_sum += (buy_volume - sell_volume) * quote.price * 100
+        if covered < max(1, ceil(len(members) * 0.8)):
+            return None
+        return covered_sum / 100_000_000 * len(members) / covered
+
+    @staticmethod
+    def _anchor_series_to_truth(series: SectorFlowSeries, truth_total: float | None) -> SectorFlowSeries:
+        """总量锚定：分钟线形态不动，整体缩放到 L1 主动净额真值。
+
+        比值越界（含与原曲线方向矛盾）时保留原曲线——宁可显示原口径，
+        也不把一个形态可疑的缩放结果摆上台。
+        """
+        if truth_total is None or not series.points:
+            return series
+        shape_total = sum(float(point.value) for point in series.points)
+        if shape_total == 0:
+            return series
+        ratio = truth_total / shape_total
+        if not 0.2 <= ratio <= 3.0:
+            return series
+        return series.model_copy(
+            update={
+                "points": [
+                    SectorFlowPoint(time=point.time, value=round(float(point.value) * ratio, 4))
+                    for point in series.points
+                ],
+                "final_value": round(truth_total, 2),
+                "flow_basis": "每分钟净流入(分钟形态×L1主动量定标)",
+            }
+        )
+
+    def _anchor_flow_list_to_active_net(
+        self,
+        flow_list: list[SectorFlowSeries],
+        sectors: list[SectorSnapshot],
+        quotes: list[Quote] | None,
+        member_code_loader: Callable[[SectorSnapshot], list[str]] | None = None,
+    ) -> list[SectorFlowSeries]:
+        """云端记录加载后的总量锚定：分钟形态不动，总量收敛到 L1 主动净额真值。
+
+        云端记录可能是上一版未锚定的成交额口径（趋势日虚高），加载时用当前
+        快照的外/内盘计数器定标到真值；已锚定（定标 basis）或真值不可得的
+        记录原样保留。
+        """
+        quotes_by_code = {quote.code: quote for quote in quotes or [] if getattr(quote, "code", "")}
+        if not flow_list or not quotes_by_code:
+            return flow_list
+        sectors_by_name = {sector.name: sector for sector in sectors or []}
+        anchored: list[SectorFlowSeries] = []
+        for series in flow_list:
+            if "L1主动量定标" in str(series.flow_basis or ""):
+                anchored.append(series)
+                continue
+            sector = sectors_by_name.get(series.name)
+            member_codes: list[str] = []
+            if sector is not None and member_code_loader is not None:
+                try:
+                    member_codes = list(member_code_loader(sector) or [])
+                except Exception:
+                    member_codes = []
+            if not member_codes and sector is not None:
+                member_codes = self.engine.sector_flow_codes(sector, list(quotes or []), member_codes=None)
+            anchored.append(
+                self._anchor_series_to_truth(series, self._active_net_truth_total(member_codes, quotes_by_code))
+            )
+        return anchored
 
     def _load_sector_flow_cloud(self, cache_key: str, trade_date: str) -> list[SectorFlowSeries]:
         state_store = getattr(self, "state_store", None)
@@ -5542,8 +5870,20 @@ class DashboardService:
                 item = SectorFlowSeries.model_validate(row)
             except Exception:
                 continue
+            if "缺省用L1主动量" in str(item.flow_basis or ""):
+                # 旧口径（成交额增量×单方向）持久化的历史数据在趋势日虚高 2 倍
+                # 以上，拒绝加载，让调用方走分钟线/轨迹重建出新口径曲线。
+                continue
             if item.points:
                 series.append(item)
+        if str(trade_date or "") < china_now().strftime("%Y%m%d"):
+            # 历史完整交易日的曲线必须覆盖到尾盘；中途持久化的残缺回灌
+            # （如 188/240 点）拒绝加载，让调用方重建完整分钟线。
+            series = [
+                item
+                for item in series
+                if str(item.points[-1].time or "") >= "14:50"
+            ]
         if not any(len(item.points) >= 2 for item in series):
             return []
         return series
@@ -5815,6 +6155,34 @@ class DashboardService:
         )
         # 引擎产出的是累计曲线，统一差分成「每分钟净流入」口径后再缓存/返回。
         result = [self._per_minute_flow_series(series) for series in built]
+        # 总量锚定到当日 L1 主动净额真值（外/内盘计数器差）：分钟形态保留，
+        # 成交额×方向口径在趋势日的系统性虚高被收敛；真值不可得时维持原口径。
+        quotes_by_code = {quote.code: quote for quote in snapshot.quotes if quote.code}
+        sectors_by_name = {sector.name: sector for sector in stable_sectors}
+        anchored: list[SectorFlowSeries] = []
+        for series in result:
+            member_codes = sector_member_codes.get(series.name)
+            if not member_codes:
+                sector = sectors_by_name.get(series.name)
+                member_codes = (
+                    self.engine.sector_flow_codes(sector, snapshot.quotes, member_codes=None)
+                    if sector is not None
+                    else list(series.core_codes or [])
+                )
+            truth_total = self._active_net_truth_total(member_codes, quotes_by_code)
+            shape_total = sum(float(point.value) for point in series.points)
+            next_series = self._anchor_series_to_truth(series, truth_total)
+            if next_series is series or next_series.flow_basis != "每分钟净流入(分钟形态×L1主动量定标)":
+                logger.info(
+                    "sector_flow anchor skipped: name=%s members=%d truth=%s shape=%.2f quotes=%d",
+                    series.name,
+                    len(member_codes or []),
+                    f"{truth_total:.2f}" if truth_total is not None else "none",
+                    shape_total,
+                    len(quotes_by_code),
+                )
+            anchored.append(next_series)
+        result = anchored
         with self._sector_flow_lock:
             self._sector_flow_cache_by_key[cache_key] = (time.time(), result)
             if len(self._sector_flow_cache_by_key) > 12:
@@ -6098,85 +6466,108 @@ class DashboardService:
         trade_date: str | None = None,
         client_watchlist: list[WatchlistItem] | None = None,
     ) -> SignalDetailContext:
-        current_context = self._get_context()
-        current_context = self._context_with_client_watchlist(current_context, client_watchlist)
-        current_trade_date = str(current_context.source_status.get("trade_date") or "")
-        actual_trade_date = trade_date or current_trade_date or china_now().strftime("%Y%m%d")
-        context = self._context_for_trade_date(current_context, actual_trade_date)
-        context = self._context_with_client_watchlist(context, client_watchlist)
-        quote = self._quote_for_code(context.snapshot.quotes, code)
-        if quote is None:
-            raise ValueError(f"未找到 {code} 的行情数据")
-
-        signal = self._signal_for_code(context.signals_all, code)
-        if signal is None:
-            raise ValueError(f"未找到 {code} 的信号数据")
-
+        normalized_code = str(code or "").strip().zfill(6)
+        normalized_watchlist = self._normalize_client_watchlist(client_watchlist) or []
         requested_sector = self._normalize_sector(sector)
-        sector_snapshot = self._best_sector_for_quote(
-            quote,
-            context.sectors,
-            preferred_sector_names=self._manual_theme_names(context.themes),
-            requested_sector=requested_sector,
-        )
-        selected_sector = sector_snapshot.name if sector_snapshot else requested_sector
-        position = self.position_store.get(code)
-        watchlist_item = self._watchlist_item_for_code(context.watchlist, code)
-        live_mode = context.snapshot.data_mode == "live" or context.source_status.get("active_source") == "easy_tdx"
-        if sector_snapshot is not None:
-            scoped_quotes = [
-                quote if item.code == quote.code else item
-                for item in context.snapshot.quotes
+        base_context = self._get_context()
+        current_context = self._context_with_client_watchlist(base_context, normalized_watchlist or None)
+        cache_key = "|".join(
+            [
+                self._context_signature(base_context),
+                normalized_code,
+                str(requested_sector or ""),
+                str(trade_date or ""),
+                self._watchlist_signature(normalized_watchlist),
             ]
-            scoped_formula_rows = self._formula_rows_by_code_for_context(
-                trade_date=actual_trade_date,
-                quotes=[quote],
-                watchlist=[
-                    WatchlistItem(
-                        code=quote.code,
-                        name=quote.name,
-                        themes=list(quote.themes),
-                        core=quote.core,
-                    )
-                ],
-                positions={quote.code: position} if position else {},
-            )
-            scoped_signals = self.engine.build_signals(
-                scoped_quotes,
-                [
-                    WatchlistItem(
-                        code=quote.code,
-                        name=quote.name,
-                        themes=list(quote.themes),
-                        core=quote.core,
-                    )
-                ],
-                context.sectors,
-                self._market_for_signals(context.snapshot, context.market),
-                clock_label=str(context.source_status.get("clock_label") or context.market.updated_at or ""),
-                preferred_sector_names={sector_snapshot.name},
-                positions={quote.code: position} if position else {},
-                formula_rows_by_code=scoped_formula_rows,
-            )
-            if scoped_signals:
-                scoped_signal = scoped_signals[0]
-                signal = scoped_signal.model_copy(
-                    update={
-                        "pinned": signal.pinned,
-                        "watchlist_tags": list(signal.watchlist_tags),
-                    }
-                )
+        )
 
-        return SignalDetailContext(
-            context=context,
-            actual_trade_date=actual_trade_date,
-            quote=quote,
-            signal=signal,
-            sector_snapshot=sector_snapshot,
-            selected_sector=selected_sector,
-            position=position,
-            watchlist_item=watchlist_item,
-            live_mode=live_mode,
+        def build() -> SignalDetailContext:
+            current_trade_date = str(current_context.source_status.get("trade_date") or "")
+            actual_trade_date = trade_date or current_trade_date or china_now().strftime("%Y%m%d")
+            context = self._context_for_trade_date(current_context, actual_trade_date)
+            context = self._context_with_client_watchlist(context, normalized_watchlist or None)
+            quote = self._quote_for_code(context.snapshot.quotes, normalized_code)
+            if quote is None:
+                raise ValueError(f"未找到 {normalized_code} 的行情数据")
+
+            signal = self._signal_for_code(context.signals_all, normalized_code)
+            if signal is None:
+                raise ValueError(f"未找到 {normalized_code} 的信号数据")
+
+            sector_snapshot = self._best_sector_for_quote(
+                quote,
+                context.sectors,
+                preferred_sector_names=self._manual_theme_names(context.themes),
+                requested_sector=requested_sector,
+            )
+            selected_sector = sector_snapshot.name if sector_snapshot else requested_sector
+            position = self.position_store.get(normalized_code)
+            watchlist_item = self._watchlist_item_for_code(context.watchlist, normalized_code)
+            live_mode = context.snapshot.data_mode == "live" or context.source_status.get("active_source") == "easy_tdx"
+            if sector_snapshot is not None:
+                scoped_quotes = [
+                    quote if item.code == quote.code else item
+                    for item in context.snapshot.quotes
+                ]
+                scoped_formula_rows = self._formula_rows_by_code_for_context(
+                    trade_date=actual_trade_date,
+                    quotes=[quote],
+                    watchlist=[
+                        WatchlistItem(
+                            code=quote.code,
+                            name=quote.name,
+                            themes=list(quote.themes),
+                            core=quote.core,
+                        )
+                    ],
+                    positions={quote.code: position} if position else {},
+                )
+                scoped_signals = self.engine.build_signals(
+                    scoped_quotes,
+                    [
+                        WatchlistItem(
+                            code=quote.code,
+                            name=quote.name,
+                            themes=list(quote.themes),
+                            core=quote.core,
+                        )
+                    ],
+                    context.sectors,
+                    self._market_for_signals(context.snapshot, context.market),
+                    clock_label=str(context.source_status.get("clock_label") or context.market.updated_at or ""),
+                    preferred_sector_names={sector_snapshot.name},
+                    positions={quote.code: position} if position else {},
+                    formula_rows_by_code=scoped_formula_rows,
+                )
+                if scoped_signals:
+                    scoped_signal = scoped_signals[0]
+                    signal = scoped_signal.model_copy(
+                        update={
+                            "pinned": signal.pinned,
+                            "watchlist_tags": list(signal.watchlist_tags),
+                        }
+                    )
+
+            return SignalDetailContext(
+                context=context,
+                actual_trade_date=actual_trade_date,
+                quote=quote,
+                signal=signal,
+                sector_snapshot=sector_snapshot,
+                selected_sector=selected_sector,
+                position=position,
+                watchlist_item=watchlist_item,
+                live_mode=live_mode,
+            )
+
+        return self._cached_value(
+            self._signal_detail_context_cache,
+            self._signal_detail_context_cache_lock,
+            self._signal_detail_context_build_locks,
+            cache_key,
+            5.0,
+            build,
+            max_entries=24,
         )
 
     def _detail_chart_series(
@@ -6729,22 +7120,42 @@ class DashboardService:
         tape preview and detail chart aligned without adding full-market minute
         polling.
         """
-        try:
-            rows = self.data_source.fetch_minute_series(
+        cache_key = "|".join(
+            [
+                self._context_signature(info.context),
                 info.quote.code,
                 info.actual_trade_date,
-                live=bool(info.live_mode),
-            )
-            return SharedMinuteChartRows(
-                rows=self._merge_live_quote_tail(
-                    rows,
-                    quote=info.quote,
-                    market=info.context.market,
+                str(bool(info.live_mode)),
+            ]
+        )
+
+        def build() -> SharedMinuteChartRows:
+            try:
+                rows = self.data_source.fetch_minute_series(
+                    info.quote.code,
+                    info.actual_trade_date,
                     live=bool(info.live_mode),
                 )
-            )
-        except Exception as exc:
-            return SharedMinuteChartRows(rows=[], error=str(exc))
+                return SharedMinuteChartRows(
+                    rows=self._merge_live_quote_tail(
+                        rows,
+                        quote=info.quote,
+                        market=info.context.market,
+                        live=bool(info.live_mode),
+                    )
+                )
+            except Exception as exc:
+                return SharedMinuteChartRows(rows=[], error=str(exc))
+
+        return self._cached_value(
+            self._detail_minute_rows_cache,
+            self._detail_minute_rows_cache_lock,
+            self._detail_minute_rows_build_locks,
+            cache_key,
+            5.0,
+            build,
+            max_entries=24,
+        )
 
     @staticmethod
     def _minute_label_from_clock(clock_label: str) -> str:
@@ -7328,7 +7739,12 @@ class DashboardService:
                 output.append({
                     "event_id": row.get("event_id"),
                     "title": row.get("event_title") or row.get("topic_title"),
-                    "summary": row.get("event_summary") or row.get("media_summary"),
+                    "summary": (
+                        row.get("display_text")
+                        or row.get("media_summary")
+                        or row.get("event_summary")
+                        or row.get("topic_content")
+                    ),
                     "direction": row.get("direction"),
                     "event_type": row.get("event_type"),
                     "confidence": row.get("confidence"),
@@ -7665,7 +8081,15 @@ class DashboardService:
         sector_snapshot: SectorSnapshot | None,
         selected_sector: str | None,
     ) -> list[str]:
+        code = str(quote.code).zfill(6)
+        easy_tdx_terms = [
+            self._stock_board_display_map_for_level(level).get(code)
+            for level in (3, 2, 1)
+        ]
+        display_sector = self._display_sector_name(quote, sector_snapshot)
         focused_terms = [
+            display_sector,
+            *easy_tdx_terms,
             selected_sector,
             signal.sector,
             sector_snapshot.name if sector_snapshot else None,
@@ -7689,11 +8113,24 @@ class DashboardService:
             if not title:
                 continue
             descriptor = item.event_type or item.direction or item.entity_type
+            summary = self._message_evidence_text(item, limit=180)
             if descriptor:
-                basis.append(f"消息面：{title}（{descriptor}）")
+                prefix = f"消息面：{title}（{descriptor}）"
             else:
-                basis.append(f"消息面：{title}")
+                prefix = f"消息面：{title}"
+            basis.append(f"{prefix}：{summary}" if summary else prefix)
         return basis
+
+    @staticmethod
+    def _message_evidence_text(item: Any, limit: int = 180) -> str:
+        text = (
+            getattr(item, "display_text", "")
+            or getattr(item, "media_summary", "")
+            or getattr(item, "event_summary", "")
+            or getattr(item, "topic_content", "")
+        )
+        text = "；".join(part.strip() for part in str(text or "").splitlines() if part.strip())
+        return text[: max(20, int(limit))]
 
     def _normalize_sector(self, sector: str | None) -> str | None:
         if not sector:
@@ -7913,6 +8350,14 @@ class DashboardService:
         self._visible_quote_refresh_errors_by_key = {}
         self._terminal_warmup_signature = ""
         self._historical_context_cache = {}
+        self._signal_detail_context_cache = {}
+        self._signal_detail_context_build_locks = {}
+        self._detail_minute_rows_cache = {}
+        self._detail_minute_rows_build_locks = {}
+        self._signal_detail_context_cache = {}
+        self._signal_detail_context_build_locks = {}
+        self._detail_minute_rows_cache = {}
+        self._detail_minute_rows_build_locks = {}
 
     def _clear_payload_caches(self) -> None:
         """清空共享载荷缓存（terminal/dashboard/菱形预览）。

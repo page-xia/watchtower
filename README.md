@@ -47,6 +47,33 @@ npm run dev
 
 前端默认运行在 `http://localhost:7100`，通过 Vite 代理把 `/api` 和 `/ws` 转到后端 `127.0.0.1:8788`。后端不在该端口时，可用 `WATCH_BACKEND=http://127.0.0.1:8790` 覆盖。
 
+## CloudBase 部署
+
+项目提供一键部署脚本，默认部署到生产环境 `server-d2g7x597t019f5cb0` 的 CloudRun 服务 `watchtower`：
+
+```powershell
+.\scripts\deploy_cloudbase.ps1
+```
+
+脚本会依次运行后端关键回归测试、构建 `web/dist`、调用 `scripts/package_cloudbase.ps1` 生成干净部署包、执行 `tcb cloudrun deploy --service-name watchtower --env-id server-d2g7x597t019f5cb0 --port 8788 --force`，最后检查生产接口 `/api/health`、`/api/dashboard?view=terminal`、`/api/indices/minutes` 和 `/api/sectors/rank`。
+
+首次使用前需要安装并登录 CloudBase CLI：
+
+```powershell
+npm i -g @cloudbase/cli
+tcb login
+```
+
+常用参数：
+
+```powershell
+.\scripts\deploy_cloudbase.ps1 -DryRun -SkipTests
+.\scripts\deploy_cloudbase.ps1 -SkipTests
+.\scripts\deploy_cloudbase.ps1 -SkipBuild -SkipVerify
+```
+
+`-DryRun` 只构建和打包，不改云端资源。若测试阶段出现 `KeyboardInterrupt` 或失败，脚本会在部署前停止；已经单独确认测试通过时，可以用 `-SkipTests` 直接发布。部署后的 smoke check 会重试等待新实例脱离冷启动 bootstrap，并检查大盘分时、板块资金动能是否从早盘开始且尾部接近当前交易进度。部署包只包含 `app/`、`web/dist/`、`data/themes.yaml`、`data/trading_rules.yaml`、`pyproject.toml`、`Dockerfile` 和 `.dockerignore`；脚本会阻止 `ts2db_config.yaml`、本地自选、持仓和 `data/runtime` 进入生产包。
+
 ## Web 前端
 
 `web/` 是 React + TypeScript + Vite + Tailwind + shadcn/ui + ECharts 的盯盘界面，深色终端主题，红涨绿跌。构建产物 `web/dist` 由后端直接挂载在 `/` 和 `/assets`。
@@ -165,7 +192,7 @@ WATCH_OPENING_WINDOW_WARN_CONFIRM_TICKS
 
 ### CloudBase 云托管持久化
 
-CloudBase CloudRun 容器文件系统不是持久化存储，实例重启、扩缩容或重新部署后，本地 `/tmp`、SQLite 和 JSON 文件都可能回到镜像初始状态。生产最优方案是保持服务无状态：高频行情轨迹仍写本地 SQLite 做运行期缓存，跨重启必须保留的小状态写入 CloudBase NoSQL。
+CloudBase CloudRun 容器文件系统不是持久化存储，实例重启、扩缩容或重新部署后，本地 `/tmp`、SQLite 和 JSON 文件都可能回到镜像初始状态。生产方案是保持服务无状态：高频行情轨迹仍写本地 SQLite 做运行期缓存，跨重启必须保留的小状态写入 CloudBase NoSQL，知识星球消息历史写入 CloudBase MySQL。
 
 当前镜像默认开启：
 
@@ -175,6 +202,9 @@ WATCH_OPENING_WINDOW_ENGINE=1
 WATCH_PERSISTENCE_BACKEND=cloudbase_nosql
 WATCH_CLOUDBASE_ENV_ID=server-d2g7x597t019f5cb0
 WATCH_CLOUDBASE_STATE_COLLECTION=watchtower_state
+WATCH_MESSAGE_STORE_BACKEND=cloudbase_mysql
+WATCH_CLOUDBASE_MYSQL_INSTANCE=default
+WATCH_CLOUDBASE_MYSQL_SCHEMA=server-d2g7x597t019f5cb0
 WATCH_DARK_POOL=1
 ```
 
@@ -191,25 +221,33 @@ WATCH_CLOUDBASE_DATABASE_INSTANCE=(default)
 WATCH_CLOUDBASE_DATABASE_NAME=(default)
 ```
 
-云端会保存自选股、持仓、最新 dashboard 快照、官方板块成员缓存和开盘窗口菱形标记。容器重启后，服务优先从 NoSQL 恢复这些状态；服务保持活跃时，后台采集器会继续按行情源重新构建本地轨迹缓存。暗盘资金开启后只在独立慢循环里读取有界股票池，不进入 5 秒全市场刷新链路。若希望减少冷启动和空档，CloudRun 建议设置最小实例数 `MinNum=1`；如果为了省成本设为 `0`，冷启动后仍可从 NoSQL 恢复轻量状态，但运行期 SQLite 缓存需要重新采集。
+云端 NoSQL 会保存最新 dashboard 快照、官方板块成员缓存和开盘窗口菱形标记；CloudBase MySQL 会保存 `message_topics`、`message_events`、`message_event_links`、`message_sync_runs` 和物化证据表 `message_evidence_cache`。网页自选股保存在用户浏览器 `localStorage`，并通过请求参数传给看板和详情接口；不同用户看到的自选互不影响，也不会随部署包上传。容器重启后，服务优先从 NoSQL 恢复这些服务端轻量状态，并从 MySQL 读取星球消息证据；服务保持活跃时，后台采集器会继续按行情源重新构建本地轨迹缓存。暗盘资金开启后只在独立慢循环里读取有界股票池，不进入 5 秒全市场刷新链路。若希望减少冷启动和空档，CloudRun 建议设置最小实例数 `MinNum=1`；如果为了省成本设为 `0`，冷启动后仍可恢复云端持久数据，但运行期 SQLite 缓存需要重新采集。
+
+星球消息证据读取走物化缓存：详情页按 `(scope=stock/sector, cache_key=代码/板块词)` 直接读 `message_evidence_cache`（1~2 次索引查询，亚秒）；未命中的键走动态查询兜底并回写（read-through，空结果也缓存）；每次消息同步后后台自动重建受影响实体的物化值（含板块查询词与链接名的子串别名桥接）。全新部署或物化表被清空后，下一次同步会自动触发一次全量预建，也可手动触发 `POST /api/messages/evidence/prebuild`（需 ingest token）；`scripts/materialize_message_evidence.py` 可在临时开放 MySQL 直连时从本地一次性全量重建（语义与服务端一致）。
 
 ### 知识星球消息同步
 
-盯盘系统运行时只读自己的消息库 `data/runtime/watchtower_messages.sqlite`，不直接读取 `G:\ai\lh\zsxq`。本地知识星球工程同步和归类完成后，用推送脚本把处理好的消息写入盯盘系统：
+盯盘系统运行时只读 CloudBase MySQL 中的消息表，不直接读取 `G:\ai\lh\zsxq`，也不再用项目本地 sqlite 保存星球消息。需要先用 MCP/控制台初始化 MySQL 表 `message_topics`、`message_events`、`message_event_links`、`message_sync_runs`、`message_evidence_cache`（`MessageStore.schema_statements()` 里有全部 DDL）。本地知识星球工程同步和归类完成后，用推送脚本把处理好的消息写入盯盘系统：
 
 ```powershell
 $env:WATCH_INGEST_TOKEN="your-local-secret"
 .\.venv\Scripts\python.exe scripts\dev_server.py
-.\.venv\Scripts\python.exe scripts\push_zsxq_messages.py --lookback-days 3 --target-url http://127.0.0.1:8788 --token $env:WATCH_INGEST_TOKEN
+.\.venv\Scripts\python.exe scripts\push_zsxq_messages.py --lookback-days 1 --media-mode fast --target-url http://127.0.0.1:8788 --token $env:WATCH_INGEST_TOKEN
 ```
 
-生产部署时同样只开放 `POST /api/ingest/zsxq/messages` 接收推送，token 放在生产后端环境变量 `WATCH_INGEST_TOKEN`。查看同步状态：
+推送脚本会给每条主题带上 `media_kind`：`text`、`image`、`file`、`voice`、`mixed`。`--media-mode fast` 只推文本/图片；`--media-mode full` 会推全部类型。生产部署时同样只开放 `POST /api/ingest/zsxq/messages` 接收推送，token 放在生产后端环境变量 `WATCH_INGEST_TOKEN`；服务端会把批次写入 CloudBase MySQL。查看同步状态：
 
 ```text
 GET /api/messages/status
 ```
 
-`G:\ai\lh\zsxq` 的每日 08:00 `message-cache-sync-daemon` 已支持在上游同步成功后自动调用这个推送脚本。调度器从 `WATCH_INGEST_TOKEN`、`WATCH_TARGET_URL`、`WATCH_PUSH_SCRIPT` 和 `WATCH_PUSH_PYTHON` 读取连接信息；token 不写入 Windows 计划任务命令或同步日志。若未配置 token，调度记录会明确显示“未配置 WATCH_INGEST_TOKEN”，不会误报已经推送。
+`G:\ai\lh\zsxq` 的 Windows 任务现在分成两条：5 分钟一次的 fast 同步负责文本/图片并推送，08:00 的 full 同步负责文件/语音/混合消息、回补和研究刷新后再推送。调度器从 `WATCH_INGEST_TOKEN`、`WATCH_TARGET_URLS`、`WATCH_TARGET_URL`、`WATCH_LOCAL_TARGET_URL`、`WATCH_PUSH_SCRIPT` 和 `WATCH_PUSH_PYTHON` 读取连接信息；token 不写入 Windows 计划任务命令或同步日志。若未配置 token，调度记录会明确显示“未配置 WATCH_INGEST_TOKEN”，不会误报已经推送。
+
+同时推送生产和本地时：
+
+```powershell
+$env:WATCH_TARGET_URLS="https://你的生产域名;http://127.0.0.1:8788"
+```
 
 ## 配置
 
@@ -227,10 +265,10 @@ GET /api/messages/status
 
 ## 关键文件
 
-- `data/watchlist.json`：网页自选股持久化文件，默认不参与全市场股票板扫描。
+- `web/src/lib/localWatchlist.ts`：网页自选股保存在浏览器 `localStorage`，默认不参与全市场股票板扫描。
 - `data/themes.yaml`：手工交易主题和核心票映射。
 - `data/trading_rules.yaml`：买 T、卖 T、板块强度等阈值。
-- `data/runtime/watchtower_messages.sqlite`：盯盘系统自己的消息库，由 ingest API 写入。
+- CloudBase MySQL `message_*` 表：盯盘系统自己的星球消息库，由 ingest API 写入。
 - `data/runtime/auction_snapshots.jsonl`：交易日内可行动竞价候选的采样轨迹。
 - `data/runtime/opening_decisions.jsonl`：盘中保存的真实开盘检查点快照，供收盘后复盘。
 - `ts2db_config.example.yaml`：空模板，复制成 `ts2db_config.yaml` 后再填写。

@@ -32,7 +32,13 @@ $cloudbaseConfig = @{
         name = $ServerName
     }
 } | ConvertTo-Json -Depth 3
-$cloudbaseConfig | Set-Content -LiteralPath (Join-Path $packagePath "cloudbaserc.json") -Encoding utf8
+# PS 5.1 "Set-Content -Encoding utf8" emits a BOM; newer @cloudbase/cli
+# rejects cloudbaserc.json with a BOM, so write UTF-8 without BOM explicitly.
+[System.IO.File]::WriteAllText(
+    (Join-Path $packagePath "cloudbaserc.json"),
+    $cloudbaseConfig,
+    (New-Object System.Text.UTF8Encoding($false))
+)
 
 $blockedPatterns = @("watchlist", "positions", "runtime", "ts2db_config")
 $blockedFiles = Get-ChildItem -LiteralPath $packagePath -Recurse -File |

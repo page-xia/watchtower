@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.data_sources import china_now, is_trading_window, market_session, normalize_board_level
 from app.config import ROOT_DIR, settings
+from app.market_schedule import market_refresh_policy
 from app.models import (
     PositionRecord,
     ReplayMarker,
@@ -388,6 +389,12 @@ def ingest_zsxq_messages(
     return service.ingest_zsxq_messages(payload).model_dump(mode="json")
 
 
+@app.post("/api/messages/evidence/prebuild")
+def prebuild_message_evidence(_: None = Depends(require_ingest_token)) -> dict:
+    """后台全量预建星球消息物化证据（全部申万板块词 + 自选/持仓个股）。"""
+    return service.prebuild_message_evidence()
+
+
 @app.get("/api/dashboard")
 def dashboard(
     sector: str | None = None,
@@ -597,6 +604,7 @@ def signal_detail_extras(
     include_capital_flow: bool = False,
     include_indicators: bool = False,
     include_chanlun: bool = False,
+    include_auction_history: bool = True,
     watchlist_codes: str | None = None,
 ) -> dict:
     try:
@@ -608,6 +616,7 @@ def signal_detail_extras(
             include_capital_flow=include_capital_flow,
             include_indicators=include_indicators,
             include_chanlun=include_chanlun,
+            include_auction_history=include_auction_history,
             **_client_watchlist_kwargs(watchlist_codes),
         ).model_dump(mode="json")
     except ValueError as exc:
@@ -716,6 +725,9 @@ def analyze_watchlist_item(code: str, sector: str | None = None, trade_date: str
 async def stream(websocket: WebSocket) -> None:
     await websocket.accept()
     params = _stream_params(websocket)
+    if not _stream_refresh_policy()["should_stream"]:
+        await _stream_send_once_and_close(websocket, params)
+        return
     if settings.stream_broadcaster_enabled:
         # 广播模式：同一参数组合共享一个频道（单发布者），构建/序列化/delta
         # 计算全局一次，每连接只从队列取文本发送。频道数超限回退旧实现。
@@ -730,7 +742,14 @@ async def stream(websocket: WebSocket) -> None:
                 if snapshot:
                     await websocket.send_text(snapshot)
                 while True:
-                    item = await sub.queue.get()
+                    if not _stream_refresh_policy()["should_stream"]:
+                        await _stream_send_static_notice(websocket, params)
+                        await websocket.close(code=1000)
+                        return
+                    try:
+                        item = await asyncio.wait_for(sub.queue.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
                     if item is RESYNC:
                         # 队列溢出掉队：重发最新全量快照，之后的增量继续干净应用
                         text = sub.snapshot_text()
@@ -817,11 +836,59 @@ def _stream_channel_key(params: StreamParams) -> tuple:
 
 
 def _stream_interval() -> float:
-    return float(
-        settings.stream_live_interval_seconds
-        if is_trading_window()
-        else settings.stream_static_interval_seconds
+    policy = _stream_refresh_policy()
+    return float(policy["stream_interval_seconds"] or settings.stream_static_interval_seconds)
+
+
+def _stream_refresh_policy() -> dict:
+    return market_refresh_policy(
+        live_interval_seconds=settings.stream_live_interval_seconds,
+        static_interval_seconds=settings.stream_static_interval_seconds,
     )
+
+
+async def _stream_send_static_notice(websocket: WebSocket, params: StreamParams) -> None:
+    policy = _stream_refresh_policy()
+    notice = {
+        "type": "market_phase",
+        "market_session": policy["market_session"],
+        "traffic_mode": policy["traffic_mode"],
+        "refresh_policy": policy,
+    }
+    await websocket.send_json(notice)
+
+
+async def _stream_send_once_and_close(websocket: WebSocket, params: StreamParams) -> None:
+    if params.view == "terminal":
+        payload = (
+            await asyncio.to_thread(
+                service.terminal,
+                sector=params.sector,
+                board_level=params.board_level,
+                sort=params.sort,
+                page=params.page,
+                page_size=params.page_size,
+                fast=params.fast,
+                **_stream_client_watchlist_kwargs(params),
+            )
+        ).model_dump(mode="json")
+        if params.delta_format:
+            tracker = TerminalDeltaTracker()
+            message = tracker.next_message(payload)
+            if message is not None:
+                await websocket.send_json(message)
+        else:
+            await websocket.send_json(payload)
+    else:
+        payload = (
+            await asyncio.to_thread(
+                service.dashboard,
+                sector=params.sector,
+                **_stream_client_watchlist_kwargs(params),
+            )
+        ).model_dump(mode="json")
+        await websocket.send_json(payload)
+    await websocket.close(code=1000)
 
 
 def _terminal_payload_key(payload: dict) -> str:
@@ -931,8 +998,13 @@ async def _stream_legacy(websocket: WebSocket, params: StreamParams) -> None:
     """每连接轮询旧实现：WATCH_STREAM_BROADCASTER=0 或频道数超限时使用。"""
     last_payload_key = ""
     tracker = TerminalDeltaTracker() if params.delta_format and params.view == "terminal" else None
+    sent_payload = False
     try:
         while True:
+            if sent_payload and not _stream_refresh_policy()["should_stream"]:
+                await _stream_send_static_notice(websocket, params)
+                await websocket.close(code=1000)
+                return
             if params.view == "terminal":
                 payload_model = await asyncio.to_thread(
                     service.terminal,
@@ -949,6 +1021,7 @@ async def _stream_legacy(websocket: WebSocket, params: StreamParams) -> None:
                     message = tracker.next_message(payload)
                     if message is not None:
                         await websocket.send_json(message)
+                        sent_payload = True
                     await asyncio.sleep(_stream_interval())
                     continue
                 payload_key = _terminal_payload_key(payload)
@@ -964,6 +1037,7 @@ async def _stream_legacy(websocket: WebSocket, params: StreamParams) -> None:
             if payload_key != last_payload_key:
                 await websocket.send_json(payload)
                 last_payload_key = payload_key
+                sent_payload = True
             await asyncio.sleep(_stream_interval())
     except WebSocketDisconnect:
         return

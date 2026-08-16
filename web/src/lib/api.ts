@@ -69,16 +69,36 @@ export function getSignalOverlay(code: string, watchlistCodes: string[] = []): P
   return fetchJSON(`/api/signals/${code}/detail/overlay${suffix}`)
 }
 
+export interface DetailExtrasOptions {
+  includeFundamentals?: boolean
+  includeCapitalFlow?: boolean
+  includeIndicators?: boolean
+  includeChanlun?: boolean
+  includeAuctionHistory?: boolean
+}
+
 export function getTransactions(code: string, count = 240): Promise<TransactionFlow> {
   return fetchJSON(`/api/transactions/${code}?count=${count}`)
 }
 
-export function getDetailExtras(code: string, watchlistCodes: string[] = []): Promise<DetailExtrasResponse> {
+export function getDetailExtras(
+  code: string,
+  watchlistCodes: string[] = [],
+  options: DetailExtrasOptions = {},
+): Promise<DetailExtrasResponse> {
+  const {
+    includeFundamentals = true,
+    includeCapitalFlow = true,
+    includeIndicators = true,
+    includeChanlun = true,
+    includeAuctionHistory = true,
+  } = options
   const q = new URLSearchParams()
-  q.set("include_capital_flow", "true")
-  q.set("include_fundamentals", "true")
-  q.set("include_indicators", "true")
-  q.set("include_chanlun", "true")
+  q.set("include_capital_flow", String(includeCapitalFlow))
+  q.set("include_fundamentals", String(includeFundamentals))
+  q.set("include_indicators", String(includeIndicators))
+  q.set("include_chanlun", String(includeChanlun))
+  q.set("include_auction_history", String(includeAuctionHistory))
   q.set("watchlist_codes", watchlistCodes.join(","))
   return fetchJSON(`/api/signals/${code}/detail/extras?${q.toString()}`)
 }

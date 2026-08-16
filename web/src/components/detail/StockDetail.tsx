@@ -1,4 +1,4 @@
-import { useEffect } from "react"
+import { useEffect, useState } from "react"
 import { X, Star, Sparkles } from "lucide-react"
 import { getDetailExtras, getSignalChart, getSignalOverlay, runAiAnalysis } from "@/lib/api"
 import { usePolling } from "@/hooks/usePolling"
@@ -10,6 +10,7 @@ import { TapePanel } from "@/components/detail/TapePanel"
 import { ConfluenceCard, FormulaCard, RiskRewardCard } from "@/components/detail/DetailSide"
 import { DetailTabs } from "@/components/detail/DetailTabs"
 import { cn } from "@/lib/utils"
+import type { DetailExtrasResponse } from "@/types/api"
 
 interface StockDetailProps {
   code: string
@@ -23,7 +24,19 @@ export function StockDetail({ code, onClose, onToggleWatch, watchlisted, watchli
   const watchlistKey = watchlistCodes.join(",")
   const chartState = usePolling(() => getSignalChart(code, watchlistCodes), 10000, [code, watchlistKey])
   const overlayState = usePolling(() => getSignalOverlay(code, watchlistCodes), 10000, [code, watchlistKey])
-  const extrasState = usePolling(() => getDetailExtras(code, watchlistCodes), 0, [code, watchlistKey])
+  const coreExtrasState = usePolling(
+    () =>
+      getDetailExtras(code, watchlistCodes, {
+        includeAuctionHistory: false,
+        includeCapitalFlow: false,
+        includeFundamentals: false,
+        includeIndicators: false,
+        includeChanlun: false,
+      }),
+    0,
+    [code, watchlistKey],
+  )
+  const [richExtras, setRichExtras] = useState<DetailExtrasResponse | null>(null)
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -33,8 +46,31 @@ export function StockDetail({ code, onClose, onToggleWatch, watchlisted, watchli
     return () => window.removeEventListener("keydown", onKey)
   }, [onClose])
 
+  useEffect(() => {
+    setRichExtras(null)
+  }, [code, watchlistKey])
+
+  useEffect(() => {
+    if (!coreExtrasState.data) return
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void getDetailExtras(code, watchlistCodes)
+        .then((payload) => {
+          if (!cancelled) setRichExtras(payload)
+        })
+        .catch(() => {
+          if (!cancelled) setRichExtras(null)
+        })
+    }, 120)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [code, watchlistKey, coreExtrasState.lastOkAt])
+
   const detail = chartState.data
   const overlay = overlayState.data
+  const extras = richExtras ?? coreExtrasState.data
   const signal = detail?.current_signal
   const name = detail?.name ?? code
 
@@ -76,7 +112,14 @@ export function StockDetail({ code, onClose, onToggleWatch, watchlisted, watchli
             variant="outline"
             size="sm"
             className="h-7 gap-1 text-xs"
-            onClick={() => void runAiAnalysis(code).then(() => extrasState.refresh()).catch(() => undefined)}
+            onClick={() =>
+              void runAiAnalysis(code)
+                .then(() => {
+                  setRichExtras(null)
+                  coreExtrasState.refresh()
+                })
+                .catch(() => undefined)
+            }
             title="调用后端 AI 接口生成分析"
           >
             <Sparkles className="h-3 w-3" /> AI分析
@@ -152,7 +195,7 @@ export function StockDetail({ code, onClose, onToggleWatch, watchlisted, watchli
 
           {/* 右列：星球消息 / AI / 竞价 / 资金流 / F10 / 缠论（全高加宽） */}
           <div className="col-span-12 min-h-0 max-lg:h-[480px] lg:col-span-5">
-            <DetailTabs extras={extrasState.data} error={extrasState.error} />
+            <DetailTabs extras={extras} error={coreExtrasState.error} />
           </div>
         </div>
       </div>

@@ -13,7 +13,6 @@ CONFIG_FILE = ROOT_DIR / "ts2db_config.yaml"
 WATCHLIST_FILE = DATA_DIR / "watchlist.json"
 THEMES_FILE = DATA_DIR / "themes.yaml"
 RULES_FILE = DATA_DIR / "trading_rules.yaml"
-MESSAGE_DB_FILE = DATA_DIR / "runtime" / "watchtower_messages.sqlite"
 POSITION_FILE = DATA_DIR / "positions.json"
 INTRADAY_WATCHTOWER_DB_FILE = DATA_DIR / "runtime" / "intraday_watchtower.sqlite"
 AUCTION_HISTORY_FILE = DATA_DIR / "runtime" / "auction_snapshots.jsonl"
@@ -38,11 +37,18 @@ class AppSettings:
         self.watchlist_file = Path(os.getenv("WATCHLIST_FILE", str(WATCHLIST_FILE)))
         self.themes_file = Path(os.getenv("THEMES_FILE", str(THEMES_FILE)))
         self.rules_file = Path(os.getenv("TRADING_RULES_FILE", str(RULES_FILE)))
-        self.message_db_file = Path(os.getenv("WATCH_MESSAGE_DB_FILE", str(MESSAGE_DB_FILE)))
         self.position_file = Path(os.getenv("WATCH_POSITION_FILE", str(POSITION_FILE)))
         self.persistence_backend = os.getenv("WATCH_PERSISTENCE_BACKEND", "local").strip().lower() or "local"
         self.cloudbase_env_id = os.getenv("WATCH_CLOUDBASE_ENV_ID", "").strip()
         self.cloudbase_api_token = os.getenv("WATCH_CLOUDBASE_API_TOKEN", "").strip()
+        self.message_store_backend = (
+            os.getenv("WATCH_MESSAGE_STORE_BACKEND", "cloudbase_mysql").strip().lower() or "cloudbase_mysql"
+        )
+        self.cloudbase_mysql_instance = os.getenv("WATCH_CLOUDBASE_MYSQL_INSTANCE", "default").strip() or "default"
+        self.cloudbase_mysql_schema = (
+            os.getenv("WATCH_CLOUDBASE_MYSQL_SCHEMA", self.cloudbase_env_id).strip() or self.cloudbase_env_id
+        )
+        self.cloudbase_mysql_openid = os.getenv("WATCH_CLOUDBASE_MYSQL_OPENID", "watchtower").strip() or "watchtower"
         self.cloudbase_state_collection = (
             os.getenv("WATCH_CLOUDBASE_STATE_COLLECTION", "watchtower_state").strip() or "watchtower_state"
         )
@@ -50,6 +56,9 @@ class AppSettings:
         self.cloudbase_database_name = os.getenv("WATCH_CLOUDBASE_DATABASE_NAME", "(default)").strip() or "(default)"
         self.cloudbase_api_base_url = os.getenv("WATCH_CLOUDBASE_API_BASE_URL", "").strip()
         self.cloudbase_api_timeout_seconds = max(0.5, float(os.getenv("WATCH_CLOUDBASE_API_TIMEOUT_SECONDS", "3.0")))
+        # 星球消息证据/状态读缓存：消息按批次推送入库，读侧不需要秒级新鲜度，
+        # 默认 60s，避免每次打开详情都对 CloudBase MySQL REST 做全量查询风暴。
+        self.message_store_cache_seconds = max(0.0, float(os.getenv("WATCH_MESSAGE_STORE_CACHE_SECONDS", "60")))
         self.intraday_watchtower_db_file = Path(
             os.getenv("WATCH_INTRADAY_DB_FILE", str(INTRADAY_WATCHTOWER_DB_FILE))
         )
@@ -216,6 +225,16 @@ class AppSettings:
             "trajectory_retention_trade_days": self.trajectory_retention_trade_days,
             "background_collector_enabled": self.background_collector_enabled,
             "persistence_backend": self.persistence_backend,
+            "message_store_backend": self.message_store_backend,
+            "message_store_configured": bool(
+                self.message_store_backend == "cloudbase_mysql"
+                and self.cloudbase_env_id
+                and self.cloudbase_api_token
+                and self.cloudbase_mysql_instance
+                and self.cloudbase_mysql_schema
+            ),
+            "cloudbase_mysql_instance": self.cloudbase_mysql_instance,
+            "cloudbase_mysql_schema": self.cloudbase_mysql_schema,
             "cloud_persistence_configured": bool(
                 self.persistence_backend == "cloudbase_nosql"
                 and self.cloudbase_env_id
@@ -248,4 +267,3 @@ class AppSettings:
 
 
 settings = AppSettings()
-

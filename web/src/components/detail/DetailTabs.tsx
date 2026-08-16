@@ -2,8 +2,10 @@ import { useState } from "react"
 import type { AuctionSnapshot, DataTable, DetailExtrasResponse, ExtrasSection, MessageEvidence } from "@/types/api"
 import { dateShort, fmtAmount, timeShort } from "@/lib/format"
 import { cn } from "@/lib/utils"
+import { messageBody, messageKeywords, messageMetaLabels } from "./messagePresentation"
 
 type TabKey = "messages" | "ai" | "auction" | "capital" | "fundamentals" | "chanlun"
+type MessageScope = "stock" | "sector"
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: "messages", label: "星球消息" },
@@ -17,6 +19,9 @@ const TABS: { key: TabKey; label: string }[] = [
 function MessageCard({ msg }: { msg: MessageEvidence }) {
   const [expanded, setExpanded] = useState(false)
   const bullish = msg.direction === "1"
+  const body = messageBody(msg)
+  const metaLabels = messageMetaLabels(msg)
+  const keywords = messageKeywords(msg)
   return (
     <div className="rounded-md border border-border/60 bg-background/40 p-2.5">
       <div className="flex items-start justify-between gap-2">
@@ -25,9 +30,11 @@ function MessageCard({ msg }: { msg: MessageEvidence }) {
           <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[9px] text-muted-foreground">
             <span>{msg.owner_name}</span>
             <span>{dateShort(msg.create_time)} {timeShort(msg.create_time)}</span>
-            <span className={cn("rounded px-1", bullish ? "bg-up-dim text-up" : "bg-muted text-muted-foreground")}>
-              {msg.event_type} · {msg.role}
-            </span>
+            {metaLabels.length > 0 && (
+              <span className={cn("rounded px-1", bullish ? "bg-up-dim text-up" : "bg-muted text-muted-foreground")}>
+                {metaLabels.join(" · ")}
+              </span>
+            )}
           </div>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1 text-[9px] text-muted-foreground">
@@ -39,11 +46,11 @@ function MessageCard({ msg }: { msg: MessageEvidence }) {
         className={cn("mt-1.5 cursor-pointer whitespace-pre-wrap text-[11px] leading-relaxed text-foreground/80", !expanded && "line-clamp-3")}
         onClick={() => setExpanded(!expanded)}
       >
-        {msg.topic_content || msg.event_summary}
+        {body}
       </div>
-      {(msg.keywords ?? []).length > 0 && (
+      {keywords.length > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-1">
-          {msg.keywords.slice(0, 8).map((k) => (
+          {keywords.slice(0, 8).map((k) => (
             <span key={k} className="rounded bg-muted px-1 py-0.5 text-[9px] text-muted-foreground">{k}</span>
           ))}
         </div>
@@ -55,18 +62,51 @@ function MessageCard({ msg }: { msg: MessageEvidence }) {
 function MessagesPane({ extras }: { extras: DetailExtrasResponse }) {
   const stock = extras.message_evidence?.stock ?? []
   const sector = extras.message_evidence?.sector ?? []
+  const [scope, setScope] = useState<MessageScope>("stock")
+  const counts: Record<MessageScope, number> = { stock: stock.length, sector: sector.length }
+  const activeScope: MessageScope = counts[scope] > 0 ? scope : stock.length > 0 ? "stock" : "sector"
+  const activeMessages = activeScope === "stock" ? stock : sector
+  const scopeTabs: { key: MessageScope; label: string }[] = [
+    { key: "stock", label: "直接提及个股" },
+    { key: "sector", label: "板块相关" },
+  ]
+
   if (stock.length + sector.length === 0) {
     return <div className="p-8 text-center text-xs text-muted-foreground">暂无星球消息关联该股/板块</div>
   }
   return (
-    <div className="grid grid-cols-1 gap-2 p-3 xl:grid-cols-2">
-      <div className="space-y-2">
-        <div className="panel-title">直接提及个股（{stock.length}）</div>
-        {stock.map((m) => <MessageCard key={m.event_id} msg={m} />)}
+    <div className="flex min-h-0 flex-col">
+      <div className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-2 border-b border-border bg-card/95 px-3 py-2 backdrop-blur">
+        <div className="inline-flex rounded-md border border-border bg-muted/40 p-0.5">
+          {scopeTabs.map((item) => {
+            const count = counts[item.key]
+            const active = item.key === activeScope
+            return (
+              <button
+                key={item.key}
+                type="button"
+                disabled={count === 0}
+                aria-pressed={active}
+                onClick={() => setScope(item.key)}
+                className={cn(
+                  "rounded px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45",
+                  active ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-background/70",
+                )}
+              >
+                {item.label}
+                <span className="num ml-1 rounded bg-primary/15 px-1 text-[9px] text-primary">{count}</span>
+              </button>
+            )
+          })}
+        </div>
+        <div className="text-[10px] text-muted-foreground">
+          当前 {activeScope === "stock" ? "个股" : "板块"} · 共 <span className="num text-foreground">{activeMessages.length}</span> 条
+        </div>
       </div>
-      <div className="space-y-2">
-        <div className="panel-title">板块相关（{sector.length}）</div>
-        {sector.map((m, i) => <MessageCard key={m.event_id ?? i} msg={m} />)}
+      <div className="space-y-2 p-3">
+        {activeMessages.map((m, i) => (
+          <MessageCard key={`${m.event_id || "message"}-${m.entity_type || activeScope}-${m.code || m.name || i}`} msg={m} />
+        ))}
       </div>
     </div>
   )
