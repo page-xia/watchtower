@@ -2288,8 +2288,10 @@ def test_live_sector_flow_proxy_falls_back_to_l1_active_volume(tmp_path, monkeyp
     )
 
     assert [item.name for item in series] == ["PCB"]
-    assert series[0].flow_basis == "每分钟净流入(全成员L1主动量差，缺省用成交额增量×方向)"
-    assert [point.value for point in series[0].points] == [3.0]
+    # 盘中即向当前快照 L1 累计真值定标：冷启动摊速形状 3.0 亿 × (真值 6.0 / 3.0)
+    assert series[0].flow_basis == "每分钟净流入(分钟形态×L1主动量定标)"
+    assert [point.value for point in series[0].points] == [6.0]
+    assert series[0].final_value == 6.0
 
 
 def test_live_sector_flow_proxy_active_volume_is_primary_not_additive(tmp_path, monkeypatch) -> None:
@@ -2350,11 +2352,14 @@ def test_live_sector_flow_proxy_active_volume_is_primary_not_additive(tmp_path, 
         prefer_async=True,
     )
 
-    # 首 tick：冷启动摊速 (100000-50000)×10×100/2 = 0.25 亿
-    assert [point.value for point in first[0].points] == [0.25]
+    # 首 tick：冷启动摊速 (100000-50000)×10×100/2 = 0.25 亿形状，
+    # 盘中锚定收敛到当前真值 0.5 亿（ratio=2，守卫内）
+    assert [point.value for point in first[0].points] == [0.5]
     # 次 tick：主动量差增量 (60000-10000)×10.2×100 = 0.51 亿；
     # 若错误叠加成交额增量×方向（+2 亿）该点会变成 2.51。
-    assert [point.value for point in second[0].points] == [0.25, 0.51]
+    # 锚定：形状和 0.76 亿 → 真值 (160000-60000)×10.2×100 = 1.02 亿，整体 ×1.3421
+    assert [point.value for point in second[0].points] == [0.3355, 0.6845]
+    assert second[0].final_value == 1.02
 
 
 def test_live_sector_flow_proxy_active_counter_reset_skips_tick(tmp_path, monkeypatch) -> None:
@@ -2432,12 +2437,16 @@ def test_live_sector_flow_proxy_active_counter_reset_skips_tick(tmp_path, monkey
         prefer_async=True,
     )
 
-    # 首 tick：冷启动摊速 (1e6-5e5)×10×100/31 ≈ 0.16 亿
+    # 首 tick：冷启动摊速 (1e6-5e5)×10×100/31 ≈ 0.16 亿；
+    # 真值 5 亿 / 形状 0.16 = 31 超出守卫上限 20，保持原形不定标
     assert [point.value for point in first[0].points] == [0.16]
-    # 回退 tick：跳过，不新增分钟桶，也不摊入全天累计（旧逻辑会写入 ≈1.45 亿）
-    assert [point.value for point in second[0].points] == [0.16]
-    # 恢复 tick：以回退后的新基线取增量 (30000-5000)×10.1×100 = 0.25 亿
-    assert [point.value for point in third[0].points] == [0.16, 0.25]
+    # 回退 tick：跳过，不新增分钟桶，也不摊入全天累计（旧逻辑会写入 ≈1.45 亿）；
+    # 真值随新计数器重基为 (100000-50000)×10.1×100 = 0.505 亿，锚定收敛到新基线
+    assert [point.value for point in second[0].points] == [0.505]
+    # 恢复 tick：以回退后的新基线取增量 (30000-5000)×10.1×100 = 0.25 亿；
+    # 真值 (130000-55000)×10.1×100 = 0.7575 亿，形状和 0.41 亿整体 ×1.8476
+    assert [point.value for point in third[0].points] == [0.2956, 0.4619]
+    assert third[0].final_value == 0.76
 
 
 def test_sector_flow_cloud_legacy_basis_rejected(tmp_path, monkeypatch) -> None:

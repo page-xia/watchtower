@@ -2467,28 +2467,28 @@ class DashboardService:
             ]
             if len(points) < 2:
                 continue
-            result.append(
-                # 总量锚定到当日 L1 主动净额真值：分钟形态保留，成交额口径的
-                # 趋势日虚高被收敛；真值不可得或方向矛盾时保持原口径。
-                self._anchor_series_to_truth(
-                    SectorFlowSeries(
-                        name=sector.name,
-                        heat_score=sector.heat_score,
-                        # final_value 统一为「今日累计动能」（采样压缩前的全量分钟求和），
-                        # 供三分支一致排序；points 仍是每分钟净流入，前端自行积分。
-                        final_value=round(cum_total, 2),
-                        change_pct=sector.avg_change_pct,
-                        leader_code=sector.leader_code,
-                        leader_name=sector.leader_name,
-                        core_codes=list(sector.core_codes),
-                        reasons=list(sector.reasons),
-                        points=points,
-                        flow_basis="每分钟净流入(全成员成交额增量×方向)",
-                        sample_codes=sorted(member_codes)[:3],
-                    ),
-                    self._active_net_truth_total(member_codes, quotes_by_code),
-                )
+            # 总量锚定到当日 L1 主动净额真值：分钟形态保留，成交额口径的
+            # 趋势日虚高被收敛；真值不可得时保持原口径；形状与真值符号相反
+            # 的已知错误数据直接下掉（与代理/云端锚定分支同一判据）。
+            raw_series = SectorFlowSeries(
+                name=sector.name,
+                heat_score=sector.heat_score,
+                # final_value 统一为「今日累计动能」（采样压缩前的全量分钟求和），
+                # 供三分支一致排序；points 仍是每分钟净流入，前端自行积分。
+                final_value=round(cum_total, 2),
+                change_pct=sector.avg_change_pct,
+                leader_code=sector.leader_code,
+                leader_name=sector.leader_name,
+                core_codes=list(sector.core_codes),
+                reasons=list(sector.reasons),
+                points=points,
+                flow_basis="每分钟净流入(全成员成交额增量×方向)",
+                sample_codes=sorted(member_codes)[:3],
             )
+            truth_total = self._active_net_truth_total(member_codes, quotes_by_code)
+            if self._flow_shape_contradicts_truth(raw_series, truth_total):
+                continue
+            result.append(self._anchor_series_to_truth(raw_series, truth_total))
         return result
 
     def _refresh_context(self) -> DashboardContext:
@@ -2990,10 +2990,20 @@ class DashboardService:
         opened_limit_count = sum(1 for quote in metric_quotes if quote.opened_limit)
         avg_change = sum(quote.change_pct for quote in metric_quotes) / total
         amount = sum(max(float(quote.amount or 0), 0) for quote in metric_quotes)
-        flow_delta = sum(
-            max(float(quote.amount or 0), 0) * max(-10.0, min(10.0, float(quote.change_pct or 0))) / 100
-            for quote in metric_quotes
-        ) / 100_000_000
+        # 资金口径与「板块资金动能」图同源：order_flow 覆盖足够时用全成员
+        # L1 外/内盘计数器真值，否则回退「成交额×涨跌幅」代理。同屏两个
+        # 资金数字必须一致（2026-08-17 集成电路设计卡片 133.3亿 vs 图 221.7亿）。
+        quotes_by_code = {quote.code: quote for quote in metric_quotes if quote.code}
+        truth_total = self._active_net_truth_total([quote.code for quote in metric_quotes], quotes_by_code)
+        if truth_total is not None:
+            flow_delta = truth_total
+            flow_label = "主动净额"
+        else:
+            flow_delta = sum(
+                max(float(quote.amount or 0), 0) * max(-10.0, min(10.0, float(quote.change_pct or 0))) / 100
+                for quote in metric_quotes
+            ) / 100_000_000
+            flow_label = "动能代理"
         leader = max(
             metric_quotes,
             key=lambda quote: (
@@ -3040,7 +3050,7 @@ class DashboardService:
             f"均涨{avg_change:+.2f}%",
             f"{up_count}/{total}上涨",
             f"成交额{amount / 100_000_000:.1f}亿",
-            f"动能代理{flow_delta:+.1f}亿",
+            f"{flow_label}{flow_delta:+.1f}亿",
             f"领涨{leader.name}",
         ]
         exclusion_reason = self.engine.sector_exclusion_reason(excluded_quotes)
@@ -4119,7 +4129,7 @@ class DashboardService:
         rows = DashboardService._compress_flat_mini_rows(
             DashboardService._dedupe_mini_rows_by_minute(DashboardService._regular_mini_rows(rows))
         )
-        limit = max(8, min(int(max_points or 48), 48))
+        limit = max(8, min(int(max_points or 48), 120))
         if len(rows) <= limit:
             return rows
         if limit <= 1:
@@ -5814,23 +5824,35 @@ class DashboardService:
                     state["points"][sector.name] = dict(ordered)
                 if not ordered:
                     continue
-                series_list.append(
-                    SectorFlowSeries(
-                        name=sector.name,
-                        heat_score=sector.heat_score,
-                        # final_value = 今日累计净流入（亿，全成员总量口径），
-                        # 供三分支一致排序；points 仍是每分钟净流入，前端自行积分。
-                        final_value=round(sum(value for _, value in ordered), 2),
-                        change_pct=sector.avg_change_pct,
-                        leader_code=sector.leader_code,
-                        leader_name=sector.leader_name,
-                        core_codes=list(sector.core_codes),
-                        reasons=list(sector.reasons),
-                        points=[SectorFlowPoint(time=label, value=round(value, 2)) for label, value in ordered],
-                        flow_basis="每分钟净流入(全成员L1主动量差，缺省用成交额增量×方向)",
-                        sample_codes=sorted(member_codes)[:3],
-                    )
+                raw_series = SectorFlowSeries(
+                    name=sector.name,
+                    heat_score=sector.heat_score,
+                    # final_value = 今日累计净流入（亿，全成员总量口径），
+                    # 供三分支一致排序；points 仍是每分钟净流入，前端自行积分。
+                    final_value=round(sum(value for _, value in ordered), 2),
+                    change_pct=sector.avg_change_pct,
+                    leader_code=sector.leader_code,
+                    leader_name=sector.leader_name,
+                    core_codes=list(sector.core_codes),
+                    reasons=list(sector.reasons),
+                    points=[SectorFlowPoint(time=label, value=round(value, 2)) for label, value in ordered],
+                    flow_basis="每分钟净流入(全成员L1主动量差，缺省用成交额增量×方向)",
+                    sample_codes=sorted(member_codes)[:3],
                 )
+                # 盘中即向当前快照 L1 累计真值定标：回退路径（成交额增量×方向）
+                # 与首观测摊薄带来的漂移随每次刷新收敛，不再把漂移值持久化到
+                # 云端盘后补救（2026-08-17 其他养殖 +0.76 vs 真值 -0.27 就是这么
+                # 混进面板的）。state 里仍保留原始增量，锚定只作用于展示序列。
+                truth_total = self._active_net_truth_total(sorted(member_codes), by_code)
+                if self._flow_shape_contradicts_truth(raw_series, truth_total):
+                    logger.info(
+                        "sector_flow proxy dropped (sign contradicts L1 truth): name=%s shape=%.2f truth=%.2f",
+                        sector.name,
+                        raw_series.final_value,
+                        truth_total if truth_total is not None else float("nan"),
+                    )
+                    continue
+                series_list.append(self._anchor_series_to_truth(raw_series, truth_total))
             # 统一展示排序：今日累计净流入降序，同值按热度——与回灌/轨迹分支一致
             series_list.sort(key=lambda series: (series.final_value, series.heat_score), reverse=True)
             return series_list
@@ -5956,7 +5978,10 @@ class DashboardService:
 
         云端记录可能是上一版未锚定的成交额口径（趋势日虚高），加载时用当前
         快照的外/内盘计数器定标到真值；已锚定（定标 basis）或真值不可得的
-        记录原样保留。
+        记录原样保留。形状与真值符号相反（量级均 ≥0.1亿）的记录是已知错误
+        数据（2026-08-17 其他养殖 +0.76亿 vs 真值 -0.27亿），直接下掉不再
+        展示；锚定改变 final_value 后统一按真值重排，否则榜单顺序与数值
+        矛盾（消费电子组件 50.27 排在半导体材料 24.71 之后的生产事故）。
         """
         quotes_by_code = {quote.code: quote for quote in quotes or [] if getattr(quote, "code", "")}
         if not flow_list or not quotes_by_code:
@@ -5976,10 +6001,31 @@ class DashboardService:
                     member_codes = []
             if not member_codes and sector is not None:
                 member_codes = self.engine.sector_flow_codes(sector, list(quotes or []), member_codes=None)
-            anchored.append(
-                self._anchor_series_to_truth(series, self._active_net_truth_total(member_codes, quotes_by_code))
-            )
+            truth_total = self._active_net_truth_total(member_codes, quotes_by_code)
+            if self._flow_shape_contradicts_truth(series, truth_total):
+                logger.info(
+                    "sector_flow dropped (sign contradicts L1 truth): name=%s shape=%.2f truth=%.2f",
+                    series.name,
+                    sum(float(point.value) for point in series.points),
+                    truth_total if truth_total is not None else float("nan"),
+                )
+                continue
+            anchored.append(self._anchor_series_to_truth(series, truth_total))
+        anchored.sort(key=lambda series: (series.final_value, series.heat_score), reverse=True)
         return anchored
+
+    @staticmethod
+    def _flow_shape_contradicts_truth(series: SectorFlowSeries, truth_total: float | None) -> bool:
+        """形状总量与 L1 真值符号相反且两侧量级都 ≥0.1亿 时判为已知错误数据。
+
+        近零噪声（形状或真值贴零）不算矛盾，避免开盘早期/小板块误杀。
+        """
+        if truth_total is None:
+            return False
+        shape_total = sum(float(point.value) for point in series.points)
+        if shape_total * truth_total >= 0:
+            return False
+        return min(abs(shape_total), abs(truth_total)) >= 0.1
 
     def _load_sector_flow_cloud(self, cache_key: str, trade_date: str) -> list[SectorFlowSeries]:
         state_store = getattr(self, "state_store", None)
@@ -6316,7 +6362,8 @@ class DashboardService:
                     len(quotes_by_code),
                 )
             anchored.append(next_series)
-        result = anchored
+        # 锚定把 final_value 换成真值后必须按真值重排，否则榜单顺序与数值矛盾
+        result = sorted(anchored, key=lambda series: (series.final_value, series.heat_score), reverse=True)
         with self._sector_flow_lock:
             self._sector_flow_cache_by_key[cache_key] = (time.time(), result)
             if len(self._sector_flow_cache_by_key) > 12:
