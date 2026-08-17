@@ -52,7 +52,7 @@ async def lifespan(_: FastAPI):
     service.start_trajectory_cleanup_thread(reason="startup")
     # 若进程恰在盘前窗口内重启（如 08:45 发版），补触发一轮 F10 增量预热。
     service.maybe_run_f10_preopen_refresh(reason="startup")
-    # 暗盘资金监控随后端启动拉起：线程自行休眠至 09:30 交易窗口开始首轮磁带周期，
+    # 暗盘资金面板预热：首屏即触发东财快照后台拉取与 EOD 本地库缓存，
     # 盘中数据积累不依赖「有人打开页面触发接口」。
     service.dark_pool_payload()
     if settings.background_collector_enabled:
@@ -489,13 +489,19 @@ def sectors_rank(board_level: int = 3, watchlist_codes: str | None = None) -> li
 
 
 @app.get("/api/dark-pool")
-def dark_pool() -> dict:
-    """暗盘资金面板：盘中大单推断（缓存）+ Tushare 收盘官方口径（本地库）。
+def dark_pool(sector: str | None = None, board_level: int = 3) -> dict:
+    """暗盘资金面板：暗吸/暗派（多日背离）+ 大手场外 + 东财盘中资金地图。
 
     只读内存缓存与本地 SQLite，绝不在请求路径上发行情网络请求，
-    保证不拖慢首页 5 秒刷新链路。
+    保证不拖慢首页 5 秒刷新链路。sector/board_level 用于首页板块联动过滤。
     """
-    return service.dark_pool_payload()
+    return service.dark_pool_payload(sector=sector, board_level=board_level)
+
+
+@app.get("/api/dark-pool/stock/{code}")
+def dark_pool_stock(code: str) -> dict:
+    """个股暗盘资金摘要（详情页右栏）：多日资金流判定 + 大宗/北向/两融/席位。"""
+    return service.dark_pool_stock_payload(code)
 
 
 @app.get("/api/signals")

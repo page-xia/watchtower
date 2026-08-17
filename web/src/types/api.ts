@@ -500,6 +500,53 @@ export interface MessageEvidence {
   name?: string
 }
 
+export interface MessageDetailTopic {
+  topic_id: string
+  title: string
+  content: string
+  create_time: string
+  owner_name: string
+  likes: number
+  readers: number
+  comments: number
+  has_files: boolean
+  has_images: boolean
+  media_kind: string
+  media_summary: string
+  source: string
+}
+
+export interface MessageDetailEvent {
+  event_id: string
+  topic_id: string
+  title: string
+  summary: string
+  event_type: string
+  direction: string | number | null
+  confidence: number
+  impact_strength: number
+  valid_from: string
+  expires_at: string
+  keywords: string[]
+}
+
+export interface MessageDetailLink {
+  event_id: string
+  entity_type: string
+  code: string
+  name: string
+  role: string
+  relevance: number
+  impact: number
+}
+
+export interface MessageDetailResponse {
+  topic: MessageDetailTopic
+  event: MessageDetailEvent
+  links: MessageDetailLink[]
+  sync?: unknown
+}
+
 export interface AnalysisRecord {
   status: string
   provider?: string
@@ -620,19 +667,7 @@ export interface IndexMinutesResponse {
   refresh_policy?: MarketRefreshPolicy
 }
 
-// ---- 暗盘资金 ----
-
-export interface DarkPoolIntradayRow {
-  code: string
-  name: string
-  sector?: string
-  change_pct: number
-  large_buy_amount: number
-  large_sell_amount: number
-  net_amount: number
-  net_ratio_pct: number
-  tag: string
-}
+// ---- 暗盘资金（2026-08-18 重构：暗吸暗派 / 大手场外 / 东财盘中资金地图） ----
 
 export interface DarkPoolSectorBucket {
   sector: string
@@ -642,12 +677,26 @@ export interface DarkPoolSectorBucket {
   top_net: number
 }
 
-export interface DarkPoolEodRow {
+/** 暗吸/暗派榜行：多日同向净额 + 价格滞涨/抗跌 */
+export interface DarkPoolAbsorbRow {
   code: string
   name: string
   sector?: string
-  net_mf_amount: number
-  on_top_list: boolean
+  net_window: number
+  pos_days: number
+  neg_days: number
+  days: number
+  window_chg_pct: number
+  turnover_avg: number
+  close: number
+}
+
+export interface DarkPoolNorthRow {
+  code: string
+  name: string
+  sector?: string
+  change_pct: number
+  amount: number
 }
 
 export interface DarkPoolBlockRow {
@@ -655,11 +704,49 @@ export interface DarkPoolBlockRow {
   name: string
   sector?: string
   price: number
-  vol: number
-  amount: number
   close: number
+  amount: number
   premium_pct: number
   on_top_list: boolean
+}
+
+export interface DarkPoolInstRow {
+  code: string
+  name: string
+  sector?: string
+  inst_net: number
+  total_net: number
+  seats: number
+}
+
+export interface DarkPoolEmRow {
+  code: string
+  name: string
+  sector?: string
+  change_pct: number
+  main_net: number
+  main_pct: number
+  elg_net: number
+}
+
+export interface DarkPoolMarketStrip {
+  available: boolean
+  trade_date?: string
+  main_net_amount?: number
+  em_main_net?: number
+  em_as_of?: string
+  north_turnover?: number
+  north_trade_date?: string
+  margin_balance?: number
+  margin_change?: number
+  margin_trade_date?: string
+  block_amount?: number
+}
+
+export interface DarkPoolSectorFilter {
+  sector: string
+  board_level: number
+  member_count: number
 }
 
 export interface DarkPoolPayload {
@@ -668,28 +755,85 @@ export interface DarkPoolPayload {
   enabled: boolean
   is_trading_window?: boolean
   refresh_policy?: MarketRefreshPolicy
-  intraday: {
+  market: DarkPoolMarketStrip
+  absorb: {
     available: boolean
-    refreshed_at?: string
-    pool_size?: number
-    errors?: number
-    source?: string
     note?: string
-    rows?: DarkPoolIntradayRow[]
-    sector_rollup?: DarkPoolSectorBucket[]
-    sector_rollup_by_level?: { l1?: DarkPoolSectorBucket[]; l2?: DarkPoolSectorBucket[]; l3?: DarkPoolSectorBucket[] }
+    window_dates?: string[]
+    window_days?: number
+    rule?: string
+    source?: string
+    inflow?: DarkPoolAbsorbRow[]
+    outflow?: DarkPoolAbsorbRow[]
   }
-  eod: {
+  offmarket: {
     available: boolean
     trade_date?: string
-    source?: string
+    north_trade_date?: string
+    inst_trade_date?: string
+    north_note?: string
+    north_top10?: DarkPoolNorthRow[]
+    blocks?: DarkPoolBlockRow[]
+    top_inst?: DarkPoolInstRow[]
+  }
+  em: {
+    available: boolean
     note?: string
-    main_inflow?: DarkPoolEodRow[]
-    main_outflow?: DarkPoolEodRow[]
-    block_trades?: DarkPoolBlockRow[]
-    sector_rollup?: DarkPoolSectorBucket[]
+    as_of?: string
+    stock_count?: number
+    total_main_net?: number
+    source?: string
+    stale_error?: string
+    inflow?: DarkPoolEmRow[]
+    outflow?: DarkPoolEmRow[]
     sector_rollup_by_level?: { l1?: DarkPoolSectorBucket[]; l2?: DarkPoolSectorBucket[]; l3?: DarkPoolSectorBucket[] }
   }
+  sector_filter?: DarkPoolSectorFilter | null
+}
+
+// ---- 个股暗盘资金摘要（详情页右栏） ----
+
+export interface DarkPoolStockFlowDay {
+  trade_date: string
+  net: number
+  close: number
+  turnover: number
+}
+
+export interface DarkPoolStockVerdict {
+  label: string
+  net_window: number
+  pos_days: number
+  neg_days: number
+  days: number
+  window_chg_pct: number
+}
+
+export interface DarkPoolStockBlock {
+  trade_date: string
+  price: number
+  close: number
+  amount: number
+  premium_pct: number
+}
+
+export interface DarkPoolStockPayload {
+  available: boolean
+  code: string
+  name: string
+  as_of: string
+  note?: string
+  eod_available?: boolean
+  trade_date?: string
+  flow_10d?: DarkPoolStockFlowDay[]
+  verdict?: DarkPoolStockVerdict
+  ths?: { net_today: number; net_d5: number }
+  dc?: { net_today: number }
+  em?: { as_of: string; main_net: number; main_pct: number; elg_net: number; lg_net: number }
+  north_top10?: { trade_date: string; amount: number }
+  blocks?: DarkPoolStockBlock[]
+  margin?: { trade_date: string; rzye: number; rzye_change?: number }
+  top_list?: { trade_date: string; reason: string }[]
 }
 
 // ---- 日K详情（AI主力狙击公式 + 筹码峰 + 题材概念） ----

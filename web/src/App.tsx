@@ -82,6 +82,13 @@ export default function App() {
     setPage(1)
   }, [])
 
+  // 暗盘资金面板联动：点击板块桶时同时切换板块口径并选中（name=null 仅清除过滤）
+  const handleDarkPoolSelectSector = useCallback((level: number, name: string | null) => {
+    setBoardLevel(level)
+    setSector(name)
+    setPage(1)
+  }, [])
+
   const handleBoardLevel = useCallback((lv: number) => {
     setBoardLevel(lv)
     // 切换口径后原选中项在另一套分类里不存在，直接清空避免带着旧过滤
@@ -209,9 +216,9 @@ export default function App() {
           <SectorNetInflowChart sectors={data?.sectors ?? []} selected={sector} onSelect={handleSelectSector} />
           <SectorFlowChart series={data?.sector_flow ?? []} selected={sector} onSelect={handleSelectSector} />
           <LimitUpLadderChart sectors={data?.sectors ?? []} selected={sector} onSelect={handleSelectSector} />
-          {/* 暗盘资金：横跨整行，置于涨停情绪梯队下方 */}
+          {/* 暗盘资金：横跨整行，置于涨停情绪梯队下方；跟随首页板块选中联动过滤 */}
           <div className="min-h-0 xl:col-span-2">
-            <DarkPoolPanel />
+            <DarkPoolPanel selected={sector} boardLevel={boardLevel} onSelectSector={handleDarkPoolSelectSector} />
           </div>
         </div>
       </main>

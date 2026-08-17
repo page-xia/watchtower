@@ -10,6 +10,16 @@
 - `data/`：本地配置、主题、规则和运行期数据。
 - `docs/`：策略说明、研究记录和架构文档。
 
+## 界面截图
+
+首页是日内盯盘工作台：上方看指数、情绪和成交额，中间扫描活跃股与板块强弱，右侧聚合机会队列、板块资金动能和暗盘资金线索。
+
+![日内盯盘首页](shots/darkpool_home.png)
+
+个股详情弹窗用于复盘单票：左侧展示分时、做 T 公式状态和 L1 逐笔成交，右侧聚合筹码、星球消息、AI 分析、资金流、F10 和缠论等标签页。
+
+![个股详情与逐笔成交](shots/darkpool_detail.png)
+
 ## 快速开始
 
 ### 后端
@@ -182,7 +192,7 @@ WATCH_CLOUDBASE_DATABASE_INSTANCE=(default)
 WATCH_CLOUDBASE_DATABASE_NAME=(default)
 ```
 
-云端 NoSQL 会保存最新 dashboard 快照和官方板块成员缓存；CloudBase MySQL 会保存 `message_topics`、`message_events`、`message_event_links`、`message_sync_runs` 和物化证据表 `message_evidence_cache`。网页自选股保存在用户浏览器 `localStorage`，并通过请求参数传给看板和详情接口；不同用户看到的自选互不影响，也不会随部署包上传。容器重启后，服务优先从 NoSQL 恢复这些服务端轻量状态，并从 MySQL 读取星球消息证据；服务保持活跃时，后台采集器会继续按行情源重新构建本地轨迹缓存。暗盘资金开启后只在独立慢循环里读取有界股票池，不进入 5 秒全市场刷新链路。若希望减少冷启动和空档，CloudRun 建议设置最小实例数 `MinNum=1`；如果为了省成本设为 `0`，冷启动后仍可恢复云端持久数据，但运行期 SQLite 缓存需要重新采集。
+云端 NoSQL 会保存最新 dashboard 快照和官方板块成员缓存；CloudBase MySQL 会保存 `message_topics`、`message_events`、`message_event_links`、`message_sync_runs` 和物化证据表 `message_evidence_cache`。网页自选股保存在用户浏览器 `localStorage`，并通过请求参数传给看板和详情接口；不同用户看到的自选互不影响，也不会随部署包上传。容器重启后，服务优先从 NoSQL 恢复这些服务端轻量状态，并从 MySQL 读取星球消息证据；服务保持活跃时，后台采集器会继续按行情源重新构建本地轨迹缓存。暗盘资金面板只读本地 EOD 库与东财快照缓存（后台一次性线程补齐），不进入 5 秒全市场刷新链路，也不再轮询磁带。若希望减少冷启动和空档，CloudRun 建议设置最小实例数 `MinNum=1`；如果为了省成本设为 `0`，冷启动后仍可恢复云端持久数据，但运行期 SQLite 缓存需要重新采集。
 
 星球消息证据读取走物化缓存：详情页按 `(scope=stock/sector, cache_key=代码/板块词)` 直接读 `message_evidence_cache`（1~2 次索引查询，亚秒）；未命中的键走动态查询兜底并回写（read-through，空结果也缓存）；每次消息同步后后台自动重建受影响实体的物化值（含板块查询词与链接名的子串别名桥接）。全新部署或物化表被清空后，下一次同步会自动触发一次全量预建，也可手动触发 `POST /api/messages/evidence/prebuild`（需 ingest token）；`scripts/materialize_message_evidence.py` 可在临时开放 MySQL 直连时从本地一次性全量重建（语义与服务端一致）。
 

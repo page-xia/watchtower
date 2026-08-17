@@ -31,6 +31,29 @@ test("message body falls back when display text is only machine tags", () => {
   assert.equal(messageBody(msg), "原帖正文：AI算力链路继续放量。")
 })
 
+test("expanded message body uses complete detail content over card snippets", () => {
+  const fullContent = `完整原帖正文：${"AI算力订单持续验证。".repeat(80)}尾段仍要显示。`
+  const snippet = fullContent.slice(0, 600)
+  const msg = {
+    display_text: snippet,
+    topic_content: snippet,
+    topic_title: "算力链路跟踪",
+  }
+  const detail = {
+    topic: {
+      title: "算力链路跟踪",
+      content: fullContent,
+      media_summary: "",
+    },
+    event: {
+      title: "订单验证",
+      summary: "",
+    },
+  }
+
+  assert.equal(messageBody(msg, detail), fullContent)
+})
+
 test("message presentation keeps useful event labels", () => {
   const msg = {
     event_type: "订单",

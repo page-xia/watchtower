@@ -24,6 +24,7 @@ from app.market_schedule import market_refresh_policy
 from app.message_store import MessageStore
 from app.webhook_push import SignalPushPool, WebhookSubscriptionStore
 from app.dark_pool import DarkPoolMonitor
+from app.em_moneyflow import EMMoneyflowCache
 from app.formula_engine import (
     SIGNAL_VERSION,
     ZuoTDayContext,
@@ -197,13 +198,15 @@ class DashboardService:
             load_yaml(settings.rules_file, {}),
             persist_path=settings.opening_decision_file,
         )
-        # 暗盘资金监控：盘中大单推断独立慢循环（默认 120s/24 只），
-        # 盘后口径读本地 tushare_eod.sqlite；均不进 5 秒大盘刷新循环。
+        # 暗盘资金监控：官方口径读本地 tushare_eod.sqlite（300s TTL），
+        # 盘中资金地图走东财快照缓存（后台一次性线程补齐）；均不进 5 秒大盘刷新循环。
+        self.em_moneyflow_cache = EMMoneyflowCache()
         self.dark_pool_monitor = DarkPoolMonitor(
             settings,
             context_provider=self._get_context,
-            tape_fetcher=self._fetch_transaction_flow,
             sector_mapper=self._stock_board_display_map_for_level,
+            sector_members_provider=self._sector_members_for_level,
+            em_cache=self.em_moneyflow_cache,
         )
         self._context_cache: DashboardContext | None = None
         self._context_cache_at: float = 0.0
@@ -365,14 +368,34 @@ class DashboardService:
             max_entries=8,
         )
 
-    def dark_pool_payload(self) -> dict[str, Any]:
-        """暗盘资金面板数据：只读缓存/本地库，绝不在请求路径发行情请求。"""
-        payload = self.dark_pool_monitor.payload()
+    def dark_pool_payload(self, sector: str | None = None, board_level: int | str = 3) -> dict[str, Any]:
+        """暗盘资金面板数据：只读缓存/本地库，绝不在请求路径发行情请求。
+
+        sector/board_level：首页板块联动——传入当前选中板块时，
+        面板内个股级榜单按该板块成员过滤（板块汇总保持全市场口径）。
+        """
+        level = int(normalize_board_level(board_level))
+        payload = self.dark_pool_monitor.payload(sector=sector, board_level=level)
         policy = self._market_refresh_policy()
         payload["session"] = policy["market_session"]
         payload["is_trading_window"] = policy["is_trading_window"]
         payload["refresh_policy"] = policy
         return payload
+
+    def dark_pool_stock_payload(self, code: str) -> dict[str, Any]:
+        """个股暗盘资金摘要（详情页右栏）：本地库 + 东财快照，零行情请求。"""
+        return self.dark_pool_monitor.stock_payload(code)
+
+    def _sector_members_for_level(self, level: int = 3) -> dict[str, list[str]]:
+        """板块名 → 成员代码（easy_tdx 口径，1/2/3 申万行业，4/5/6 概念/风格/地区）。
+
+        供暗盘面板做板块联动过滤；复用板块成员缓存，失败时返回空（不过滤）。
+        """
+        try:
+            board_context = self.data_source.fetch_board_context(normalize_board_level(level))
+        except Exception:  # noqa: BLE001
+            return {}
+        return self._board_members_by_sector(board_context)
 
     def terminal(
         self,

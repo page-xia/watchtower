@@ -103,7 +103,7 @@
 
 @layer utilities {
   .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
-  .panel-title { @apply text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground; }
+  .panel-title { @apply text-[11px] font-semibold uppercase tracking-[0.14em] leading-[13px] text-muted-foreground; }
   .terminal-panel { @apply rounded-lg border border-border bg-card; }
 }
 

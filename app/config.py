@@ -173,11 +173,10 @@ class AppSettings:
         self.transaction_rows = int(os.getenv("WATCH_TRANSACTION_ROWS", "240"))
         self.auction_history_max_points = int(os.getenv("WATCH_AUCTION_HISTORY_MAX_POINTS", "180"))
         self.auction_history_file = Path(os.getenv("WATCH_AUCTION_HISTORY_FILE", str(AUCTION_HISTORY_FILE)))
-        # 暗盘资金模块：盘中大单推断走独立慢循环（默认 120s 一轮、24 只有界池、
-        # 4 线程），与 5 秒大盘刷新循环完全隔离；WATCH_DARK_POOL=0 可整体关闭。
+        # 暗盘资金模块：官方口径读本地 tushare_eod.sqlite（300s TTL），
+        # 盘中资金地图走东财快照缓存（WATCH_EM_MONEYFLOW=0 关闭，TTL 见 em_moneyflow.py）；
+        # 均与 5 秒大盘刷新循环完全隔离；WATCH_DARK_POOL=0 可整体关闭。
         self.dark_pool_enabled = os.getenv("WATCH_DARK_POOL", "1").lower() in {"1", "true", "yes"}
-        self.dark_pool_refresh_seconds = max(30, int(os.getenv("WATCH_DARK_POOL_REFRESH_SECONDS", "120")))
-        self.dark_pool_pool_size = max(5, min(40, int(os.getenv("WATCH_DARK_POOL_POOL_SIZE", "24"))))
         self.opening_decision_file = Path(
             os.getenv("WATCH_OPENING_DECISION_FILE", str(OPENING_DECISION_FILE))
         )

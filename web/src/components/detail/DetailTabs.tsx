@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import type { AuctionSnapshot, ChipDaily, ChipIntraday, DetailExtrasResponse, MessageEvidence } from "@/types/api"
-import { getDetailExtras, type DetailExtrasOptions } from "@/lib/api"
+import type { AuctionSnapshot, ChipDaily, ChipIntraday, DetailExtrasResponse, MessageDetailResponse, MessageEvidence } from "@/types/api"
+import { getDetailExtras, getMessageDetail, type DetailExtrasOptions } from "@/lib/api"
 import { dateShort, fmtAmount, timeShort } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { messageBody, messageKeywords, messageMetaLabels } from "./messagePresentation"
 import { F10Pane } from "./F10Pane"
 import { CapitalFlowPane, ChanlunPane, IndicatorsPane } from "./ExtrasPanes"
 import { ChipDailyPane, ChipIntradayPane } from "./ChipPane"
+import { DarkPoolStockPane } from "./DarkPoolStockPane"
 
 type TabKey = "chip" | "messages" | "ai" | "auction" | "capital" | "indicators" | "fundamentals" | "chanlun"
 type MessageScope = "stock" | "sector"
@@ -24,10 +25,43 @@ const TABS: { key: TabKey; label: string }[] = [
 
 function MessageCard({ msg }: { msg: MessageEvidence }) {
   const [expanded, setExpanded] = useState(false)
+  const [detail, setDetail] = useState<MessageDetailResponse | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [detailError, setDetailError] = useState<string | null>(null)
+  const mountedRef = useRef(true)
   const bullish = msg.direction === "1"
-  const body = messageBody(msg)
+  const body = messageBody(msg, expanded ? detail : null)
   const metaLabels = messageMetaLabels(msg)
   const keywords = messageKeywords(msg)
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  const loadFullDetail = () => {
+    if (!msg.event_id || detail || detailLoading) return
+    setDetailLoading(true)
+    setDetailError(null)
+    getMessageDetail(msg.event_id)
+      .then((payload) => {
+        if (mountedRef.current) setDetail(payload)
+      })
+      .catch((err) => {
+        if (mountedRef.current) setDetailError(err instanceof Error ? err.message : String(err))
+      })
+      .finally(() => {
+        if (mountedRef.current) setDetailLoading(false)
+      })
+  }
+
+  const toggleExpanded = () => {
+    const nextExpanded = !expanded
+    setExpanded(nextExpanded)
+    if (nextExpanded) loadFullDetail()
+  }
+
   return (
     <div className="rounded-md border border-border/60 bg-background/40 p-2.5">
       <div className="flex items-start justify-between gap-2">
@@ -50,9 +84,15 @@ function MessageCard({ msg }: { msg: MessageEvidence }) {
       </div>
       <div
         className={cn("mt-1.5 cursor-pointer whitespace-pre-wrap text-[11px] leading-relaxed text-foreground/80", !expanded && "line-clamp-3")}
-        onClick={() => setExpanded(!expanded)}
+        onClick={toggleExpanded}
       >
         {body}
+        {expanded && detailLoading && (
+          <span className="mt-1 block text-[10px] text-muted-foreground">加载完整消息...</span>
+        )}
+        {expanded && detailError && (
+          <span className="mt-1 block text-[10px] text-destructive" title={detailError}>完整消息加载失败</span>
+        )}
       </div>
       {keywords.length > 0 && (
         <div className="mt-1.5 flex flex-wrap gap-1">
@@ -340,12 +380,16 @@ export function DetailTabs({ coreExtras, error, code, watchlistCodes, chipDaily,
                 {chipModeOverride ? "手动查看" : "跟随主图"}
               </span>
             </div>
-            <div className="min-h-0 flex-1">
+            {/* 筹码峰压缩到 3/5 高度，下方 2/5 放该股暗盘资金（多日资金流/大宗/北向/两融） */}
+            <div className="min-h-0 flex-[3]">
               {chipMode === "daily" ? (
                 <ChipDailyPane chip={chipDaily} />
               ) : (
                 <ChipIntradayPane chip={chipIntraday} />
               )}
+            </div>
+            <div className="flex min-h-0 flex-[2] flex-col border-t border-border/60">
+              <DarkPoolStockPane code={code} />
             </div>
           </div>
         ) : tab === "fundamentals" ? (

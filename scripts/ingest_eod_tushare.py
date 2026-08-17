@@ -13,6 +13,12 @@
   daily_basic     每日指标（换手、量比、PE/PB、市值）
   limit_list_d    涨跌停统计（给涨停情绪梯队做 T+1 校验）
 
+暗盘资金扩展（2026-08-18 实测 5000 积分覆盖）：
+  hsgt_top10      沪深股通十大成交股（当日北向大手，含 buy/sell/net_amount）
+  hk_hold         沪深股通个股持股（T+1，959 只标的，vol/ratio）
+  moneyflow_dc    东财口径全市场资金流向 EOD（含超大单 buy_elg）
+  moneyflow_ths   同花顺口径资金流向 EOD（自带 5 日净额 net_d5_amount）
+
 用法：
   .\\.venv\\Scripts\\python.exe scripts\\ingest_eod_tushare.py                 # 最近已收盘交易日
   .\\.venv\\Scripts\\python.exe scripts\\ingest_eod_tushare.py --date 20260812 # 指定交易日
@@ -86,6 +92,27 @@ DATASETS: dict[str, dict] = {
         "kwargs": lambda d: {"trade_date": d},
         "date_col": "trade_date",
         "desc": "涨跌停统计",
+    },
+    # ---- 暗盘资金扩展（2026-08-18 实测 5000 积分覆盖）----
+    "hsgt_top10": {
+        "kwargs": lambda d: {"trade_date": d},
+        "date_col": "trade_date",
+        "desc": "沪深股通十大成交",
+    },
+    "hk_hold": {
+        "kwargs": lambda d: {"trade_date": d},
+        "date_col": "trade_date",
+        "desc": "沪深股通持股",
+    },
+    "moneyflow_dc": {
+        "kwargs": lambda d: {"trade_date": d},
+        "date_col": "trade_date",
+        "desc": "东财口径资金流向",
+    },
+    "moneyflow_ths": {
+        "kwargs": lambda d: {"trade_date": d},
+        "date_col": "trade_date",
+        "desc": "同花顺口径资金流向",
     },
 }
 

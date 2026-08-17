@@ -1,234 +1,589 @@
-"""暗盘资金盯盘模块（大单推断 + Tushare 收盘口径）。
+"""暗盘资金盯盘模块（2026-08-18 重构）。
 
-两层口径，严格分开标注（见 AGENTS.md 数据边界）：
+「暗盘资金」拆成四个可回答的口径，数据源分层严格标注（见 AGENTS.md 数据边界）：
 
-- 盘中「大单推断」：easy_tdx L1 成交磁带的大单印花拆出
-  （单笔成交额 ≥ max(50万, 5×中位数)），小单噪声不进净买比。
-  这是推断信号，不是隐藏主力单真值——L1 看不到委托队列/冰山单。
-- 盘后「官方口径」：Tushare moneyflow（主力净额）+ block_trade（大宗交易，
-  字面意义的暗盘成交）+ 龙虎榜命中，收盘后由 scripts/ingest_eod_tushare.py
-  落库到 data/runtime/tushare_eod.sqlite，本模块只读本地库。
+1. 背景条：全市场主力净额（Tushare moneyflow EOD 合计）＋ 东财盘中主力净额合计
+   ＋ 北向成交额（moneyflow_hsgt；2024-08 起交易所只披露成交额，无净额/方向）
+   ＋ 融资余额日变化（margin_detail，T+1 晚间落地）＋ 大宗交易当日总额。
+2. 暗吸 / 暗派（核心）：Tushare moneyflow 多日窗口 × daily_basic 收盘价/换手。
+   暗吸 = 近 5 日主力净额为正、净流入天数 ≥ 3 且区间涨跌幅 |≤3%|
+   （资金在进、价格没动）；暗派对称。「暗」来自多日连续 + 价格背离，
+   单日大额是「明」不是「暗」。
+3. 大手场外：北向十大成交（hsgt_top10，仅成交额）＋ 大宗交易（折溢价）
+   ＋ 龙虎榜机构席位净买（top_inst 中「机构」席位聚合）。
+4. 盘中资金地图：东财 push2 全市场资金流（推断口径，见 em_moneyflow.py 注释），
+   板块归组一律走 easy_tdx 申万 1/2/3 级映射，不用第三方 taxonomy。
+
+个股摘要 stock_payload(code)：详情页右侧「暗盘资金」区使用。
 
 性能边界（首页不能被拖慢）：
 
 - HTTP 端点只读内存缓存 / 本地 SQLite（带 TTL），永远不在请求路径上发
-  行情网络请求；
-- 盘中磁带读取在独立守护线程里按慢节奏跑（默认 120s 一轮），股票池有界
-  （默认 24 只：自选股 + 成交额 top），与 5 秒大盘刷新循环完全隔离；
-- 非交易时段 / replay 模式下磁带线程自动休眠，只出官方口径数据。
+  行情网络请求；东财快照由 em_moneyflow.EMMoneyflowCache 后台一次性线程补齐；
+- 原「24 只自选股磁带大单推断慢循环」已下线（2026-08-18）：样本太小、
+  口径与详情页磁带重复；逐笔磁带回归「个股详情按需读取」的既定边界。
 """
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from pathlib import Path
 import sqlite3
-import threading
 import time
 from typing import Any, Callable
 
 from app.config import AppSettings
-from app.data_sources import china_now, is_trading_window, market_session
-from app.models import Quote, TransactionFlowObservation
+from app.data_sources import china_now, market_session
 
 logger = logging.getLogger(__name__)
 
 EOD_DB_FILE = "tushare_eod.sqlite"
 
-# 大单推断打标阈值
-ABSORB_RATIO_PCT = 20.0   # 大单净流入占比 ≥ 20% 且价格滞涨 → 疑似暗吸
-ABSORB_PRICE_PCT = 1.0    # 「滞涨」判定：|涨幅| ≤ 1%
-MIN_LARGE_TOTAL = 1_000_000.0  # 大单成交总额低于 100 万不参与打标（噪声）
+# 暗吸/暗派判定窗口与阈值
+ABSORB_WINDOW_DAYS = 5       # 近 N 个交易日
+ABSORB_MIN_DAYS = 3          # 其中同向净流入天数 ≥ 3
+ABSORB_MAX_PRICE_PCT = 3.0   # 价格「没动」：区间涨跌幅 |≤3%|
+ABSORB_MIN_NET = 30_000_000  # 窗口净额低于 3000 万不参与（噪声）
 
-
-def _now_hhmm() -> int:
-    now = china_now()
-    return now.hour * 100 + now.minute
-
-
-def _tape_window_open() -> bool:
-    """盘中磁带读取窗口：工作日 09:30-15:00。"""
-    if china_now().weekday() >= 5:
-        return False
-    hhmm = _now_hhmm()
-    return 930 <= hhmm <= 1500
+EOD_CACHE_TTL_SECONDS = 300
 
 
 class DarkPoolMonitor:
-    """暗盘资金监控：盘中大单推断慢循环 + 官方口径本地库读取。"""
+    """暗盘资金监控：官方口径本地库读取 + 东财盘中快照 + 板块联动过滤。"""
 
     def __init__(
         self,
         settings: AppSettings,
         context_provider: Callable[[], Any],
-        tape_fetcher: Callable[..., TransactionFlowObservation],
         sector_mapper: Callable[[int], dict[str, str]] | None = None,
+        sector_members_provider: Callable[[int], dict[str, list[str]]] | None = None,
+        em_cache: Any = None,
     ) -> None:
         self.settings = settings
         self._context_provider = context_provider
-        self._tape_fetcher = tape_fetcher
         self._sector_mapper = sector_mapper
+        self._sector_members_provider = sector_members_provider
+        self._em = em_cache
         self._db_path = Path(settings.data_dir) / "runtime" / EOD_DB_FILE
 
-        self._lock = threading.Lock()
-        self._intraday_cache: dict[str, Any] = {"available": False, "rows": [], "note": "等待首个盘中周期"}
-        self._intraday_cache_at: float = 0.0
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
-
         self._eod_cache: tuple[float, dict[str, Any]] | None = None
-        self._eod_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 对外入口：只读缓存，绝不阻塞
     # ------------------------------------------------------------------
-    def payload(self) -> dict[str, Any]:
-        self._ensure_thread()
-        with self._lock:
-            intraday = dict(self._intraday_cache)
+    def payload(self, sector: str | None = None, board_level: int = 3) -> dict[str, Any]:
+        eod = self._eod_payload()
+        em_section = self._em_section()
+
+        sector_filter = self._resolve_sector_filter(sector, board_level)
+        member_codes: set[str] | None = None
+        if sector_filter and sector_filter["member_count"] > 0:
+            member_codes = set(sector_filter.pop("member_codes"))
+
+        def pick(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            if member_codes is None:
+                return rows
+            return [r for r in rows if str(r.get("code") or "") in member_codes]
+
+        absorb = dict(eod.get("absorb") or {})
+        if absorb.get("available"):
+            absorb["inflow"] = pick(absorb.get("inflow") or [])
+            absorb["outflow"] = pick(absorb.get("outflow") or [])
+
+        offmarket = dict(eod.get("offmarket") or {})
+        if offmarket.get("available"):
+            for key in ("north_top10", "blocks", "top_inst"):
+                offmarket[key] = pick(offmarket.get(key) or [])
+
+        if em_section.get("available"):
+            em_section["inflow"] = pick(em_section.get("inflow") or [])
+            em_section["outflow"] = pick(em_section.get("outflow") or [])
+
         return {
             "as_of": china_now().strftime("%H:%M:%S"),
             "session": market_session(),
             "enabled": bool(self.settings.dark_pool_enabled),
-            "intraday": intraday,
-            "eod": self._eod_payload(),
+            "market": self._market_strip(eod, em_section),
+            "absorb": absorb,
+            "offmarket": offmarket,
+            "em": em_section,
+            "sector_filter": sector_filter,
         }
 
-    # ------------------------------------------------------------------
-    # 盘中：独立慢循环读 L1 磁带大单
-    # ------------------------------------------------------------------
-    def _ensure_thread(self) -> None:
-        if not self.settings.dark_pool_enabled:
-            return
-        if self.settings.data_mode == "replay":
-            return
-        if self._thread and self._thread.is_alive():
-            return
-        if not _tape_window_open() and self._intraday_cache_at:
-            return  # 盘后已有冻结结果，不再起线程
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name="dark-pool-monitor",
-            daemon=True,
-        )
-        self._thread.start()
+    def stock_payload(self, code: str) -> dict[str, Any]:
+        """个股暗盘资金摘要：详情页右栏使用。全部本地库 + 东财快照，零行情请求。"""
+        code = str(code or "").strip().zfill(6)
+        if not code.isdigit():
+            return {"available": False, "note": "无效代码"}
+        names = self._name_map()
+        payload: dict[str, Any] = {
+            "available": True,
+            "code": code,
+            "name": names.get(code, code),
+            "as_of": china_now().strftime("%H:%M:%S"),
+        }
+        payload.update(self._stock_eod(code))
+        em_row = self._em_row(code)
+        if em_row:
+            payload["em"] = em_row
+        return payload
 
-    def _run_loop(self) -> None:
-        while not self._stop.is_set():
-            if _tape_window_open() and is_trading_window():
-                age = time.monotonic() - self._intraday_cache_at
-                if age >= self.settings.dark_pool_refresh_seconds:
-                    started = time.monotonic()
-                    try:
-                        snapshot = self._collect_intraday()
-                        with self._lock:
-                            self._intraday_cache = snapshot
-                            self._intraday_cache_at = time.monotonic()
-                    except Exception as exc:  # noqa: BLE001 - 周期失败不拖垮线程
-                        logger.warning("dark pool intraday cycle failed: %s", exc)
-                        with self._lock:
-                            self._intraday_cache_at = time.monotonic()
-                    elapsed = time.monotonic() - started
-                    if elapsed > 20:
-                        logger.warning("dark pool cycle slow: %.1fs", elapsed)
-            self._stop.wait(2.0)
-
-    def _pool_quotes(self) -> list[Quote]:
-        """有界股票池：自选 + 全市场成交额 top，涨停一字板除外。"""
+    # ------------------------------------------------------------------
+    # 板块联动：把首页选中的板块解析成成员代码集合
+    # ------------------------------------------------------------------
+    def _resolve_sector_filter(self, sector: str | None, board_level: int) -> dict[str, Any] | None:
+        sector = str(sector or "").strip()
+        if not sector:
+            return None
+        info: dict[str, Any] = {"sector": sector, "board_level": board_level, "member_count": 0, "member_codes": []}
+        if not callable(self._sector_members_provider):
+            return info
         try:
-            context = self._context_provider()
+            members_by_sector = self._sector_members_provider(board_level) or {}
         except Exception:  # noqa: BLE001
-            return []
-        quotes = list(getattr(getattr(context, "snapshot", None), "quotes", []) or [])
-        watchlist = {str(item.code) for item in getattr(context, "watchlist", []) or []}
-        pool_size = self.settings.dark_pool_pool_size
+            return info
+        codes = members_by_sector.get(sector) or []
+        info["member_codes"] = list(codes)
+        info["member_count"] = len(codes)
+        return info
 
-        def eligible(q: Quote) -> bool:
-            return bool(q.code) and not q.limit_up and not q.limit_down and float(q.amount or 0) > 0
-
-        picked: dict[str, Quote] = {}
-        for q in quotes:  # 自选股优先入池
-            if q.code in watchlist and eligible(q):
-                picked[q.code] = q
-        by_amount = sorted((q for q in quotes if eligible(q)), key=lambda q: q.amount, reverse=True)
-        for q in by_amount:
-            if len(picked) >= pool_size:
-                break
-            picked.setdefault(q.code, q)
-        return list(picked.values())
-
-    def _collect_intraday(self) -> dict[str, Any]:
-        pool = self._pool_quotes()
-        quotes_by_code = {q.code: q for q in pool}
+    # ------------------------------------------------------------------
+    # 盘中资金地图：东财快照 + easy_tdx 板块归组
+    # ------------------------------------------------------------------
+    def _em_section(self) -> dict[str, Any]:
+        if self._em is None:
+            return {"available": False, "note": "东财源未接线"}
+        snap = self._em.snapshot()
+        if not snap.get("available"):
+            return {"available": False, "note": snap.get("note") or "东财资金流不可用"}
+        snap_rows = snap.get("rows")
+        rows = list(snap_rows.values()) if isinstance(snap_rows, dict) else list(snap_rows or [])
         sector_maps = self._sector_maps_all_levels()
         sectors_l3 = sector_maps.get(3) or {}
-        rows: list[dict[str, Any]] = []
-        errors = 0
 
-        def fetch(code: str) -> TransactionFlowObservation:
-            return self._tape_fetcher(code, None, True)
+        def view(row: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "code": row["code"],
+                "name": row["name"],
+                "sector": sectors_l3.get(row["code"], ""),
+                "change_pct": round(float(row.get("change_pct") or 0), 2),
+                "main_net": round(float(row.get("main_net") or 0), 0),
+                "main_pct": round(float(row.get("main_pct") or 0), 1),
+                "elg_net": round(float(row.get("elg_net") or 0), 0),
+            }
 
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="dark-pool-tape") as executor:
-            futures = {executor.submit(fetch, q.code): q.code for q in pool}
-            for future in as_completed(futures):
-                code = futures[future]
-                quote = quotes_by_code.get(code)
-                try:
-                    obs = future.result()
-                except Exception:  # noqa: BLE001
-                    errors += 1
-                    continue
-                if not obs.available or not quote:
-                    continue
-                large_buy = float(obs.large_buy_amount or 0)
-                large_sell = float(obs.large_sell_amount or 0)
-                total = large_buy + large_sell
-                if total < MIN_LARGE_TOTAL:
-                    continue
-                net = large_buy - large_sell
-                ratio = net / total * 100
-                change_pct = float(quote.change_pct or 0)
-                rows.append(
-                    {
-                        "code": code,
-                        "name": quote.name,
-                        "sector": sectors_l3.get(code, ""),
-                        "change_pct": round(change_pct, 2),
-                        "large_buy_amount": round(large_buy, 0),
-                        "large_sell_amount": round(large_sell, 0),
-                        "net_amount": round(net, 0),
-                        "net_ratio_pct": round(ratio, 1),
-                        "tag": self._tag(net, ratio, change_pct),
-                    }
-                )
-        rows.sort(key=lambda r: abs(float(r["net_amount"])), reverse=True)
-        rows = rows[:15]
+        inflow = [view(r) for r in sorted(rows, key=lambda r: float(r.get("main_net") or 0), reverse=True)[:15] if float(r.get("main_net") or 0) > 0]
+        outflow = [view(r) for r in sorted(rows, key=lambda r: float(r.get("main_net") or 0))[:10] if float(r.get("main_net") or 0) < 0]
+        total_main = sum(float(r.get("main_net") or 0) for r in rows)
         return {
-            "available": bool(rows),
-            "refreshed_at": china_now().strftime("%H:%M:%S"),
-            "pool_size": len(pool),
-            "errors": errors,
-            "source": "easy_tdx L1 成交磁带大单拆出（推断，非隐藏单真值）",
-            "refresh_seconds": self.settings.dark_pool_refresh_seconds,
-            "rows": rows,
-            "sector_rollup": self._sector_rollup(rows, "net_amount"),
+            "available": True,
+            "as_of": snap.get("as_of") or "",
+            "stock_count": snap.get("stock_count") or len(rows),
+            "total_main_net": round(total_main, 0),
+            "stale_error": snap.get("stale_error") or "",
+            "source": "东财 push2 盘中资金流（按单笔金额分桶的推断口径，非隐藏单真值）",
+            "inflow": inflow,
+            "outflow": outflow,
             "sector_rollup_by_level": {
                 f"l{level}": self._sector_rollup(
-                    [dict(r, sector=(sector_maps.get(level) or {}).get(str(r["code"]), "")) for r in rows],
-                    "net_amount",
+                    [dict(view(r), sector=(sector_maps.get(level) or {}).get(r["code"], "")) for r in rows],
+                    "main_net",
                 )
                 for level in (1, 2, 3)
             },
         }
 
+    def _em_row(self, code: str) -> dict[str, Any] | None:
+        if self._em is None:
+            return None
+        snap = self._em.snapshot()
+        rows = snap.get("rows")
+        if not snap.get("available") or not isinstance(rows, dict):
+            return None
+        row = rows.get(code)
+        if not row:
+            return None
+        return {
+            "as_of": snap.get("as_of") or "",
+            "main_net": round(float(row.get("main_net") or 0), 0),
+            "main_pct": round(float(row.get("main_pct") or 0), 1),
+            "elg_net": round(float(row.get("elg_net") or 0), 0),
+            "lg_net": round(float(row.get("lg_net") or 0), 0),
+        }
+
+    # ------------------------------------------------------------------
+    # 背景条
+    # ------------------------------------------------------------------
+    def _market_strip(self, eod: dict[str, Any], em_section: dict[str, Any]) -> dict[str, Any]:
+        market = dict(eod.get("market") or {})
+        if em_section.get("available"):
+            market["em_main_net"] = em_section.get("total_main_net")
+            market["em_as_of"] = em_section.get("as_of")
+        market["available"] = bool(market)
+        return market
+
+    # ------------------------------------------------------------------
+    # 官方口径：本地 SQLite（300s TTL）
+    # ------------------------------------------------------------------
+    def _eod_payload(self) -> dict[str, Any]:
+        now = time.monotonic()
+        cache = self._eod_cache
+        if cache and now - cache[0] < EOD_CACHE_TTL_SECONDS:
+            return dict(cache[1])
+        payload = self._load_eod()
+        self._eod_cache = (now, payload)
+        return dict(payload)
+
+    def _query(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
+        conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=2)
+        conn.row_factory = sqlite3.Row
+        try:
+            return conn.execute(sql, args).fetchall()
+        finally:
+            conn.close()
+
+    def _latest_date(self, table: str) -> str:
+        row = self._query(f'SELECT MAX(trade_date) AS d FROM "{table}"')
+        return str(row[0]["d"] or "") if row else ""
+
+    def _load_eod(self) -> dict[str, Any]:
+        if not self._db_path.exists():
+            return {"available": False, "note": "尚未跑收盘管线 scripts/ingest_eod_tushare.py"}
+        try:
+            trade_date = self._latest_date("moneyflow")
+            if not trade_date:
+                return {"available": False, "note": "tushare_eod.sqlite 中暂无 moneyflow 数据"}
+            names = self._name_map()
+            sectors = self._sector_map(3)
+            return {
+                "available": True,
+                "trade_date": trade_date,
+                "market": self._load_market(trade_date),
+                "absorb": self._load_absorb(names, sectors),
+                "offmarket": self._load_offmarket(names, sectors),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dark pool eod load failed: %s", exc)
+            return {"available": False, "note": f"读取本地库失败：{exc}"}
+
+    def _load_market(self, trade_date: str) -> dict[str, Any]:
+        market: dict[str, Any] = {"trade_date": trade_date}
+        row = self._query("SELECT SUM(net_mf_amount) AS v FROM moneyflow WHERE trade_date = ?", (trade_date,))
+        if row and row[0]["v"] is not None:
+            # moneyflow 金额单位万元 → 元
+            market["main_net_amount"] = round(float(row[0]["v"]) * 10000, 0)
+
+        hsgt_date = self._latest_date("moneyflow_hsgt")
+        if hsgt_date:
+            row = self._query("SELECT north_money FROM moneyflow_hsgt WHERE trade_date = ?", (hsgt_date,))
+            try:
+                # 百万元 → 元；2024-08 起北向只披露成交额，无净额口径
+                market["north_turnover"] = round(float(row[0]["north_money"]) * 1e6, 0) if row and row[0]["north_money"] is not None else None
+                market["north_trade_date"] = hsgt_date
+            except (TypeError, ValueError):
+                pass
+
+        margin_dates = [str(r["d"]) for r in self._query("SELECT DISTINCT trade_date AS d FROM margin_detail ORDER BY d DESC LIMIT 2")]
+        if margin_dates:
+            def rzye(d: str) -> float:
+                row = self._query("SELECT SUM(rzye) AS v FROM margin_detail WHERE trade_date = ?", (d,))
+                return float(row[0]["v"] or 0) if row else 0.0
+
+            latest = rzye(margin_dates[0])
+            market["margin_trade_date"] = margin_dates[0]
+            market["margin_balance"] = round(latest, 0)
+            if len(margin_dates) > 1:
+                market["margin_change"] = round(latest - rzye(margin_dates[1]), 0)
+
+        row = self._query("SELECT SUM(amount) AS v FROM block_trade WHERE trade_date = ?", (trade_date,))
+        if row and row[0]["v"] is not None:
+            market["block_amount"] = round(float(row[0]["v"]) * 10000, 0)
+        return market
+
+    def _load_absorb(self, names: dict[str, str], sectors: dict[str, str]) -> dict[str, Any]:
+        """暗吸/暗派：多日连续同向净额 + 价格滞涨/抗跌。"""
+        dates = [str(r["d"]) for r in self._query("SELECT DISTINCT trade_date AS d FROM moneyflow ORDER BY d DESC LIMIT ?", (ABSORB_WINDOW_DAYS,))]
+        if len(dates) < ABSORB_MIN_DAYS:
+            return {"available": False, "note": f"历史不足（{len(dates)}/{ABSORB_WINDOW_DAYS} 天），跑 scripts/ingest_eod_tushare.py --date 回填"}
+        dates = sorted(dates)
+        placeholders = ",".join("?" for _ in dates)
+        rows = self._query(
+            "SELECT m.ts_code, m.trade_date, m.net_mf_amount, d.close, d.turnover_rate"
+            " FROM moneyflow m LEFT JOIN daily_basic d"
+            "   ON m.ts_code = d.ts_code AND m.trade_date = d.trade_date"
+            f" WHERE m.trade_date IN ({placeholders})",
+            tuple(dates),
+        )
+        by_code: dict[str, list[tuple[str, float, float, float]]] = {}
+        for r in rows:
+            by_code.setdefault(str(r["ts_code"]), []).append(
+                (
+                    str(r["trade_date"]),
+                    float(r["net_mf_amount"] or 0) * 10000,  # 万元 → 元
+                    float(r["close"] or 0),
+                    float(r["turnover_rate"] or 0),
+                )
+            )
+
+        inflow: list[dict[str, Any]] = []
+        outflow: list[dict[str, Any]] = []
+        for ts_code, items in by_code.items():
+            items.sort(key=lambda x: x[0])
+            net_total = sum(x[1] for x in items)
+            pos_days = sum(1 for x in items if x[1] > 0)
+            neg_days = sum(1 for x in items if x[1] < 0)
+            closes = [x[2] for x in items if x[2] > 0]
+            chg_pct = (closes[-1] / closes[0] - 1) * 100 if len(closes) >= 2 else 0.0
+            if abs(chg_pct) > ABSORB_MAX_PRICE_PCT:
+                continue
+            if abs(net_total) < ABSORB_MIN_NET:
+                continue
+            turnover_vals = [x[3] for x in items if x[3] > 0]
+            code = ts_code[:6]
+            row = {
+                "code": code,
+                "name": names.get(code, code),
+                "sector": sectors.get(code, ""),
+                "net_window": round(net_total, 0),
+                "pos_days": pos_days,
+                "neg_days": neg_days,
+                "days": len(items),
+                "window_chg_pct": round(chg_pct, 2),
+                "turnover_avg": round(sum(turnover_vals) / len(turnover_vals), 2) if turnover_vals else 0.0,
+                "close": round(closes[-1], 2) if closes else 0.0,
+            }
+            if net_total > 0 and pos_days >= ABSORB_MIN_DAYS:
+                inflow.append(row)
+            elif net_total < 0 and neg_days >= ABSORB_MIN_DAYS:
+                outflow.append(row)
+        inflow.sort(key=lambda r: r["net_window"], reverse=True)
+        outflow.sort(key=lambda r: r["net_window"])
+        return {
+            "available": bool(inflow or outflow),
+            "window_dates": dates,
+            "window_days": len(dates),
+            "rule": f"近{len(dates)}日同向净额≥{ABSORB_MIN_DAYS}天 且 区间涨跌幅|≤{ABSORB_MAX_PRICE_PCT}%|",
+            "source": "Tushare moneyflow 多日窗口 × daily_basic 收盘价（推断口径）",
+            "inflow": inflow[:12],
+            "outflow": outflow[:12],
+        }
+
+    def _load_offmarket(self, names: dict[str, str], sectors: dict[str, str]) -> dict[str, Any]:
+        """大手场外：北向十大成交 + 大宗交易 + 龙虎榜机构席位。"""
+        trade_date = self._latest_date("moneyflow")
+
+        north_date = self._latest_date("hsgt_top10")
+        north_top10: list[dict[str, Any]] = []
+        if north_date:
+            for r in self._query(
+                "SELECT ts_code, name, close, change, amount FROM hsgt_top10"
+                " WHERE trade_date = ? ORDER BY amount DESC LIMIT 10",
+                (north_date,),
+            ):
+                code = str(r["ts_code"])[:6]
+                north_top10.append(
+                    {
+                        "code": code,
+                        "name": names.get(code, str(r["name"] or code)),
+                        "sector": sectors.get(code, ""),
+                        "change_pct": round(float(r["change"] or 0), 2),
+                        "amount": round(float(r["amount"] or 0), 0),  # 单位元；仅成交额无方向
+                    }
+                )
+
+        blocks: list[dict[str, Any]] = []
+        if trade_date:
+            top_list_codes = {
+                str(r["ts_code"])
+                for r in self._query("SELECT DISTINCT ts_code FROM top_list WHERE trade_date = ?", (trade_date,))
+            }
+            for r in self._query(
+                "SELECT b.ts_code, b.price, b.vol, b.amount, d.close,"
+                "       ROUND((b.price / d.close - 1) * 100, 2) AS premium_pct"
+                " FROM block_trade b JOIN daily_basic d"
+                "   ON b.ts_code = d.ts_code AND b.trade_date = d.trade_date"
+                " WHERE b.trade_date = ? ORDER BY b.amount DESC LIMIT 10",
+                (trade_date,),
+            ):
+                code = str(r["ts_code"])[:6]
+                blocks.append(
+                    {
+                        "code": code,
+                        "name": names.get(code, code),
+                        "sector": sectors.get(code, ""),
+                        "price": float(r["price"] or 0),
+                        "close": float(r["close"] or 0),
+                        "amount": round(float(r["amount"] or 0) * 10000, 0),  # 万元 → 元
+                        "premium_pct": float(r["premium_pct"] or 0),
+                        "on_top_list": str(r["ts_code"]) in top_list_codes,
+                    }
+                )
+
+        inst_date = self._latest_date("top_inst")
+        top_inst: list[dict[str, Any]] = []
+        if inst_date:
+            for r in self._query(
+                "SELECT ts_code,"
+                "       SUM(CASE WHEN exalter LIKE '%机构%' THEN net_buy ELSE 0 END) AS inst_net,"
+                "       SUM(net_buy) AS total_net, COUNT(*) AS seats"
+                " FROM top_inst WHERE trade_date = ?"
+                " GROUP BY ts_code HAVING inst_net != 0"
+                " ORDER BY ABS(inst_net) DESC LIMIT 10",
+                (inst_date,),
+            ):
+                code = str(r["ts_code"])[:6]
+                top_inst.append(
+                    {
+                        "code": code,
+                        "name": names.get(code, code),
+                        "sector": sectors.get(code, ""),
+                        "inst_net": round(float(r["inst_net"] or 0), 0),  # 单位元
+                        "total_net": round(float(r["total_net"] or 0), 0),
+                        "seats": int(r["seats"] or 0),
+                    }
+                )
+
+        return {
+            "available": bool(north_top10 or blocks or top_inst),
+            "trade_date": trade_date,
+            "north_trade_date": north_date,
+            "inst_trade_date": inst_date,
+            "north_note": "北向十大成交仅成交额：2024-08 起交易所不再披露北向个股买卖方向",
+            "north_top10": north_top10,
+            "blocks": blocks,
+            "top_inst": top_inst,
+        }
+
+    # ------------------------------------------------------------------
+    # 个股摘要（详情页）
+    # ------------------------------------------------------------------
+    def _stock_eod(self, code: str) -> dict[str, Any]:
+        if not self._db_path.exists():
+            return {"eod_available": False, "note": "尚未跑收盘管线 scripts/ingest_eod_tushare.py"}
+        ts_code = self._to_ts_code(code)
+        out: dict[str, Any] = {"eod_available": True}
+        try:
+            flow = [
+                {
+                    "trade_date": str(r["trade_date"]),
+                    "net": round(float(r["net_mf_amount"] or 0) * 10000, 0),
+                    "close": float(r["close"] or 0),
+                    "turnover": float(r["turnover_rate"] or 0),
+                }
+                for r in self._query(
+                    "SELECT m.trade_date, m.net_mf_amount, d.close, d.turnover_rate"
+                    " FROM moneyflow m LEFT JOIN daily_basic d"
+                    "   ON m.ts_code = d.ts_code AND m.trade_date = d.trade_date"
+                    " WHERE m.ts_code = ? ORDER BY m.trade_date DESC LIMIT 10",
+                    (ts_code,),
+                )
+            ]
+            flow.reverse()
+            out["flow_10d"] = flow
+            out["trade_date"] = flow[-1]["trade_date"] if flow else ""
+
+            window = flow[-ABSORB_WINDOW_DAYS:]
+            if window:
+                net_total = sum(x["net"] for x in window)
+                pos_days = sum(1 for x in window if x["net"] > 0)
+                neg_days = sum(1 for x in window if x["net"] < 0)
+                closes = [x["close"] for x in window if x["close"] > 0]
+                chg = (closes[-1] / closes[0] - 1) * 100 if len(closes) >= 2 else 0.0
+                flat = abs(chg) <= ABSORB_MAX_PRICE_PCT
+                if net_total > 0 and pos_days >= ABSORB_MIN_DAYS and flat:
+                    verdict = "疑似暗吸"
+                elif net_total < 0 and neg_days >= ABSORB_MIN_DAYS and flat:
+                    verdict = "疑似暗派"
+                elif net_total > 0:
+                    verdict = "主力净入"
+                elif net_total < 0:
+                    verdict = "主力净出"
+                else:
+                    verdict = "均衡"
+                out["verdict"] = {
+                    "label": verdict,
+                    "net_window": round(net_total, 0),
+                    "pos_days": pos_days,
+                    "neg_days": neg_days,
+                    "days": len(window),
+                    "window_chg_pct": round(chg, 2),
+                }
+
+            ths = self._query(
+                "SELECT net_amount, net_d5_amount FROM moneyflow_ths WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1",
+                (ts_code,),
+            )
+            if ths:
+                out["ths"] = {
+                    "net_today": round(float(ths[0]["net_amount"] or 0) * 10000, 0),
+                    "net_d5": round(float(ths[0]["net_d5_amount"] or 0) * 10000, 0),
+                }
+            dc = self._query(
+                "SELECT net_amount FROM moneyflow_dc WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1",
+                (ts_code,),
+            )
+            if dc:
+                out["dc"] = {"net_today": round(float(dc[0]["net_amount"] or 0) * 10000, 0)}
+
+            north = self._query(
+                "SELECT trade_date, amount FROM hsgt_top10 WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1",
+                (ts_code,),
+            )
+            if north:
+                out["north_top10"] = {"trade_date": str(north[0]["trade_date"]), "amount": round(float(north[0]["amount"] or 0), 0)}
+
+            blocks = self._query(
+                "SELECT b.trade_date, b.price, b.amount, d.close,"
+                "       ROUND((b.price / d.close - 1) * 100, 2) AS premium_pct"
+                " FROM block_trade b JOIN daily_basic d"
+                "   ON b.ts_code = d.ts_code AND b.trade_date = d.trade_date"
+                " WHERE b.ts_code = ? ORDER BY b.trade_date DESC LIMIT 5",
+                (ts_code,),
+            )
+            out["blocks"] = [
+                {
+                    "trade_date": str(r["trade_date"]),
+                    "price": float(r["price"] or 0),
+                    "close": float(r["close"] or 0),
+                    "amount": round(float(r["amount"] or 0) * 10000, 0),
+                    "premium_pct": float(r["premium_pct"] or 0),
+                }
+                for r in blocks
+            ]
+
+            margin_rows = self._query(
+                "SELECT trade_date, rzye, rzmre FROM margin_detail WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 2",
+                (ts_code,),
+            )
+            if margin_rows:
+                latest = {"trade_date": str(margin_rows[0]["trade_date"]), "rzye": round(float(margin_rows[0]["rzye"] or 0), 0)}
+                if len(margin_rows) > 1:
+                    latest["rzye_change"] = round(float(margin_rows[0]["rzye"] or 0) - float(margin_rows[1]["rzye"] or 0), 0)
+                out["margin"] = latest
+
+            top_hits = self._query(
+                "SELECT trade_date, reason FROM top_list WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 3",
+                (ts_code,),
+            )
+            out["top_list"] = [
+                {"trade_date": str(r["trade_date"]), "reason": str(r["reason"] or "")}
+                for r in top_hits
+            ]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dark pool stock eod failed for %s: %s", code, exc)
+            out["eod_available"] = False
+            out["note"] = f"读取本地库失败：{exc}"
+        return out
+
+    # ------------------------------------------------------------------
+    # 工具
+    # ------------------------------------------------------------------
     def _sector_map(self, level: int = 3) -> dict[str, str]:
         if not callable(self._sector_mapper):
             return {}
         try:
             return self._sector_mapper(level) or {}
         except TypeError:
-            # 兼容旧的无参 mapper（固定三级）
             try:
                 return self._sector_mapper() or {}  # type: ignore[call-arg]
             except Exception:  # noqa: BLE001
@@ -241,7 +596,7 @@ class DarkPoolMonitor:
 
     @staticmethod
     def _sector_rollup(rows: list[dict[str, Any]], amount_key: str) -> list[dict[str, Any]]:
-        """按板块汇总大单净额：板块内个股求和，按 |净额| 排序。"""
+        """按板块汇总净额：板块内个股求和，净流入 top8 + 净流出 top4。"""
         grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
             sector = str(row.get("sector") or "").strip() or "未分类"
@@ -252,137 +607,13 @@ class DarkPoolMonitor:
             if abs(net) > abs(bucket["top_net"]):
                 bucket["top_net"] = net
                 bucket["top_name"] = str(row.get("name") or row.get("code") or "")
-        result = sorted(grouped.values(), key=lambda b: abs(b["net_amount"]), reverse=True)
-        for bucket in result:
+        result = sorted(grouped.values(), key=lambda b: b["net_amount"], reverse=True)
+        picked = [b for b in result if b["net_amount"] > 0][:8] + [b for b in reversed(result) if b["net_amount"] < 0][:4]
+        picked.sort(key=lambda b: abs(b["net_amount"]), reverse=True)
+        for bucket in picked:
             bucket["net_amount"] = round(bucket["net_amount"], 0)
             bucket["top_net"] = round(bucket["top_net"], 0)
-        return result
-
-    @staticmethod
-    def _tag(net: float, ratio: float, change_pct: float) -> str:
-        if ratio >= ABSORB_RATIO_PCT and change_pct <= ABSORB_PRICE_PCT:
-            return "疑似暗吸"
-        if ratio <= -ABSORB_RATIO_PCT and change_pct >= -ABSORB_PRICE_PCT:
-            return "疑似派发"
-        if net > 0:
-            return "大单净买"
-        return "大单净卖"
-
-    # ------------------------------------------------------------------
-    # 盘后：Tushare 官方口径（本地 SQLite，TTL 缓存）
-    # ------------------------------------------------------------------
-    def _eod_payload(self) -> dict[str, Any]:
-        now = time.monotonic()
-        with self._eod_lock:
-            if self._eod_cache and now - self._eod_cache[0] < 300:
-                return dict(self._eod_cache[1])
-        payload = self._load_eod()
-        with self._eod_lock:
-            self._eod_cache = (now, payload)
-        return dict(payload)
-
-    def _load_eod(self) -> dict[str, Any]:
-        if not self._db_path.exists():
-            return {"available": False, "note": "尚未跑收盘管线 scripts/ingest_eod_tushare.py"}
-        try:
-            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=2)
-            conn.row_factory = sqlite3.Row
-            try:
-                trade_date_row = conn.execute(
-                    "SELECT MAX(trade_date) AS d FROM moneyflow"
-                ).fetchone()
-                trade_date = str(trade_date_row["d"] or "") if trade_date_row else ""
-                if not trade_date:
-                    return {"available": False, "note": "tushare_eod.sqlite 中暂无 moneyflow 数据"}
-
-                inflow = [
-                    dict(r)
-                    for r in conn.execute(
-                        "SELECT ts_code, net_mf_amount FROM moneyflow"
-                        " WHERE trade_date = ? ORDER BY net_mf_amount DESC LIMIT 10",
-                        (trade_date,),
-                    )
-                ]
-                outflow = [
-                    dict(r)
-                    for r in conn.execute(
-                        "SELECT ts_code, net_mf_amount FROM moneyflow"
-                        " WHERE trade_date = ? ORDER BY net_mf_amount ASC LIMIT 5",
-                        (trade_date,),
-                    )
-                ]
-                blocks = [
-                    dict(r)
-                    for r in conn.execute(
-                        "SELECT b.ts_code, b.price, b.vol, b.amount, d.close,"
-                        "       ROUND((b.price / d.close - 1) * 100, 2) AS premium_pct"
-                        " FROM block_trade b JOIN daily_basic d"
-                        "   ON b.ts_code = d.ts_code AND b.trade_date = d.trade_date"
-                        " WHERE b.trade_date = ? ORDER BY b.amount DESC LIMIT 10",
-                        (trade_date,),
-                    )
-                ]
-                top_list_codes = {
-                    str(r["ts_code"])
-                    for r in conn.execute(
-                        "SELECT DISTINCT ts_code FROM top_list WHERE trade_date = ?",
-                        (trade_date,),
-                    )
-                }
-                # 全市场主力净额（板块汇总用，单次约 5500 行，300s TTL 摊薄成本）
-                all_flow = [
-                    (str(r["ts_code"]), float(r["net_mf_amount"] or 0))
-                    for r in conn.execute(
-                        "SELECT ts_code, net_mf_amount FROM moneyflow WHERE trade_date = ?",
-                        (trade_date,),
-                    )
-                ]
-            finally:
-                conn.close()
-        except Exception as exc:  # noqa: BLE001
-            return {"available": False, "note": f"读取本地库失败：{exc}"}
-
-        names = self._name_map()
-        sector_maps = self._sector_maps_all_levels()
-        sectors = sector_maps.get(3) or {}
-        for row in inflow + outflow:
-            row["code"] = str(row.pop("ts_code", ""))[:6]
-            row["name"] = names.get(row["code"], row["code"])
-            row["sector"] = sectors.get(row["code"], "")
-            # moneyflow 金额单位为万元，统一转成元供前端 fmtAmount 复用。
-            row["net_mf_amount"] = round(float(row["net_mf_amount"] or 0) * 10000, 0)
-            row["on_top_list"] = self._to_ts_code(row["code"]) in top_list_codes
-        for row in blocks:
-            row["code"] = str(row.pop("ts_code", ""))[:6]
-            row["name"] = names.get(row["code"], row["code"])
-            row["sector"] = sectors.get(row["code"], "")
-            row["amount"] = round(float(row["amount"] or 0) * 10000, 0)
-            row["on_top_list"] = self._to_ts_code(row["code"]) in top_list_codes
-
-        # 官方口径全市场板块汇总（1/2/3 级）：每级净流入 top8 + 净流出 top4
-        rollup_by_level: dict[str, list[dict[str, Any]]] = {}
-        for level in (1, 2, 3):
-            level_map = sector_maps.get(level) or {}
-            sector_rows = [
-                {"sector": level_map.get(code[:6], "") or "未分类", "name": names.get(code[:6], code[:6]), "net_amount": amount * 10000}
-                for code, amount in all_flow
-            ]
-            rollup = self._sector_rollup(sector_rows, "net_amount")
-            rollup_by_level[f"l{level}"] = (
-                [b for b in rollup if b["net_amount"] > 0][:8]
-                + [b for b in reversed(rollup) if b["net_amount"] < 0][:4]
-            )
-
-        return {
-            "available": True,
-            "trade_date": trade_date,
-            "source": "Tushare 官方口径（moneyflow 主力净额 / block_trade 大宗交易）",
-            "main_inflow": inflow,
-            "main_outflow": outflow,
-            "block_trades": blocks,
-            "sector_rollup": rollup_by_level["l3"],
-            "sector_rollup_by_level": rollup_by_level,
-        }
+        return picked
 
     @staticmethod
     def _to_ts_code(code: str) -> str:

@@ -1,9 +1,11 @@
 import type {
   DailyDetailResponse,
   DarkPoolPayload,
+  DarkPoolStockPayload,
   DetailExtrasResponse,
   F10Response,
   IndexMinutesResponse,
+  MessageDetailResponse,
   SignalChartResponse,
   SignalOverlayResponse,
   StockBoard,
@@ -138,6 +140,10 @@ export function getDetailExtras(
   return fetchJSON(`/api/signals/${code}/detail/extras?${q.toString()}`)
 }
 
+export function getMessageDetail(eventId: string): Promise<MessageDetailResponse> {
+  return fetchJSON(`/api/messages/${encodeURIComponent(eventId)}`)
+}
+
 export function searchStocks(q: string, watchlistCodes: string[] = []): Promise<StockSearchResult[]> {
   const params = new URLSearchParams()
   params.set("q", q)
@@ -150,8 +156,16 @@ export function getIndexMinutes(): Promise<IndexMinutesResponse> {
   return fetchJSON(`/api/indices/minutes`)
 }
 
-export function getDarkPool(): Promise<DarkPoolPayload> {
-  return fetchJSON(`/api/dark-pool`)
+export function getDarkPool(sector?: string | null, boardLevel?: number): Promise<DarkPoolPayload> {
+  const params = new URLSearchParams()
+  if (sector) params.set("sector", sector)
+  if (boardLevel != null) params.set("board_level", String(boardLevel))
+  const qs = params.toString()
+  return fetchJSON(`/api/dark-pool${qs ? `?${qs}` : ""}`)
+}
+
+export function getDarkPoolStock(code: string): Promise<DarkPoolStockPayload> {
+  return fetchJSON(`/api/dark-pool/stock/${code}`)
 }
 
 export function addWatchlist(item: { code: string; name: string; themes?: string[] }): Promise<unknown> {

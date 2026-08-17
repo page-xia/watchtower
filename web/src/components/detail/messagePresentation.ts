@@ -9,6 +9,18 @@ export type MessagePresentationInput = {
   keywords?: string[] | null
 }
 
+export type MessageDetailPresentationInput = {
+  topic?: {
+    title?: string | null
+    content?: string | null
+    media_summary?: string | null
+  } | null
+  event?: {
+    title?: string | null
+    summary?: string | null
+  } | null
+}
+
 const MACHINE_PREFIX = /^(?:theme|sector):/i
 const DIRECT_MENTION = /^直接提及(?:个股|板块)?$/
 
@@ -33,7 +45,31 @@ function isOnlyMachineText(value: unknown): boolean {
   return !normalized || readableFragments(normalized).length === 0
 }
 
-export function messageBody(msg: MessagePresentationInput): string {
+function readableBlocks(values: unknown[]): string[] {
+  const seen = new Set<string>()
+  const blocks: string[] = []
+  for (const value of values) {
+    const normalized = text(value)
+    if (isOnlyMachineText(normalized) || seen.has(normalized)) continue
+    seen.add(normalized)
+    blocks.push(normalized)
+  }
+  return blocks
+}
+
+export function messageBody(msg: MessagePresentationInput, detail?: MessageDetailPresentationInput | null): string {
+  if (detail) {
+    const fullBlocks = readableBlocks([
+      detail.topic?.content,
+      detail.topic?.media_summary,
+      detail.event?.summary,
+    ])
+    if (fullBlocks.length > 0) return fullBlocks.join("\n\n")
+
+    const titleFallback = readableBlocks([detail.topic?.title, detail.event?.title])
+    if (titleFallback.length > 0) return titleFallback[0]
+  }
+
   const candidates = [
     msg.display_text,
     msg.media_summary,
