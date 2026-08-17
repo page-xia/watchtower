@@ -1,13 +1,16 @@
 import { useEffect, useState } from "react"
-import { RefreshCw, Radio, Snowflake, Sun, Moon } from "lucide-react"
+import { RefreshCw, Radio, Snowflake, Sun, Moon, Bell } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { StatusDot } from "@/components/widgets"
 import { SearchBox } from "@/components/SearchBox"
+import { PushSubscriptionDialog } from "@/components/PushSubscriptionDialog"
 import { useTheme, toggleTheme } from "@/lib/theme"
 import { cn } from "@/lib/utils"
 
 interface TopBarProps {
   connected: boolean
+  /** 休市期间：连接断开属于正常休息，不显示红色“连接异常” */
+  marketClosed?: boolean
   updatedAt: string
   dataMode: string
   frozen: boolean
@@ -25,8 +28,10 @@ const DATA_MODE_LABEL: Record<string, string> = {
   close_snapshot: "收盘快照",
 }
 
-export function TopBar({ connected, updatedAt, dataMode, frozen, decisionStage, onRefresh, refreshing, onOpenDetail, watchlistCodes = [] }: TopBarProps) {
+export function TopBar({ connected, marketClosed, updatedAt, dataMode, frozen, decisionStage, onRefresh, refreshing, onOpenDetail, watchlistCodes = [] }: TopBarProps) {
+  const resting = !connected && !!marketClosed
   const [clock, setClock] = useState("")
+  const [pushDialogOpen, setPushDialogOpen] = useState(false)
   const theme = useTheme()
   useEffect(() => {
     const tick = () => {
@@ -51,9 +56,9 @@ export function TopBar({ connected, updatedAt, dataMode, frozen, decisionStage, 
       </div>
 
       <div className="flex items-center gap-2 text-[11px]">
-        <StatusDot ok={connected} />
-        <span className={cn(connected ? "text-muted-foreground" : "text-destructive")}>
-          {connected ? "已连接" : "连接异常"}
+        <StatusDot ok={connected} warning={resting} />
+        <span className={cn(connected ? "text-muted-foreground" : resting ? "text-gold" : "text-destructive")}>
+          {connected ? "已连接" : resting ? "休息中" : "连接异常"}
         </span>
       </div>
 
@@ -91,11 +96,23 @@ export function TopBar({ connected, updatedAt, dataMode, frozen, decisionStage, 
         variant="outline"
         size="sm"
         className="h-7 w-7 px-0"
+        onClick={() => setPushDialogOpen(true)}
+        title="飞书信号推送订阅"
+      >
+        <Bell className="h-3.5 w-3.5" />
+      </Button>
+
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-7 w-7 px-0"
         onClick={toggleTheme}
         title={theme === "dark" ? "切换到白天模式" : "切换到夜晚模式"}
       >
         {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
       </Button>
+
+      <PushSubscriptionDialog open={pushDialogOpen} onOpenChange={setPushDialogOpen} watchlistCodes={watchlistCodes} />
     </header>
   )
 }

@@ -1,5 +1,6 @@
-import { useCallback, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { getIndexMinutes } from "@/lib/api"
+import { syncPushCodes } from "@/lib/pushSubscription"
 import {
   applyLocalWatchlistToPayload,
   loadLocalWatchlist,
@@ -11,6 +12,7 @@ import {
 } from "@/lib/localWatchlist"
 import { usePolling } from "@/hooks/usePolling"
 import { useTerminalStream } from "@/hooks/useTerminalStream"
+import { refreshPolicyFromPayload } from "@/lib/marketRefresh"
 import type { BoardItem } from "@/types/api"
 import { TopBar } from "@/components/TopBar"
 import { MarketStrip } from "@/components/MarketStrip"
@@ -27,21 +29,36 @@ const INDEX_REFRESH_MS = 10000
 
 export default function App() {
   const [sector, setSector] = useState<string | null>(null)
+  // 板块口径：1/2/3 = 申万行业级别；4/5/6 = 通达信概念/风格/地区
   const [boardLevel, setBoardLevel] = useState(3)
   const [sort, setSort] = useState("activity")
   const [page, setPage] = useState(1)
+  // 过滤开关持久化：刷新页面后保持上次选择（与主题一样走 localStorage）
+  const [nearTrend, setNearTrend] = useState(() => localStorage.getItem("board-near-trend") === "1")
+  const [pinBuy, setPinBuy] = useState(() => localStorage.getItem("board-pin-buy") === "1")
   const [detailCode, setDetailCode] = useState<string | null>(null)
   const [localWatchlist, setLocalWatchlist] = useState(() => loadLocalWatchlist())
   const localWatchlistCodes = useMemo(() => watchlistCodes(localWatchlist), [localWatchlist])
 
+  // 已开启飞书推送时，自选股变化自动同步到后端监听池（内部按签名去抖）
+  useEffect(() => {
+    void syncPushCodes(localWatchlistCodes)
+  }, [localWatchlistCodes])
+
   // 单条 WebSocket 增量流替代原三路轮询中的两路：
   // 连接时全量快照，之后只推变化分区（榜单按 code upsert/remove/order）。
   // 指数分钟共振序列保持独立的慢速轮询（10s，append-only 低频数据）。
-  const stream = useTerminalStream({ sector, boardLevel, sort, page, pageSize: 40, watchlistCodes: localWatchlistCodes })
+  const stream = useTerminalStream({ sector, boardLevel, sort, page, pageSize: 40, nearTrend, pinBuy, watchlistCodes: localWatchlistCodes })
   const refreshStream = stream.refresh
   const indexMinutes = usePolling(() => getIndexMinutes(), INDEX_REFRESH_MS, [])
 
   const data = useMemo(() => applyLocalWatchlistToPayload(stream.data, localWatchlist), [stream.data, localWatchlist])
+  // 休市判定：盘后/非交易日后端会冻结并停流，此时断线属正常“休息中”而非连接异常
+  const marketClosed = useMemo(() => {
+    if (!data) return false
+    const policy = refreshPolicyFromPayload(data)
+    return policy?.traffic_mode === "static" || policy?.is_trading_window === false || policy?.should_stream === false
+  }, [data])
   const boardData = data?.stock_board ?? null
   const watchlistForRail = useMemo(
     () => (data ? data.watchlist_preview : localWatchlistPlaceholders(localWatchlist)),
@@ -49,10 +66,10 @@ export default function App() {
   )
 
   // 当前选中板块的领涨锚（龙头），传给榜单头部展示
-  const sectorAnchor = useMemo(
-    () => (sector ? (data?.sectors ?? []).find((s) => s.name === sector) ?? null : null),
-    [data?.sectors, sector],
-  )
+  const sectorAnchor = useMemo(() => {
+    if (!sector) return null
+    return (data?.sectors ?? []).find((s) => s.name === sector) ?? null
+  }, [data?.sectors, sector])
 
   const refreshAll = useCallback(() => {
     stream.refresh()
@@ -65,8 +82,31 @@ export default function App() {
     setPage(1)
   }, [])
 
+  const handleBoardLevel = useCallback((lv: number) => {
+    setBoardLevel(lv)
+    // 切换口径后原选中项在另一套分类里不存在，直接清空避免带着旧过滤
+    setSector(null)
+    setPage(1)
+  }, [])
+
   const handleSort = useCallback((s: string) => {
     setSort(s)
+    setPage(1)
+  }, [])
+
+  const handleToggleNearTrend = useCallback(() => {
+    setNearTrend((v) => {
+      localStorage.setItem("board-near-trend", v ? "0" : "1")
+      return !v
+    })
+    setPage(1)
+  }, [])
+
+  const handleTogglePinBuy = useCallback(() => {
+    setPinBuy((v) => {
+      localStorage.setItem("board-pin-buy", v ? "0" : "1")
+      return !v
+    })
     setPage(1)
   }, [])
 
@@ -112,6 +152,7 @@ export default function App() {
     <div className="flex h-screen flex-col overflow-hidden bg-background">
       <TopBar
         connected={stream.connected}
+        marketClosed={marketClosed}
         updatedAt={data?.market?.updated_at ?? ""}
         dataMode={data?.data_mode ?? ""}
         frozen={!!data?.market?.frozen}
@@ -134,10 +175,7 @@ export default function App() {
             selected={sector}
             onSelect={handleSelectSector}
             boardLevel={boardLevel}
-            onBoardLevel={(lv) => {
-              setBoardLevel(lv)
-              setPage(1)
-            }}
+            onBoardLevel={handleBoardLevel}
           />
         </div>
 
@@ -150,18 +188,21 @@ export default function App() {
             onSort={handleSort}
             page={page}
             onPage={setPage}
+            nearTrend={nearTrend}
+            onToggleNearTrend={handleToggleNearTrend}
+            pinBuy={pinBuy}
+            onTogglePinBuy={handleTogglePinBuy}
             onOpenDetail={setDetailCode}
             onToggleWatch={handleToggleWatch}
             sectorAnchor={sectorAnchor}
           />
         </div>
 
-        {/* 右：机会队列（自选/买T卖T+菱形）占据原指数共振位，其余为板块图表与暗盘资金 */}
+        {/* 右：机会队列（自选/买T卖T）占据原指数共振位，其余为板块图表与暗盘资金 */}
         <div className="grid min-h-0 grid-cols-1 grid-rows-5 gap-2 max-lg:h-[1180px] xl:grid-cols-[1.45fr_1fr] xl:grid-rows-[1fr_1fr_minmax(170px,0.62fr)]">
           <RightRail
             items={boardData?.items ?? []}
             watchlist={watchlistForRail}
-            openingMarkers={data?.opening_markers ?? []}
             onOpenDetail={setDetailCode}
             onRemoveWatch={handleRemoveWatch}
           />

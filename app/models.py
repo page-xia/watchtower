@@ -5,6 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.formula_engine import SIGNAL_VERSION
+
 
 class SignalType(str, Enum):
     BUY_T = "买T"
@@ -332,9 +334,7 @@ class MiniIntradayMarker(BaseModel):
     signal: SignalType
     price: float = 0
     change_pct: float = 0
-    gold_resonance: bool = False
     reasons: list[str] = Field(default_factory=list)
-    resonance_reasons: list[str] = Field(default_factory=list)
 
 
 class MiniIntradaySeries(BaseModel):
@@ -360,6 +360,9 @@ class SectorSnapshot(BaseModel):
     core_codes: list[str]
     leader_code: str | None = None
     leader_name: str | None = None
+    # 板块中军：成分股里流通市值第一（tushare daily_basic 快照；无数据回退成交额第一）
+    capacity_leader_code: str | None = None
+    capacity_leader_name: str | None = None
     reasons: list[str]
     rank_change: int = 0
     flow_delta: float = 0
@@ -457,11 +460,13 @@ class TradeSignal(BaseModel):
     evidence_sequence: list[str] = Field(default_factory=list)
     validation_status: str = "research_only"
     hypothesis_id: str = ""
-    strategy_version: str = "t_strategy_v3_risk_reward"
+    strategy_version: str = SIGNAL_VERSION
     signal_grade: str = "观察"
     confluence_window_bars: int = 0
     phase: str = SignalPhase.OBSERVE.value
     invalidation_price: float = 0
+    # 做T公式信号触发那根分钟的价格（0 = 非公式信号/无触发价）；price 字段是每轮刷新的现价
+    trigger_price: float = 0
     source_quality: str = "snapshot"
     factor_scores: dict[str, float] = Field(default_factory=dict)
     exit_score: int = 0
@@ -536,11 +541,21 @@ class StockBoardItem(BaseModel):
     minute_amount_ratio: float = 1
     rebound_from_low_pct: float = 0
     pullback_from_high_pct: float = 0
+    # 做T当日常量：阻力=L1+P1*7/8、支撑=L1+P1*0.5/8（L1=min(昨收,最低)，P1=H1-L1）
+    resistance: float = 0
+    support: float = 0
     limit_up: bool = False
     limit_down: bool = False
     opened_limit: bool = False
     signal: SignalType = SignalType.WATCH
     signal_score: int = 0
+    # 当天最近一次买T/卖T信号（方向 + 触发价 + 触发时间）：榜单展示「距买卖点 ±%」用；
+    # 按全天窗口从分钟特征缓存计算，信号回「观察」后仍可显示
+    last_action: str = ""
+    last_action_price: float = 0
+    last_action_time: str = ""
+    # 现价是否落在低吸区间（短期/长期线低者为底-1%、高者为顶+3%）
+    near_zone: bool = False
     stock_type: str = "普通成员"
     stock_tags: list[str] = Field(default_factory=list)
     activity_score: float = 0
@@ -583,6 +598,12 @@ class StockBoardPayload(BaseModel):
     data_mode: str = ""
     frozen: bool = False
     items: list[StockBoardItem] = Field(default_factory=list)
+    # 低吸机会过滤：短期/长期线低者为底（-1%）、高者为顶（+3%），现价落区间内
+    near_trend: bool = False
+    near_trend_ready: int = 0
+    near_trend_pending: int = 0
+    # 置顶买点：当天最近买点 ±1% 内的票稳定排到榜单最前（不过滤其余票）
+    pin_buy: bool = False
     available_sorts: list[str] = Field(
         default_factory=lambda: ["activity", "change", "amount", "volume_ratio", "order_flow", "signal"]
     )
@@ -603,7 +624,7 @@ class ReplayPoint(BaseModel):
     vwap: float = 0
     flow_score: int = 0
     auction_confirmed: bool = False
-    strategy_version: str = "t_strategy_v3_risk_reward"
+    strategy_version: str = SIGNAL_VERSION
     signal_grade: str = "观察"
     confluence_window_bars: int = 0
     phase: str = SignalPhase.OBSERVE.value
@@ -637,7 +658,7 @@ class ReplayMarker(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     score: int = 0
     factor_flags: list[str] = Field(default_factory=list)
-    strategy_version: str = "t_strategy_v3_risk_reward"
+    strategy_version: str = SIGNAL_VERSION
     signal_grade: str = "观察"
     confluence_window_bars: int = 0
     phase: str = SignalPhase.OBSERVE.value
@@ -662,8 +683,6 @@ class ReplayMarker(BaseModel):
     validation_status: str = "research_only"
     hypothesis_id: str = ""
     risk_reward: RiskRewardPlan = Field(default_factory=RiskRewardPlan)
-    gold_resonance: bool = False
-    resonance_reasons: list[str] = Field(default_factory=list)
 
 
 class AnalysisRecord(BaseModel):
@@ -852,38 +871,49 @@ class DetailChartSeries(BaseModel):
 
 
 class FormulaState(BaseModel):
-    多方力度: float = 0
-    空方力度: float = 0
-    主力吸筹: float = 0
-    赶快出手: bool = False
-    今日保护价: float = 0
-    白线: float = 0
-    黄线: float = 0
-    白线距离_pct: float = 0
-    黄线距离_pct: float = 0
-    趋势线最近距离_pct: float = 0
-    趋势线接近阈值_pct: float = 3.0
-    是否接近趋势线: bool = False
-    是否金色共振: bool = False
-    duo_strength: float = 0
-    kong_strength: float = 0
-    main_absorption: float = 0
-    fast_trigger: bool = False
-    protection_price: float = 0
-    white_line: float = 0
-    yellow_line: float = 0
-    white_distance_pct: float = 0
-    yellow_distance_pct: float = 0
-    trend_distance_pct: float = 0
-    near_trend_threshold_pct: float = 3.0
-    near_trend_line: bool = False
-    near_trend_line_name: str = ""
-    gold_resonance: bool = False
-    resonance_reasons: list[str] = Field(default_factory=list)
+    """做T公式（做T公式.md）最新分钟状态：均线/阻力支撑/资金/评分/建议。"""
+
+    # 均线系统
+    ma30: float = 0
+    qs: float = 0  # 强弱线 EMA(C,900)
+    vwap: float = 0  # 均价 SUM(V*C,0)/SUM(V,0)
+    price: float = 0  # 现价
+    # 阻力/支撑/中轴（当日常量）
+    resistance: float = 0
+    support: float = 0
+    mid: float = 0
+    # 机构资金统计（万元）
+    big_buy_amount: float = 0  # A2
+    big_sell_amount: float = 0  # A3
+    fund_flow: float = 0  # A2-A3
+    # 买卖净（万元，按内外盘拆分当日总额）
+    buy_amount_wan: float = 0
+    sell_amount_wan: float = 0
+    net_amount_wan: float = 0
+    buy_pct: float = 0
+    sell_pct: float = 0
+    # 个股基础数据
+    change_pct: float = 0
+    volume_ratio: float = 1
+    turnover_rate: float | None = None
+    # 分析文字
+    trend_text: str = ""
+    volume_text: str = ""
+    fund_text: str = ""
+    fund_attitude: str = ""
+    position_text: str = ""
+    vwap_relation: str = ""
+    line_a: str = ""
+    line_b: str = ""
+    # 综合评分与建议
+    score: int = 0
+    advice: str = ""
+    advice_detail: str = ""
+    # 最新分钟买卖信号
+    buy_signal: bool = False
+    sell_signal: bool = False
     source_quality: str = "unavailable"
-    trend_source_quality: str = "trend_unavailable"
     point_count: int = 0
-    trigger_note: str = "赶快出手源码为0；实盘触发按CROSS(多方力度,6.78)观察"
 
 
 class ConfluenceSnapshot(BaseModel):
@@ -897,6 +927,19 @@ class ConfluenceSnapshot(BaseModel):
     updated_at: str = ""
 
 
+class FormulaOverlay(BaseModel):
+    """做T公式分时叠层：阻力/支撑两条关键价位线（相对昨收涨幅 + 绝对价）。
+
+    MA30/强弱线只在公式卡片呈现数值，不上分时图，避免曲线过多干扰读价。
+    """
+
+    available: bool = False
+    resistance_pct: float | None = None
+    support_pct: float | None = None
+    resistance: float = 0
+    support: float = 0
+
+
 class SignalDetailChartPayload(BaseModel):
     code: str
     name: str
@@ -908,14 +951,13 @@ class SignalDetailChartPayload(BaseModel):
     current_signal: TradeSignal
     summary: list[str] = Field(default_factory=list)
     chart: DetailChartSeries = Field(default_factory=DetailChartSeries)
+    formula_overlay: "FormulaOverlay" = Field(default_factory=lambda: FormulaOverlay())
     order_flow: OrderFlowObservation = Field(default_factory=OrderFlowObservation)
     watchlisted: bool = False
     watchlist_tags: list[str] = Field(default_factory=list)
     position: PositionRecord | None = None
     formula_state: FormulaState = Field(default_factory=FormulaState)
     confluence_snapshot: ConfluenceSnapshot = Field(default_factory=ConfluenceSnapshot)
-    research_status: str = "research_only"
-    research_note: str = "研究信号需经过样本外验证；不构成确定性买卖建议"
 
 
 class SignalDetailOverlayMarker(BaseModel):
@@ -946,8 +988,6 @@ class SignalDetailOverlayMarker(BaseModel):
     sector_event: str = ""
     stock_event: str = ""
     flow_event: str = ""
-    gold_resonance: bool = False
-    resonance_reasons: list[str] = Field(default_factory=list)
 
 
 class SignalDetailOverlayPayload(BaseModel):
@@ -956,13 +996,12 @@ class SignalDetailOverlayPayload(BaseModel):
     sector: str
     trade_date: str
     selected_sector: str | None = None
+    # 盘后/休市冻结标记：前端据此停掉 overlay 轮询（chart 载荷自带 market.frozen）。
+    frozen: bool = False
     markers: list[SignalDetailOverlayMarker] = Field(default_factory=list)
-    opening_markers: list[SignalDetailOverlayMarker] = Field(default_factory=list)
     transaction_flow: dict[str, Any] = Field(default_factory=dict)
     formula_state: FormulaState = Field(default_factory=FormulaState)
     confluence_snapshot: ConfluenceSnapshot = Field(default_factory=ConfluenceSnapshot)
-    research_status: str = "research_only"
-    research_note: str = "研究信号需经过样本外验证；不构成确定性买卖建议"
 
 
 class FundamentalField(BaseModel):
@@ -1003,6 +1042,28 @@ class FundamentalPayload(BaseModel):
     note: str = "easy_tdx F10/财务数据，仅作个人非商业研究展示"
 
 
+class F10Category(BaseModel):
+    key: str
+    title: str
+    available: bool = False
+    error: str = ""
+    source: str = "tushare_pro"
+    sections: list[FundamentalSection] = Field(default_factory=list)
+
+
+class F10Payload(BaseModel):
+    available: bool = False
+    source: str = "tushare_pro + easy_tdx_f10_7615"
+    code: str = ""
+    ts_code: str = ""
+    name: str = ""
+    fetched_at: str = ""
+    category_count: int = 0
+    expected_category_count: int = 13
+    categories: list[F10Category] = Field(default_factory=list)
+    note: str = "F10 聚合：tushare_pro 为主，easy_tdx 股本结构补充；仅作个人非商业研究展示"
+
+
 class DetailDataTable(BaseModel):
     title: str = ""
     columns: list[str] = Field(default_factory=list)
@@ -1038,8 +1099,6 @@ class SignalDetailExtrasPayload(BaseModel):
     capital_flow: DetailDataPayload = Field(default_factory=DetailDataPayload)
     technical_indicators: DetailDataPayload = Field(default_factory=DetailDataPayload)
     chanlun: DetailDataPayload = Field(default_factory=DetailDataPayload)
-    research_status: str = "research_only"
-    research_note: str = "研究信号需经过样本外验证；不构成确定性买卖建议"
 
 
 class MessageDetailPayload(BaseModel):
@@ -1074,8 +1133,6 @@ class SignalReplayDetail(BaseModel):
     decision_markers: list[ReplayMarker] = Field(default_factory=list)
     formula_state: FormulaState = Field(default_factory=FormulaState)
     confluence_snapshot: ConfluenceSnapshot = Field(default_factory=ConfluenceSnapshot)
-    research_status: str = "research_only"
-    research_note: str = "研究信号需经过样本外验证；不构成确定性买卖建议"
 
 
 class IndexReplayDetail(BaseModel):
@@ -1111,8 +1168,6 @@ class TerminalPayload(BaseModel):
     board_level: int = 3
     board_source: str = ""
     watchlist_codes: list[str] = Field(default_factory=list)
-    # 开盘窗口菱形买卖点流（机会队列用，最新在前，当天全量）
-    opening_markers: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DashboardPayload(BaseModel):

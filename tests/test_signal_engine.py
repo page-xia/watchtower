@@ -2,15 +2,12 @@ from app.models import (
     AuctionSnapshot,
     IndexSnapshot,
     OrderFlowObservation,
-    PositionRecord,
     Quote,
     SectorSnapshot,
     SignalPhase,
     SignalType,
     TradeAction,
     TradeDirection,
-    TransactionFlowObservation,
-    TransactionFlowPoint,
     WatchlistItem,
 )
 from app.signal_engine import SignalEngine
@@ -128,22 +125,8 @@ def bars_from_prices(prices: list[float]) -> list[dict[str, float | str]]:
     ]
 
 
-def near_trend_states_for_bars(bars: list[dict[str, float | str]]) -> list[dict[str, float | str | bool]]:
-    return [
-        {
-            "time": str(bar["time"]),
-            "white_line": float(bar["close"]),
-            "yellow_line": float(bar["close"]) * 0.98,
-            "trend_source_quality": "unit_daily_trend",
-        }
-        for bar in bars
-    ]
 
 
-def buy_formula_prices() -> list[float]:
-    prices = [10.0 - 0.01 * index for index in range(20)]
-    prices.extend([prices[-1] + 0.01 * step for step in range(1, 3)])
-    return prices
 
 
 def test_board_signals_remain_observation_even_when_old_confluence_is_strong() -> None:
@@ -290,181 +273,45 @@ def test_rank_sectors_excludes_new_listing_distortion_from_strength_metrics() ->
     assert any("新股扰动剔除1只：N超纯" in reason for reason in sector.reasons)
 
 
-def test_replay_markers_use_formula_buy_primitive_and_gold_resonance() -> None:
+def test_engine_strategy_version_is_zuot_formula() -> None:
     engine = SignalEngine(RULES)
-    quote = q("300308", "中际旭创", ["AI硬件"], 9.83, 10.0, 10.0, 9.75, 10.05, 1.0, True)
-    market = engine.build_market_state(index_turning(), [quote])
-    bars = bars_from_prices(buy_formula_prices())
-
-    replay_points, markers, timeline, summary = engine.build_replay_detail(
-        quote,
-        bars,
-        market,
-        sector_snapshot(),
-        trend_states=near_trend_states_for_bars(bars),
-    )
-
-    buy_markers = [marker for marker in markers if marker.signal == SignalType.BUY_T]
-    assert replay_points[0].time == "09:31"
-    assert timeline[0].signal == SignalType.WATCH
-    assert buy_markers
-    assert buy_markers[0].phase == SignalPhase.CONFIRM.value
-    assert buy_markers[0].action == TradeAction.BUY_T.value
-    assert buy_markers[0].direction == TradeDirection.POSITIVE_T.value
-    assert buy_markers[0].gold_resonance is True
-    assert any("CROSS(多方力度,6.78)" in reason for reason in buy_markers[0].reasons)
-    assert any("接近" in reason for reason in buy_markers[0].resonance_reasons)
-    assert all(marker.exit_score == 0 for marker in markers)
-    assert any("做T买卖点唯一来源" in item for item in summary)
+    assert engine.strategy_version == "zuot_tdx_levels_v1"
 
 
-def test_replay_green_sell_marker_comes_from_formula_rsi_cross() -> None:
+def test_zuot_event_detects_support_reclaim_buy() -> None:
+    """看板提升路径：LONGCROSS(支撑,现价,2) 跌破支撑 → 买T 事件。"""
     engine = SignalEngine(RULES)
-    quote = q("300308", "中际旭创", ["AI硬件"], 12.0, 10.0, 10.0, 9.8, 12.6, 1.0, True)
-    market = engine.build_market_state(index_turning(), [quote])
-    prices = [10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 12.0]
+    # prev_close=10, day_high=10.8, day_low=9.8 → 支撑=9.8625, 阻力=10.675
+    quote = q("300308", "中际旭创", ["AI硬件"], 9.9, 10.0, 10.0, 9.8, 10.8, 1.5, True)
+    bars = bars_from_prices([10.0, 10.05, 9.80])
 
-    _, markers, timeline, _ = engine.build_replay_detail(
-        quote,
-        bars_from_prices(prices),
-        market,
-        sector_snapshot(),
-    )
+    event = engine._latest_cached_zuot_event(bars, quote)
 
-    sell_markers = [marker for marker in markers if marker.signal == SignalType.SELL_T]
-    assert sell_markers
-    assert sell_markers[0].phase == SignalPhase.SELL_CONFIRM.value
-    assert sell_markers[0].action == TradeAction.SELL_BASE.value
-    assert sell_markers[0].direction == TradeDirection.REVERSE_T.value
-    assert "DRAWICON(CROSS(88.8,RSI),90,15)" in sell_markers[0].reasons
-    assert sell_markers[0].exit_score == 0
-    assert any(marker.signal == SignalType.SELL_T for marker in timeline)
+    assert event is not None
+    assert event["signal"] == SignalType.BUY_T
+    assert event["time"] == "09:33"
+    assert abs(event["invalidation_price"] - 9.8625) < 0.01
+    assert any("LONGCROSS(支撑,现价,2)" in reason for reason in event["reasons"])
 
 
-def test_l1_sell_pressure_vetoes_gold_but_keeps_red_formula_buy_marker() -> None:
+def test_zuot_event_detects_resistance_breakout_sell() -> None:
+    """看板提升路径：LONGCROSS(现价,阻力,2) 突破阻力 → 卖T 事件。"""
     engine = SignalEngine(RULES)
-    quote = q("300308", "中际旭创", ["AI硬件"], 9.83, 10.0, 10.0, 9.75, 10.05, 1.0, True)
-    bars = bars_from_prices(buy_formula_prices())
-    pressure_flow = TransactionFlowObservation(
-        available=True,
-        source="easy_tdx_history_transaction_data",
-        data_quality="l1_transaction",
-        trade_date="20260807",
-        full_session=True,
-        points=[
-            TransactionFlowPoint(
-                time=str(bar["time"]),
-                rolling_count=30,
-                rolling_imbalance_pct=-35,
-                rolling_large_imbalance_pct=-45,
-                rolling_score=-40,
-            )
-            for bar in bars
-        ],
-    )
+    quote = q("300308", "中际旭创", ["AI硬件"], 10.7, 10.0, 10.0, 9.8, 10.8, 1.5, True)
+    bars = bars_from_prices([10.5, 10.6, 10.70])
 
-    _, markers, _, summary = engine.build_replay_detail(
-        quote,
-        bars,
-        engine.build_market_state(index_turning(), [quote]),
-        sector_snapshot(),
-        transaction_flow=pressure_flow,
-        trend_states=near_trend_states_for_bars(bars),
-    )
+    event = engine._latest_cached_zuot_event(bars, quote)
 
-    buy_marker = next(marker for marker in markers if marker.signal == SignalType.BUY_T)
-    assert buy_marker.gold_resonance is False
-    assert "L1明显抛压否决" in buy_marker.resonance_reasons
-    assert any("红色公式买候选保留" in risk for risk in buy_marker.risks)
-    assert any("只增强理由或否决金点" in item for item in summary)
+    assert event is not None
+    assert event["signal"] == SignalType.SELL_T
+    assert event["time"] == "09:33"
+    assert abs(event["invalidation_price"] - 10.675) < 0.01
+    assert any("LONGCROSS(现价,阻力,2)" in reason for reason in event["reasons"])
 
 
-def test_l1_buy_support_only_enhances_existing_gold_marker() -> None:
+def test_zuot_event_none_when_price_stays_inside_channel() -> None:
     engine = SignalEngine(RULES)
-    quote = q("300308", "中际旭创", ["AI硬件"], 9.83, 10.0, 10.0, 9.75, 10.05, 1.0, True)
-    bars = bars_from_prices(buy_formula_prices())
-    support_flow = TransactionFlowObservation(
-        available=True,
-        source="easy_tdx_history_transaction_data",
-        data_quality="l1_transaction",
-        trade_date="20260807",
-        full_session=True,
-        points=[
-            TransactionFlowPoint(
-                time=str(bar["time"]),
-                rolling_count=30,
-                rolling_imbalance_pct=32,
-                rolling_large_imbalance_pct=18,
-                rolling_score=36,
-            )
-            for bar in bars
-        ],
-    )
+    quote = q("300308", "中际旭创", ["AI硬件"], 10.2, 10.0, 10.0, 9.8, 10.8, 1.5, True)
+    bars = bars_from_prices([10.1, 10.2, 10.15, 10.25])
 
-    _, markers, _, _ = engine.build_replay_detail(
-        quote,
-        bars,
-        engine.build_market_state(index_turning(), [quote]),
-        sector_snapshot(),
-        transaction_flow=support_flow,
-        trend_states=near_trend_states_for_bars(bars),
-    )
-    _, flat_markers, _, _ = engine.build_replay_detail(
-        quote,
-        bars_from_prices([10.0] * 10),
-        engine.build_market_state(index_turning(), [quote]),
-        sector_snapshot(),
-        transaction_flow=support_flow,
-    )
-
-    buy_marker = next(marker for marker in markers if marker.signal == SignalType.BUY_T)
-    assert buy_marker.gold_resonance is True
-    assert "L1逐笔买盘支持" in buy_marker.resonance_reasons
-    assert flat_markers == []
-
-
-def test_replay_gold_resonance_rejects_far_daily_trend_lines() -> None:
-    engine = SignalEngine(RULES)
-    prices = [round(price * 5.35, 2) for price in buy_formula_prices()]
-    bars = bars_from_prices(prices)
-    quote = q("600206", "有研新材", ["稀土"], 52.63, 53.52, 52.0, 50.8, 55.2, 1.0, True)
-    far_trend_states = [
-        {
-            "time": str(bar["time"]),
-            "white_line": 42.59,
-            "yellow_line": 41.06,
-            "trend_source_quality": "unit_daily_trend",
-        }
-        for bar in bars
-    ]
-
-    _, markers, _, _ = engine.build_replay_detail(
-        quote,
-        bars,
-        engine.build_market_state(index_turning(), [quote]),
-        sector_snapshot(),
-        trend_states=far_trend_states,
-    )
-
-    buy_marker = next(marker for marker in markers if marker.signal == SignalType.BUY_T)
-    assert buy_marker.gold_resonance is False
-    assert not any("接近" in reason for reason in buy_marker.resonance_reasons)
-
-
-def test_formula_sell_marker_is_risk_context_when_position_is_t_plus_one_restricted() -> None:
-    engine = SignalEngine(RULES)
-    quote = q("300308", "中际旭创", ["AI硬件"], 12.0, 10.0, 10.0, 9.8, 12.6, 1.0, True)
-    position = PositionRecord(code=quote.code, name=quote.name, cost=10.5, quantity=1000, available_quantity=0)
-
-    _, markers, _, _ = engine.build_replay_detail(
-        quote,
-        bars_from_prices([10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 12.0]),
-        engine.build_market_state(index_turning(), [quote]),
-        sector_snapshot(),
-        position=position,
-    )
-
-    sell_marker = next(marker for marker in markers if marker.signal == SignalType.SELL_T)
-    assert sell_marker.executable is False
-    assert sell_marker.t_plus_one_restricted is True
-    assert any("T+1" in risk for risk in sell_marker.risks)
+    assert engine._latest_cached_zuot_event(bars, quote) is None

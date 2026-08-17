@@ -9,6 +9,8 @@ export interface TerminalStreamParams {
   sort?: string
   page?: number
   pageSize?: number
+  nearTrend?: boolean
+  pinBuy?: boolean
   watchlistCodes?: string[]
 }
 
@@ -50,7 +52,6 @@ const REPLACE_SECTIONS = [
   "watchlist",
   "watchlist_preview",
   "positions_preview",
-  "opening_markers",
 ] as const
 
 function applyDelta(prev: TerminalPayload, sections: NonNullable<DeltaMessage["sections"]>): TerminalPayload {
@@ -94,6 +95,8 @@ function buildStreamUrl(params: TerminalStreamParams): string {
   q.set("page", String(params.page ?? 1))
   q.set("page_size", String(params.pageSize ?? 40))
   if (params.sector) q.set("sector", params.sector)
+  if (params.nearTrend) q.set("near_trend", "1")
+  if (params.pinBuy) q.set("pin_buy", "1")
   q.set("watchlist_codes", (params.watchlistCodes ?? []).join(","))
   return `${protocol}//${location.host}/ws/stream?${q.toString()}`
 }
@@ -182,7 +185,7 @@ export function useTerminalStream(params: TerminalStreamParams): TerminalStreamS
       ws?.close()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [documentHidden, params.sector, params.boardLevel, params.sort, params.page, params.pageSize, params.watchlistCodes?.join(","), nonce])
+  }, [documentHidden, params.sector, params.boardLevel, params.sort, params.page, params.pageSize, params.nearTrend, params.pinBuy, params.watchlistCodes?.join(","), nonce])
 
   return { data, connected, error, lastMessageAt, refresh }
 }

@@ -6,7 +6,7 @@
 
 ## Market Data Boundaries
 
-- 板块口径统一以 easy_tdx 官方板块（申万三级，`fetch_board_context` / `_stock_board_display_map`）为唯一标准，盘中与收盘后一致。Tushare 只提供个股级资金数值（moneyflow / block_trade），不参与板块分类；板块汇总一律用 easy_tdx 映射对个股数值归组，禁止混入东财/同花顺等第三方板块 taxonomy。手动主题（themes.yaml）是独立功能，不算板块口径。
+- 板块口径统一以 easy_tdx 官方板块（申万三级，`fetch_board_context` / `_stock_board_display_map`）为唯一标准，盘中与收盘后一致。Tushare 只提供个股级资金数值（moneyflow / block_trade），不参与板块分类；板块汇总一律用 easy_tdx 映射对个股数值归组。禁止混入东财/同花顺等第三方板块 taxonomy——这条约束的是星球消息归类等数据归组场景；面板查看口径不受此限。通达信概念/风格/地区板块（easy_tdx `BoardType.GN/FG/DQ`）已接入为并列查看口径：内部编码 `board_level=4/5/6`，面板「板块扫描」头部菜单切换（板块 1/2/3 级 / 概念 / 风格 / 地区），与申万聚合互不混合，一只票可同时属于多个概念/风格。手工主题面板模式（sector_mode=theme、theme_sectors）已于 2026-08-17 移除；`data/themes.yaml` 仍作为信号装饰（preferred_sector_names / core_watch）与个股题材标签的配置输入保留，不再是独立榜单口径。
 - Treat easy_tdx L1 transaction tape as an important analysis input for this project. Future strategy work should use it to confirm real buying support, detect selling pressure, and support buy-T / reduce-T decisions.
 - Keep easy_tdx data quality labels strict. A-share quotes can provide five displayed levels, aggregate active volume, minute price/amount and L1 transaction tape, but not order queues, order-by-order entrusts, ten-level queues or hidden main-order truth.
 - Do not use Level-2 as the unified project vocabulary. `get_transaction_data` and `get_history_transaction_data` return L1 transaction prints, usually with `hour`, `minute`, `price`, `vol` and `buyorsell`; describe them as transaction tape or L1 transaction flow.
@@ -14,9 +14,9 @@
   - If `is_trading_window()` is true and the requested trade date is today, use `get_transaction_data`.
   - If the market is not in the trading window, the date is historical, it is after close, weekend or a holiday, use `get_history_transaction_data`.
   - For non-intraday debugging, pass an explicit valid `trade_date=YYYYMMDD`; do not rely on today's date when today is not a trading day.
-- Keep transaction reads on demand for stock details or transaction endpoints. Do not add full-market transaction polling to the 5-second dashboard refresh loop.
-- The opening-window diamond engine (`app/opening_window_engine.py`) is the one sanctioned exception to watch-set tape reads: a bounded ~40-code pool (top-5 heat sectors x top-3 members + activity top-20 + watchlist, deduped, limit-up excluded), 6s ticks, only 09:30-10:00, intraday/historical routing unchanged. It must never expand to full-market tape polling or join the dashboard refresh loop. Its tape stats are large-print only (`large_buy_amount`/`large_sell_amount` per minute, threshold max(50万, 5×median print amount)); small prints are excluded from the net-buy ratio. Codes with a confirmed marker join the dedup set and are no longer monitored that day.
+- Keep transaction reads on demand for stock details or transaction endpoints. Do not add full-market transaction polling to the 5-second dashboard refresh loop. The opening-window diamond engine was removed (2026-08-17, performance); the detail-page opening7 diamond overlay (`opening_markers` / `app/opening7.py` wiring in `services.py`) was removed the same day — do not reintroduce watch-set tape polling or the diamond overlay without an explicit owner request. `app/opening7.py` remains as an offline research-replay tool for `scripts/backtest_opening7_sector.py` only.
 - Special `buyorsell` values are neutral unless explicitly understood. Prefer `buyorsell` direction when present; only fall back to adjacent price-tick direction when the field is missing.
+- 个股结构标签口径（`_classify_stock`，对齐市场通用认知，勿加自造阈值）：板块龙头 = 板块领涨股（涨幅第一且为正，涨幅为负是领跌不打标）；核心容量 = 板块中军，即板块内流通市值第一（tushare daily_basic `circ_mv` 本地快照，见 `_float_mcap_map`；无市值数据回退成交额第一）；手工主题 core_codes / 自选 core 是显式配置，不受板块口径影响。`sector.core_codes`（领涨+成交额前5）仅供板块进攻强度等内部策略使用，不再用于标签。
 
 ## Verification Commands
 

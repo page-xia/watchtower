@@ -1,8 +1,9 @@
 import type {
+  DailyDetailResponse,
   DarkPoolPayload,
   DetailExtrasResponse,
+  F10Response,
   IndexMinutesResponse,
-  OpeningMarkersPage,
   SignalChartResponse,
   SignalOverlayResponse,
   StockBoard,
@@ -14,7 +15,7 @@ import type {
 
 const BASE = ""
 
-async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
+async function doFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(`${BASE}${path}`, init)
   if (!resp.ok) {
     const text = await resp.text().catch(() => "")
@@ -23,12 +24,31 @@ async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
   return (await resp.json()) as T
 }
 
+// In-flight dedup for GET requests: React StrictMode remounts, fast detail
+// switching and overlapping polls can all fire identical GETs concurrently.
+// Coalesce them onto one in-flight promise so the network only sees one.
+const inflightGet = new Map<string, Promise<unknown>>()
+
+async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
+  const isGet = !init || !init.method || init.method.toUpperCase() === "GET"
+  if (!isGet) return doFetch<T>(path, init)
+  const existing = inflightGet.get(path)
+  if (existing) return existing as Promise<T>
+  const promise = doFetch<T>(path, init).finally(() => {
+    inflightGet.delete(path)
+  })
+  inflightGet.set(path, promise)
+  return promise
+}
+
 export interface TerminalParams {
   sector?: string | null
   boardLevel?: number
   sort?: string
   page?: number
   pageSize?: number
+  nearTrend?: boolean
+  pinBuy?: boolean
   watchlistCodes?: string[]
 }
 
@@ -40,6 +60,8 @@ export function getTerminal(params: TerminalParams = {}): Promise<TerminalPayloa
   q.set("page", String(params.page ?? 1))
   q.set("page_size", String(params.pageSize ?? 40))
   if (params.sector) q.set("sector", params.sector)
+  if (params.nearTrend) q.set("near_trend", "1")
+  if (params.pinBuy) q.set("pin_buy", "1")
   q.set("watchlist_codes", (params.watchlistCodes ?? []).join(","))
   return fetchJSON<TerminalPayload>(`/api/dashboard?${q.toString()}`)
 }
@@ -51,6 +73,8 @@ export function getStockBoard(params: TerminalParams = {}): Promise<StockBoard> 
   q.set("page", String(params.page ?? 1))
   q.set("page_size", String(params.pageSize ?? 40))
   if (params.sector) q.set("sector", params.sector)
+  if (params.nearTrend) q.set("near_trend", "1")
+  if (params.pinBuy) q.set("pin_buy", "1")
   q.set("watchlist_codes", (params.watchlistCodes ?? []).join(","))
   return fetchJSON<StockBoard>(`/api/stocks/board?${q.toString()}`)
 }
@@ -75,10 +99,19 @@ export interface DetailExtrasOptions {
   includeIndicators?: boolean
   includeChanlun?: boolean
   includeAuctionHistory?: boolean
+  includeMessages?: boolean
 }
 
 export function getTransactions(code: string, count = 240): Promise<TransactionFlow> {
   return fetchJSON(`/api/transactions/${code}?count=${count}`)
+}
+
+export function getDetailF10(code: string, refresh = false): Promise<F10Response> {
+  return fetchJSON(`/api/signals/${code}/detail/f10${refresh ? "?refresh=1" : ""}`)
+}
+
+export function getDetailDaily(code: string, count = 240): Promise<DailyDetailResponse> {
+  return fetchJSON(`/api/signals/${code}/detail/daily?count=${count}`)
 }
 
 export function getDetailExtras(
@@ -92,6 +125,7 @@ export function getDetailExtras(
     includeIndicators = true,
     includeChanlun = true,
     includeAuctionHistory = true,
+    includeMessages = true,
   } = options
   const q = new URLSearchParams()
   q.set("include_capital_flow", String(includeCapitalFlow))
@@ -99,6 +133,7 @@ export function getDetailExtras(
   q.set("include_indicators", String(includeIndicators))
   q.set("include_chanlun", String(includeChanlun))
   q.set("include_auction_history", String(includeAuctionHistory))
+  q.set("include_messages", String(includeMessages))
   q.set("watchlist_codes", watchlistCodes.join(","))
   return fetchJSON(`/api/signals/${code}/detail/extras?${q.toString()}`)
 }
@@ -117,15 +152,6 @@ export function getIndexMinutes(): Promise<IndexMinutesResponse> {
 
 export function getDarkPool(): Promise<DarkPoolPayload> {
   return fetchJSON(`/api/dark-pool`)
-}
-
-export function getOpeningMarkers(offset = 0, limit = 20, tradeDate?: string, side?: "buy" | "sell"): Promise<OpeningMarkersPage> {
-  const q = new URLSearchParams()
-  q.set("offset", String(offset))
-  q.set("limit", String(limit))
-  if (tradeDate) q.set("trade_date", tradeDate)
-  if (side) q.set("side", side)
-  return fetchJSON(`/api/opening/markers?${q.toString()}`)
 }
 
 export function addWatchlist(item: { code: string; name: string; themes?: string[] }): Promise<unknown> {

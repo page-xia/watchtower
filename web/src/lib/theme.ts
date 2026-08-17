@@ -81,6 +81,8 @@ const CHANNELS = {
     symbolBorder: "#0b0e14",
     dimBuy: "#8f1023",
     dimSell: "#0d5c36",
+    mag: "310 85% 62%",
+    blue: "215 90% 62%",
   },
   light: {
     grid: "213 25% 86%",
@@ -103,6 +105,8 @@ const CHANNELS = {
     symbolBorder: "#ffffff",
     dimBuy: "#f5c0c6",
     dimSell: "#a9dcc3",
+    mag: "310 75% 45%",
+    blue: "215 85% 45%",
   },
 } as const
 
@@ -129,10 +133,14 @@ export function chartPalette(theme: Theme) {
     symbolBorder: c.symbolBorder as string,
     dimBuy: c.dimBuy as string,
     dimSell: c.dimSell as string,
+    mag: `hsl(${c.mag})`,
+    blue: `hsl(${c.blue})`,
     upA: (alpha: number) => `hsl(${c.up} / ${alpha})`,
     downA: (alpha: number) => `hsl(${c.down} / ${alpha})`,
     goldA: (alpha: number) => `hsl(${c.gold} / ${alpha})`,
     flatA: (alpha: number) => `hsl(${c.flat} / ${alpha})`,
+    magA: (alpha: number) => `hsl(${c.mag} / ${alpha})`,
+    blueA: (alpha: number) => `hsl(${c.blue} / ${alpha})`,
   }
 }
 

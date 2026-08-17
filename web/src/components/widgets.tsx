@@ -111,10 +111,16 @@ export function HeatBar({ score, className }: { score: number; className?: strin
   )
 }
 
-/** 状态点 */
-export function StatusDot({ ok, className }: { ok: boolean; className?: string }) {
+/** 状态点：ok=绿，warning=黄（休市休息中），其余=红（连接异常） */
+export function StatusDot({ ok, warning, className }: { ok: boolean; warning?: boolean; className?: string }) {
   return (
-    <span className={cn("relative inline-flex h-2 w-2 rounded-full", ok ? "bg-down" : "bg-destructive", className)}>
+    <span
+      className={cn(
+        "relative inline-flex h-2 w-2 rounded-full",
+        ok ? "bg-down" : warning ? "bg-gold" : "bg-destructive",
+        className,
+      )}
+    >
       {ok && <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-down opacity-60" />}
     </span>
   )

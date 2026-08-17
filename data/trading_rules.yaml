@@ -1,103 +1,16 @@
 thresholds:
-  sector_strong_score: 68
+  # 板块与个股观察阈值
   sector_watch_score: 55
-  buy_rebound_pct_min: 1.5
-  # 超过该幅度不再称为低位拐头，避免接近 8-10% 兑现区时追买。
-  buy_rebound_pct_max: 7.0
   buy_volume_ratio_min: 1.25
-  sell_rebound_pct: 8.0
   core_attack_volume_ratio: 1.5
   order_flow_attack_score: 25
   order_flow_pressure_score: -25
   low_support_rebound_min: 1.0
   pressure_pullback_pct: 3.5
-  # Intraday confluence thresholds. These are rolling-bar rules, not formula
-  # copies; the formula contributes the ideas of trend, support and exhaustion.
+  # 指数共振：指数拐头与量能配合的滚动窗口规则。
   buy_index_rebound_pct: 0.15
   buy_index_volume_ratio_min: 1.08
-  buy_flow_score_min: 18
-  # T strategy V2: market/sector are hard context gates; L1/five-level flow
-  # is a transparent confidence input, not a fake 委托队列 hard trigger.
-  strategy_version: t_strategy_v3_risk_reward
-  strategy_confluence_window_bars: 2
-  strategy_flow_support_score: 18
-  strategy_flow_pressure_score: -25
-  strategy_flow_overheat_score: 65
-  strategy_a_grade_min_score: 82
-  strategy_b_grade_min_score: 68
-  strategy_require_current_volume: true
-  strategy_allow_neutral_flow: true
-  # Two-day/100-stock study findings are soft grading only. They must not hide
-  # afternoon or high-rebound events from the replay queue.
-  strategy_preferred_rebound_min: 3.0
-  strategy_late_rebound_warning_pct: 5.0
-  strategy_afternoon_score_penalty: 8
-  strategy_late_rebound_score_penalty: 3
-  strategy_extreme_volume_ratio: 4.0
-  strategy_extreme_volume_score_penalty: 5
-  strategy_extreme_index_volume_ratio: 2.0
-  strategy_extreme_index_score_penalty: 4
-  buy_sector_heat_min: 55
-  buy_sector_confirm_min: 1
-  buy_price_slope_pct: 0.08
-  replay_min_bars_after_open: 3
-  replay_sell_min_bars: 15
-  replay_marker_cooldown_bars: 8
-  replay_volume_window: 5
-  # 分钟回放允许“核心先动 -> 指数拐头 -> 跟随股修复”在5分钟内顺序发生。
-  # 实时3-5秒快照仍使用上面的 strategy_confluence_window_bars=2。
-  replay_confluence_window_bars: 5
-  replay_auction_bars: 7
-  replay_reentry_min_bars: 20
-  replay_reentry_pullback_pct: 1.5
-  # Phase-state thresholds. Opening 3-7 minutes only changes feature weights;
-  # it is not rendered as a separate candidate board.
-  entry_prealert_score: 55
-  # 先手也必须已有市场前兆和量价支持，不能只靠板块/个股静态高分触发。
-  entry_prealert_market_min: 4
-  entry_opening_market_min: 0
-  entry_prealert_flow_min: 6
-  # 09:33-09:37 只降低先手阈值，确认阈值保持不变。
-  entry_opening_prealert_bonus: 3
-  # 同一交易时段点火失败后逐次提高门槛；连续两次失败后只允许强共振重启。
-  entry_rearm_score_step: 4
-  entry_rearm_strict_after_failures: 2
-  entry_rearm_confirm_bonus: 4
-  entry_confirm_score: 68
-  entry_retest_score: 72
-  entry_confirm_snapshots: 2
-  entry_cancel_score: 45
-  entry_cancel_timeout_bars: 8
-  entry_invalidation_buffer_pct: 0.35
-  exit_reduce_score: 36
-  exit_confirm_score: 55
-  exit_confirm_snapshots: 2
-  exit_hard_pressure_score: 70
-  exit_min_bars_after_entry: 3
-  action_prealert_pct: 25
-  action_confirm_pct: 75
-  action_retest_pct: 100
-  # Point-in-time risk/reward plan. These are broad guardrails, not values
-  # optimized against the two-day exploratory replay.
-  rr_structure_window: 12
-  rr_support_buffer_pct: 0.25
-  rr_min_risk_pct: 0.50
-  rr_max_risk_pct: 2.20
-  rr_min_reward_pct: 0.75
-  rr_target_cap_pct: 3.00
-  rr_min_strong: 1.45
-  rr_min_sector_lead: 1.70
-  rr_min_weak: 2.10
-  rr_afternoon_add: 0.35
-  rr_chase_add: 0.35
-  # 容量核心/板块传导只使用25%计划T额度，可比75%确认单少0.20R；
-  # 仍必须保留结构止损、正向逐笔成交与不追价上限。
-  rr_pilot_discount: 0.20
-  rr_pilot_floor: 1.15
-  # 宽度已高位饱和时不再追普通突破，只允许新主线核心或首次回踩。
-  v3_market_saturation_breadth: 0.60
-  v3_market_saturation_strong_breadth: 0.45
-  rr_min_tick_pct: 0.08
+  # 集合竞价（真实/代理）门槛
   auction_buy_change_pct_min: 0.5
   auction_volume_ratio_min: 1.1
   auction_market_breadth_min: 0.52
@@ -107,20 +20,18 @@ thresholds:
   auction_proxy_min_snapshots: 2
   auction_actual_min_amount: 1000000
   post_open_confirm_minute: 3
-  active_flow_imbalance_min_pct: 8
   buy_sector_core_attack_min: 1
   # 新股首日/近端新股极端涨跌不参与板块强弱聚合，只在个股列表展示。
   sector_new_listing_exclude_pct: 20.0
   sector_extreme_change_exclude_pct: 35.0
+  # 板块资金流合成权重
   sector_flow_gap_weight: 0.15
   sector_flow_momentum_weight: 0.55
   sector_flow_vwap_weight: 0.30
   sector_flow_gap_scale_pct: 4.0
   sector_flow_momentum_scale_pct: 0.20
   sector_flow_vwap_scale_pct: 0.50
-  board_default_page_size: 80
-  # Opening 3-7 minute decision window. These are transparent starting
-  # hypotheses, not parameters optimized on the two-day exploratory sample.
+  # 开盘 3-7 分钟决策窗口（OpeningStrategy 消费，独立于做T公式）。
   opening_market_breadth_min: 52
   opening_market_breadth_risk: 42
   opening_market_volume_ratio_min: 1.08

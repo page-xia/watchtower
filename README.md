@@ -132,61 +132,23 @@ $env:WATCH_SECTOR_FLOW_REFRESH_SECONDS="20"
 
 ## 开盘与研究
 
-### 开盘 7 分钟决策标记
+### 开盘 7 分钟决策标记（已下线）
 
-基于 `docs/opening7_research.md` 的事件研究（自选池 15 只 × 62 个交易日），分时图上叠加开盘 7 分钟制度分层研究标记：
+基于 `docs/opening7_research.md` 的事件研究（自选池 15 只 × 62 个交易日）曾在分时图上叠加开盘 7 分钟制度分层菱形研究标记（09:31 卖出闸门 / 09:33 买入决策）。该叠层已于 2026-08-17 从详情页下线：`GET /api/signals/{code}/detail/overlay` 不再返回 `opening_markers`，前端也不再渲染菱形标记。研究脚本与规则实现（`app/opening7.py`、`scripts/backtest_opening7_sector.py`）保留用于离线回放，不进入线上请求链路。
 
-- `09:31` 卖出闸门：高开 `>=2%` 且分笔净买比 `<=-10%`。持仓票触发深绿菱形“开盘卖出”；无持仓票同样触发深绿菱形“回避追高”。
-- `09:33` 买入决策：按指数开盘制度分层，强低开 `<=-0.8%` 抢反弹；低开 `-0.8~-0.3%` 要求无重抛压；平稳 `-0.3~0%` 要求分笔净买 `>=10%` 且站上分笔 VWAP；高开不追。命中后显示深红菱形“开盘买入”。
-- 追高排除：缺口 `>=5%` 或开盘已涨 `>=6.5%`。
+### 做T分时公式（做T公式.md）
 
-标记由 `GET /api/signals/{code}/detail/overlay` 的 `opening_markers` 字段返回，`validation_status=research_only`、`executable=false`，只用于研究，不自动执行。
+买卖点的唯一来源是通达信分时做T公式的 point-in-time 实现（`app/formula_engine.py`，版本 `zuot_tdx_levels_v1`）：
 
-### 开盘窗口菱形引擎
+- 均线系统：`MA30=EMA(C,30)`、`强弱=EMA(C,900)`，分钟级 O(n) 递推，第 i 个状态只用前 i 根分钟线。
+- 阻力/支撑/中轴：`H1=MAX(昨收,最高)`，`L1=MIN(昨收,最低)`，`P1=H1-L1`，`阻力=L1+P1*7/8`，`支撑=L1+P1*0.5/8`，`中=(支撑+阻力)/2`，当日为常量。
+- 均价：`SUM(V*C,0)/SUM(V,0)`（累计 VWAP）。
+- 买卖信号：`买=LONGCROSS(支撑,现价,2)`（回踩支撑），`卖=LONGCROSS(现价,阻力,2)`（冲高兑现）；分时图上以红/绿标记画在对应分钟。
+- 机构资金：分钟成交额（万元）= `V*C/100`，`成交额/8>20`（即单分钟成交额 >160 万元）记为大单分钟，按涨跌方向累计 A2/A3，资金流向 = A2-A3。
+- 买卖净：当日总额（万元）按外盘/（内盘+外盘）拆分（外盘=主动买、内盘=主动卖）。
+- 综合评分：`MA30>强弱` 30 分 + `现价>均价` 20 分 + `A2>A3` 30 分 + `现价>支撑` 20 分，输出五档建议（★强推/☆关注/△观望/○减仓/X规避）。
 
-`app/opening_window_engine.py` 在 09:30-10:00 以 6 秒一轮为机会队列实时产出菱形买卖点，10:00 后自动停转，不进入 5 秒看板刷新循环。
-
-- 观察池约 40 只：板块热度前 5 × 成员前 3 + 活跃股前 20 + 自选，去重，涨停票动态剔除。
-- 分笔只读池内票，盘内用 `get_transaction_data`，历史用 `get_history_transaction_data`。
-- 规则包含 09:31 卖出/回避和 09:33 买入，以及 09:35-10:00 的三条扩展研究规则。
-- 扩展规则首次命中时进队列为空心“确认中”，连续 2 轮（12s）成立后转实心确认；同票同规则当天只出一次。
-- 输出包含 `opening_markers` 分区，分页端点为 `GET /api/opening/markers?trade_date=&offset=&limit=20`，持久化到 `data/runtime/opening-markers/<YYYYMMDD>.json`。
-
-可用环境变量调参：
-
-```text
-WATCH_OPENING_WINDOW_ENGINE
-WATCH_OPENING_WINDOW_TICK_SECONDS
-WATCH_OPENING_WINDOW_TAPE_COUNT
-WATCH_OPENING_WINDOW_POOL_*
-WATCH_OPENING_WINDOW_WARN_CONFIRM_TICKS
-```
-
-历史事件研究可运行：
-
-```powershell
-.\.venv\Scripts\python.exe scripts/opening_window_research.py --days 20 --top 30
-```
-
-### 做 T 策略研究
-
-当前采用研究优先协议：正 T、反 T 分开标注，先验证 H1-H7 的市场机制、反事实和可实现盈亏比，再决定是否固化规则。旧 V2/V3 只保留为历史基线，不参与可执行状态。
-
-两日真实数据只用于链路冒烟和数据质量检查：
-
-```powershell
-.\.venv\Scripts\python.exe scripts/research_t_strategy.py --dates 20260806,20260807 --sample-size 100
-.\.venv\Scripts\python.exe scripts/research_t_strategy.py --dates 20260806,20260807 --sample-size 100 --no-transactions
-```
-
-正式筛选先扩展到 20 个连续交易日，再扩展到 60 日滚动样本外验证：
-
-```powershell
-.\.venv\Scripts\python.exe scripts/research_t_strategy.py --end 20260807 --lookback-days 20 --sample-size 100
-.\.venv\Scripts\python.exe scripts/research_t_strategy.py --end 20260807 --lookback-days 60 --sample-size 100
-```
-
-完整报告写入 `data/runtime/strategy-research/latest.json` 和 `latest.md`；页面/API 只读不含原始候选、标签和结果的 `latest_summary.json`。研究状态通过 `GET /api/research/status` 和 `GET /api/research/protocol` 查看。
+详情页分时图叠加 MA30/强弱两条曲线和阻力/支撑/中轴三条水平线（`GET /api/signals/{code}/detail/chart` 的 `formula_overlay` 字段）；公式状态卡片数据来自 `formula_state` 字段。旧的 V2/V3 策略、金色共振和研究管线（`/api/research/*`、`scripts/research_t_strategy.py`）已整体移除。
 
 ## 持久化与同步
 
@@ -198,7 +160,6 @@ CloudBase CloudRun 容器文件系统不是持久化存储，实例重启、扩�
 
 ```text
 WATCH_BACKGROUND_COLLECTOR=1
-WATCH_OPENING_WINDOW_ENGINE=1
 WATCH_PERSISTENCE_BACKEND=cloudbase_nosql
 WATCH_CLOUDBASE_ENV_ID=server-d2g7x597t019f5cb0
 WATCH_CLOUDBASE_STATE_COLLECTION=watchtower_state
@@ -221,7 +182,7 @@ WATCH_CLOUDBASE_DATABASE_INSTANCE=(default)
 WATCH_CLOUDBASE_DATABASE_NAME=(default)
 ```
 
-云端 NoSQL 会保存最新 dashboard 快照、官方板块成员缓存和开盘窗口菱形标记；CloudBase MySQL 会保存 `message_topics`、`message_events`、`message_event_links`、`message_sync_runs` 和物化证据表 `message_evidence_cache`。网页自选股保存在用户浏览器 `localStorage`，并通过请求参数传给看板和详情接口；不同用户看到的自选互不影响，也不会随部署包上传。容器重启后，服务优先从 NoSQL 恢复这些服务端轻量状态，并从 MySQL 读取星球消息证据；服务保持活跃时，后台采集器会继续按行情源重新构建本地轨迹缓存。暗盘资金开启后只在独立慢循环里读取有界股票池，不进入 5 秒全市场刷新链路。若希望减少冷启动和空档，CloudRun 建议设置最小实例数 `MinNum=1`；如果为了省成本设为 `0`，冷启动后仍可恢复云端持久数据，但运行期 SQLite 缓存需要重新采集。
+云端 NoSQL 会保存最新 dashboard 快照和官方板块成员缓存；CloudBase MySQL 会保存 `message_topics`、`message_events`、`message_event_links`、`message_sync_runs` 和物化证据表 `message_evidence_cache`。网页自选股保存在用户浏览器 `localStorage`，并通过请求参数传给看板和详情接口；不同用户看到的自选互不影响，也不会随部署包上传。容器重启后，服务优先从 NoSQL 恢复这些服务端轻量状态，并从 MySQL 读取星球消息证据；服务保持活跃时，后台采集器会继续按行情源重新构建本地轨迹缓存。暗盘资金开启后只在独立慢循环里读取有界股票池，不进入 5 秒全市场刷新链路。若希望减少冷启动和空档，CloudRun 建议设置最小实例数 `MinNum=1`；如果为了省成本设为 `0`，冷启动后仍可恢复云端持久数据，但运行期 SQLite 缓存需要重新采集。
 
 星球消息证据读取走物化缓存：详情页按 `(scope=stock/sector, cache_key=代码/板块词)` 直接读 `message_evidence_cache`（1~2 次索引查询，亚秒）；未命中的键走动态查询兜底并回写（read-through，空结果也缓存）；每次消息同步后后台自动重建受影响实体的物化值（含板块查询词与链接名的子串别名桥接）。全新部署或物化表被清空后，下一次同步会自动触发一次全量预建，也可手动触发 `POST /api/messages/evidence/prebuild`（需 ingest token）；`scripts/materialize_message_evidence.py` 可在临时开放 MySQL 直连时从本地一次性全量重建（语义与服务端一致）。
 
@@ -295,10 +256,6 @@ WS /ws/stream?view=terminal&format=delta&...   # React 首页：快照 + 分区�
 GET /api/signals/{code}/detail
 GET /api/signals/{code}/detail/overlay
 GET /api/opening/decision
-GET /api/opening/markers?trade_date=&offset=0&limit=20
-GET /api/opening/research
-GET /api/research/status
-GET /api/research/protocol
 GET /api/messages/status
 GET /api/dark-pool
 ```
@@ -307,7 +264,7 @@ GET /api/dark-pool
 
 ## 相关文档
 
-- `docs/strategy/t_strategy_v2.md`
+- `做T公式.md`
 - `docs/strategy/opening_3_7_method.md`
 - `docs/opening7_research.md`
 - `docs/ws_broadcast_plan.md`

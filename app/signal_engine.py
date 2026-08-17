@@ -4,7 +4,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime
 from math import isfinite
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from app.models import (
     EventItem,
@@ -26,7 +26,12 @@ from app.models import (
     TrendState,
     WatchlistItem,
 )
-from app.formula_engine import compute_formula_series, evaluate_gold_resonance
+from app.formula_engine import (
+    SIGNAL_VERSION,
+    ZuoTDayContext,
+    compute_zuot_series,
+    latest_zuot_event,
+)
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -73,8 +78,7 @@ class SignalEngine:
         self.sector_flow_scale = float(thresholds.get("sector_flow_scale", 1.0))
         self.buy_index_rebound_pct = float(thresholds.get("buy_index_rebound_pct", 0.15))
         self.buy_index_volume_ratio_min = float(thresholds.get("buy_index_volume_ratio_min", 1.08))
-        self.strategy_version = "tdx_formula_v1_research_only"
-        self.replay_volume_window = int(thresholds.get("replay_volume_window", 5))
+        self.strategy_version = SIGNAL_VERSION
         self.auction_buy_change_pct_min = float(thresholds.get("auction_buy_change_pct_min", 0.5))
         self.auction_volume_ratio_min = float(thresholds.get("auction_volume_ratio_min", 1.1))
         self.auction_market_breadth_min = float(thresholds.get("auction_market_breadth_min", 0.52))
@@ -424,6 +428,8 @@ class SignalEngine:
                 for quote in metric_quotes
             ) / 100_000_000
             leader = max(metric_quotes, key=lambda quote: (quote.change_pct, quote.minute_amount_ratio))
+            # 引擎不读市值库：中军用成交额第一作代理（services 层有 daily_basic 时用流通市值）
+            capacity_leader = max(metric_quotes, key=lambda quote: float(quote.amount or 0))
             core_attack = any(
                 by_code[code].change_pct >= 1.5
                 and by_code[code].minute_amount_ratio >= self.core_attack_volume_ratio
@@ -491,6 +497,8 @@ class SignalEngine:
                     core_codes=core_codes,
                     leader_code=leader.code,
                     leader_name=leader.name,
+                    capacity_leader_code=capacity_leader.code,
+                    capacity_leader_name=capacity_leader.name,
                     reasons=reasons,
                     flow_delta=round(flow_delta, 2),
                     raw_total_count=len(sector_quotes),
@@ -518,6 +526,7 @@ class SignalEngine:
         preferred_sector_names: set[str] | None = None,
         positions: dict[str, PositionRecord] | None = None,
         formula_rows_by_code: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+        sector_name_mapper: Callable[[Quote, SectorSnapshot], str] | None = None,
     ) -> list[TradeSignal]:
         """Return board signals from cached formula rows when available.
 
@@ -570,7 +579,11 @@ class SignalEngine:
             risks: list[str] = []
             factor_flags: list[str] = ["公式唯一来源"]
             if sector:
-                reasons.append(f"{sector.name}热度{sector.heat_score}分")
+                # 板块名统一走展示名映射：内部行业代码（X250602 等）映射成官方板块名
+                display_sector_name = (
+                    sector_name_mapper(quote, sector) if sector_name_mapper else sector.name
+                )
+                reasons.append(f"{display_sector_name}热度{sector.heat_score}分")
                 if sector.core_attack:
                     reasons.append("板块核心进攻")
                     factor_flags.append("板块进攻")
@@ -619,14 +632,13 @@ class SignalEngine:
                 "low_rebound_pct": round(float(low_rebound), 2),
                 "pullback_pct": round(float(pullback), 2),
             }
-            formula_event = self._latest_cached_formula_event(
+            formula_event = self._latest_cached_zuot_event(
                 formula_rows_by_code.get(quote.code) or formula_rows_by_code.get(str(quote.code).zfill(6)) or [],
                 quote,
             )
             if formula_event is not None:
                 event_signal = formula_event["signal"]
                 event_reasons = list(formula_event["reasons"])
-                gold_reasons = list(formula_event.get("resonance_reasons") or [])
                 signal_type = event_signal
                 signal_phase = (
                     SignalPhase.CONFIRM.value
@@ -643,14 +655,14 @@ class SignalEngine:
                     if event_signal == SignalType.BUY_T
                     else TradeDirection.REVERSE_T.value
                 )
-                signal_setup = "tdx_formula_cached_buy" if event_signal == SignalType.BUY_T else "tdx_formula_cached_sell"
-                signal_grade = "金色共振买T" if formula_event.get("gold_resonance") else "公式买T" if event_signal == SignalType.BUY_T else "公式卖T"
-                signal_source = "tdx_formula_cached_stock_features"
-                source_quality = "trajectory_stock_features+tdx_formula"
-                score = max(score, 84 if formula_event.get("gold_resonance") else 78 if event_signal == SignalType.BUY_T else 74)
-                reasons = list(dict.fromkeys([*event_reasons, *gold_reasons, *reasons[:3]]))
+                signal_setup = "zuot_support_rebound" if event_signal == SignalType.BUY_T else "zuot_resistance_fade"
+                signal_grade = "公式买T" if event_signal == SignalType.BUY_T else "公式卖T"
+                signal_source = "zuot_tdx_cached_stock_features"
+                source_quality = "trajectory_stock_features+zuot_tdx_levels"
+                score = max(score, 78 if event_signal == SignalType.BUY_T else 74)
+                reasons = list(dict.fromkeys([*event_reasons, *reasons[:3]]))
                 risks = [risk for risk in risks if "等待详情分钟公式确认" not in risk]
-                risks.append("首页未读取L1逐笔；L1抛压只在详情中否决金点")
+                risks.append("首页未读取L1逐笔；L1抛压只在详情中确认")
                 if event_signal == SignalType.SELL_T:
                     if t_plus_one_restricted:
                         risks.append("A股T+1限制：当前持仓可卖数量为0")
@@ -661,21 +673,20 @@ class SignalEngine:
                         [
                             "公式买入原语" if event_signal == SignalType.BUY_T else "公式卖出原语",
                             *factor_flags,
-                            "金色共振" if formula_event.get("gold_resonance") else "",
                         ]
                     )
                 )
                 factor_flags = [item for item in factor_flags if item]
                 executable = False
-                execution_reason = "本地分钟特征缓存出现公式原语；执行前打开详情确认L1成交流"
-                evidence_sequence = list(dict.fromkeys([*event_reasons, *gold_reasons]))
+                execution_reason = "本地分钟特征缓存出现做T公式信号；执行前打开详情确认L1成交流"
+                evidence_sequence = list(dict.fromkeys(event_reasons))
                 invalidation_price = float(formula_event.get("invalidation_price") or 0)
                 factor_scores.update(
                     {
-                        "多方力度": float(formula_event.get("duo_strength") or 0),
-                        "空方力度": float(formula_event.get("kong_strength") or 0),
-                        "主力吸筹": float(formula_event.get("main_absorption") or 0),
-                        "趋势线距离_pct": float(formula_event.get("trend_distance_pct") or 0),
+                        "总评分": float(formula_event.get("score") or 0),
+                        "资金流向_万": float(formula_event.get("fund_flow") or 0),
+                        "阻力": float(formula_event.get("resistance") or 0),
+                        "支撑": float(formula_event.get("support") or 0),
                     }
                 )
 
@@ -712,6 +723,7 @@ class SignalEngine:
                     confluence_window_bars=0,
                     phase=signal_phase,
                     invalidation_price=round(invalidation_price, 2),
+                    trigger_price=round(float(formula_event.get("price") or 0), 3) if formula_event else 0.0,
                     source_quality=source_quality,
                     factor_scores=factor_scores,
                     exit_score=0,
@@ -723,79 +735,53 @@ class SignalEngine:
         signals.sort(key=lambda signal: (not signal.pinned, -signal.score, signal.code))
         return signals
 
-    def _latest_cached_formula_event(
+    def _latest_cached_zuot_event(
         self,
         rows: Sequence[Mapping[str, Any]],
         quote: Quote,
+        recent_bars: int | None = None,
     ) -> dict[str, Any] | None:
+        """从本地分钟特征缓存检测最新做T买/卖信号（新做T公式，支撑/阻力穿越）。
+
+        recent_bars 缺省用首页提升窗口（最近几根分钟才算数）；传大窗口（如全天）
+        可拿「当天最近一次买卖点」，供榜单距买卖点 ±% 展示。
+        """
         formula_rows = self._cached_formula_rows(rows, quote)
         if len(formula_rows) < 2:
             return None
+        day = ZuoTDayContext(
+            prev_close=float(quote.prev_close or 0),
+            day_high=float(quote.day_high or 0),
+            day_low=float(quote.day_low or 0),
+            change_pct=float(quote.change_pct or 0),
+            volume_ratio=float(quote.minute_amount_ratio or 1) or 1.0,
+            total_amount=float(quote.amount or 0),
+            outer_volume=float(quote.order_flow.active_buy_volume or 0),
+            inner_volume=float(quote.order_flow.active_sell_volume or 0),
+        )
         try:
-            states = [dict(state) for state in compute_formula_series(formula_rows).states]
+            result = compute_zuot_series(formula_rows, day)
         except Exception:
             return None
-        if not states:
+        event = latest_zuot_event(
+            result.states,
+            recent_bars=recent_bars if recent_bars is not None else self.dashboard_formula_recent_bars,
+        )
+        if event is None:
             return None
-
-        events: list[dict[str, Any]] = []
-        previous_absorption = 0.0
-        for index, state in enumerate(states):
-            quick_entry = bool(state.get("赶快出手") or state.get("quick_entry") or state.get("fast_trigger"))
-            absorption = float(state.get("主力吸筹") or state.get("main_absorption") or 0)
-            buy_event = bool(quick_entry or (absorption > 0 and previous_absorption <= 0))
-            sell_event = bool(state.get("sell_candidate") or state.get("sell_trigger"))
-            previous_absorption = absorption
-            if buy_event:
-                gold, gold_reasons = evaluate_gold_resonance(
-                    state,
-                    buy_candidate=True,
-                    l1_sell_pressure=False,
-                    l1_buy_support=False,
-                )
-                reasons = list(state.get("formula_buy_reasons") or state.get("buy_signal_reasons") or [])
-                if not reasons:
-                    if quick_entry:
-                        reasons.append("赶快出手=CROSS(多方力度,6.78)")
-                    if absorption > 0:
-                        reasons.append("主力吸筹>0")
-                events.append(
-                    {
-                        "index": index,
-                        "signal": SignalType.BUY_T,
-                        "time": str(state.get("time") or formula_rows[index].get("time") or quote.updated_at or "")[:5],
-                        "reasons": reasons,
-                        "gold_resonance": gold,
-                        "resonance_reasons": gold_reasons,
-                        "invalidation_price": state.get("今日保护价") or state.get("protection_price") or 0,
-                        "duo_strength": state.get("多方力度") or state.get("duo_strength") or 0,
-                        "kong_strength": state.get("空方力度") or state.get("kong_strength") or 0,
-                        "main_absorption": absorption,
-                        "trend_distance_pct": state.get("趋势线最近距离_pct") or state.get("trend_distance_pct") or 0,
-                    }
-                )
-            elif sell_event:
-                events.append(
-                    {
-                        "index": index,
-                        "signal": SignalType.SELL_T,
-                        "time": str(state.get("time") or formula_rows[index].get("time") or quote.updated_at or "")[:5],
-                        "reasons": list(state.get("formula_sell_reasons") or state.get("sell_signal_reasons") or ["DRAWICON(CROSS(88.8,RSI),90,15)"]),
-                        "gold_resonance": False,
-                        "resonance_reasons": [],
-                        "invalidation_price": state.get("今日保护价") or state.get("protection_price") or 0,
-                        "duo_strength": state.get("多方力度") or state.get("duo_strength") or 0,
-                        "kong_strength": state.get("空方力度") or state.get("kong_strength") or 0,
-                        "main_absorption": absorption,
-                        "trend_distance_pct": state.get("趋势线最近距离_pct") or state.get("trend_distance_pct") or 0,
-                    }
-                )
-        if not events:
-            return None
-        latest = events[-1]
-        if int(latest["index"]) < len(states) - self.dashboard_formula_recent_bars:
-            return None
-        return latest
+        latest = result.latest
+        return {
+            "index": event["index"],
+            "signal": SignalType.BUY_T if event["signal"] == "buy" else SignalType.SELL_T,
+            "time": event["time"],
+            "price": float(event.get("price") or 0),
+            "reasons": list(event["reasons"]),
+            "invalidation_price": event.get("invalidation_price") or 0,
+            "score": latest.get("score") or 0,
+            "fund_flow": latest.get("fund_flow") or 0,
+            "resistance": latest.get("resistance") or 0,
+            "support": latest.get("support") or 0,
+        }
 
     def _cached_formula_rows(
         self,
@@ -1043,427 +1029,6 @@ class SignalEngine:
         member_codes: list[str] | set[str] | None = None,
     ) -> list[str]:
         return self._sector_flow_codes(sector, {quote.code: quote for quote in quotes}, member_codes=member_codes)
-
-    def build_replay_detail(
-        self,
-        quote: Quote,
-        bars: list[dict],
-        market: MarketState,
-        sector: SectorSnapshot | None,
-        selected_sector: str | None = None,
-        market_bars: list[dict] | None = None,
-        sector_bars: list[list[dict]] | None = None,
-        position: PositionRecord | None = None,
-        transaction_flow: TransactionFlowObservation | None = None,
-        trend_states: Sequence[Mapping[str, Any]] | None = None,
-    ) -> tuple[list[ReplayPoint], list[ReplayMarker], list[ReplayMarker], list[str]]:
-        """Build replay points and markers from the TDX formula state only."""
-        if not bars:
-            return [], [], [], ["暂无分钟回放数据"]
-
-        def number(value: Any, default: float = 0.0) -> float:
-            try:
-                result = float(value)
-            except (TypeError, ValueError):
-                return default
-            return result if isfinite(result) else default
-
-        def state_value(state: dict[str, Any], *keys: str, default: Any = None) -> Any:
-            for key in keys:
-                if key in state and state.get(key) not in (None, ""):
-                    return state.get(key)
-            return default
-
-        def l1_flags(point: Any | None) -> tuple[bool, bool, int]:
-            if point is None:
-                if not transaction_flow or not transaction_flow.available:
-                    return False, False, 0
-                score = int(transaction_flow.score or 0)
-                pressure = bool(
-                    score <= -25
-                    or transaction_flow.imbalance_pct <= -20
-                    or transaction_flow.large_imbalance_pct <= -25
-                )
-                support = bool(
-                    score >= 18
-                    or transaction_flow.imbalance_pct >= 18
-                    or transaction_flow.large_imbalance_pct >= 8
-                )
-                return pressure, support, score
-            score = int(getattr(point, "rolling_score", getattr(point, "score", 0)) or 0)
-            imbalance = number(getattr(point, "rolling_imbalance_pct", getattr(point, "imbalance_pct", 0)))
-            large_imbalance = number(
-                getattr(point, "rolling_large_imbalance_pct", getattr(point, "large_imbalance_pct", 0))
-            )
-            pressure = bool(score <= -25 or imbalance <= -20 or large_imbalance <= -25)
-            support = bool(score >= 18 or imbalance >= 18 or large_imbalance >= 8)
-            return pressure, support, score
-
-        def buy_reasons(state: dict[str, Any]) -> list[str]:
-            raw = state_value(state, "formula_buy_reasons", "buy_signal_reasons", default=[])
-            reasons = [str(item) for item in (raw or []) if str(item)] if isinstance(raw, list) else []
-            if reasons:
-                return reasons
-            fallback: list[str] = []
-            if bool(state_value(state, "赶快出手", "quick_entry", "fast_trigger", default=False)):
-                fallback.append("赶快出手=CROSS(多方力度,6.78)")
-            if number(state_value(state, "主力吸筹", "main_absorption", default=0)) > 0:
-                fallback.append("主力吸筹>0")
-            return fallback
-
-        def sell_reasons(state: dict[str, Any]) -> list[str]:
-            raw = state_value(state, "formula_sell_reasons", "sell_signal_reasons", default=[])
-            reasons = [str(item) for item in (raw or []) if str(item)] if isinstance(raw, list) else []
-            return reasons or ["DRAWICON(CROSS(88.8,RSI),90,15)"]
-
-        count = len(bars)
-        raw_prices = [number(bar.get("close", bar.get("price", quote.prev_close))) for bar in bars]
-        prices = self._normalize_replay_prices(raw_prices, quote.prev_close, quote.day_low, quote.day_high)
-        fallback_times = self._session_times(count)
-        times = [
-            str(bar.get("time") or bar.get("datetime") or (fallback_times[idx] if idx < len(fallback_times) else ""))[:5]
-            for idx, bar in enumerate(bars)
-        ]
-        raw_opens = [number(bar.get("open"), prices[idx - 1] if idx else quote.open or quote.prev_close or prices[idx]) for idx, bar in enumerate(bars)]
-        raw_highs = [number(bar.get("high"), max(prices[idx], raw_opens[idx])) for idx, bar in enumerate(bars)]
-        raw_lows = [number(bar.get("low"), min(prices[idx], raw_opens[idx])) for idx, bar in enumerate(bars)]
-        opens = self._normalize_replay_prices(raw_opens, quote.prev_close, quote.day_low, quote.day_high)
-        highs = self._normalize_replay_prices(raw_highs, quote.prev_close, quote.day_low, quote.day_high)
-        lows = self._normalize_replay_prices(raw_lows, quote.prev_close, quote.day_low, quote.day_high)
-
-        volumes: list[float] = []
-        amounts: list[float] = []
-        formula_rows: list[dict[str, Any]] = []
-        for idx, (bar, price) in enumerate(zip(bars, prices)):
-            volume = max(number(bar.get("vol", bar.get("volume", 0))), 0.0)
-            amount = max(number(bar.get("amount")), 0.0)
-            if amount <= 0 and volume > 0 and price > 0:
-                amount = volume * price * 100
-            volumes.append(volume)
-            amounts.append(amount)
-            open_price = opens[idx] if idx < len(opens) else price
-            high_price = max(highs[idx] if idx < len(highs) else price, open_price, price)
-            low_price = min(lows[idx] if idx < len(lows) else price, open_price, price)
-            formula_rows.append(
-                {
-                    "time": times[idx],
-                    "open": open_price,
-                    "high": high_price,
-                    "low": low_price,
-                    "close": price,
-                    "price": price,
-                    "vol": volume,
-                    "amount": amount,
-                }
-            )
-
-        formula_result = compute_formula_series(formula_rows, trend_states=trend_states)
-        states = [dict(state) for state in formula_result.states]
-        index_metrics = self._context_metrics(
-            market_bars or [],
-            market.indices[0].prev_close if market.indices else 0,
-            count,
-        )
-        sector_metrics = [self._context_metrics(rows, 0, count) for rows in (sector_bars or []) if rows]
-        transaction_points = {
-            str(point.time or "")[:5]: point
-            for point in (transaction_flow.points if transaction_flow else [])
-        }
-        tx_available = bool(transaction_flow and transaction_flow.available)
-
-        replay_points: list[ReplayPoint] = []
-        markers: list[ReplayMarker] = []
-        timeline: list[ReplayMarker] = []
-        running_low = prices[0]
-        running_high = prices[0]
-        cumulative_amount = 0.0
-        cumulative_volume = 0.0
-        previous_absorption = 0.0
-
-        has_position = bool(position and position.quantity > 0)
-        t_plus_one_restricted = bool(has_position and position and position.available_quantity <= 0)
-
-        for idx, (time_label, price, volume, amount) in enumerate(zip(times, prices, volumes, amounts)):
-            running_low = min(running_low, price)
-            running_high = max(running_high, price)
-            cumulative_amount += amount
-            cumulative_volume += volume * 100
-            vwap = cumulative_amount / cumulative_volume if cumulative_volume > 0 else price
-            amount_ratio = self._rolling_ratio(amounts, idx, self.replay_volume_window)
-            change_pct = (price - quote.prev_close) / quote.prev_close * 100 if quote.prev_close else 0.0
-            rebound = (price - running_low) / running_low * 100 if running_low else 0.0
-            pullback = (running_high - price) / running_high * 100 if running_high else 0.0
-            state = states[idx] if idx < len(states) else {}
-            quick_entry = bool(state_value(state, "赶快出手", "quick_entry", "fast_trigger", default=False))
-            absorption = number(state_value(state, "主力吸筹", "main_absorption", default=0))
-            sell_candidate = bool(state_value(state, "sell_candidate", "sell_trigger", default=False))
-            buy_event = bool(quick_entry or (absorption > 0 and previous_absorption <= 0))
-            sell_event = bool(sell_candidate)
-            previous_absorption = absorption
-            tape_point = transaction_points.get(time_label)
-            l1_pressure, l1_support, flow_score = l1_flags(tape_point)
-            gold, gold_reasons = evaluate_gold_resonance(
-                state,
-                buy_candidate=buy_event,
-                l1_sell_pressure=l1_pressure,
-                l1_buy_support=l1_support,
-            )
-            point_signal = SignalType.BUY_T if buy_event else SignalType.SELL_T if sell_candidate else SignalType.WATCH
-            point_phase = (
-                SignalPhase.CONFIRM.value
-                if point_signal == SignalType.BUY_T
-                else SignalPhase.SELL_CONFIRM.value
-                if point_signal == SignalType.SELL_T
-                else SignalPhase.OBSERVE.value
-            )
-            point_action = (
-                TradeAction.BUY_T.value
-                if point_signal == SignalType.BUY_T
-                else TradeAction.SELL_BASE.value
-                if point_signal == SignalType.SELL_T
-                else TradeAction.OBSERVE.value
-            )
-            point_direction = (
-                TradeDirection.POSITIVE_T.value
-                if point_signal == SignalType.BUY_T
-                else TradeDirection.REVERSE_T.value
-                if point_signal == SignalType.SELL_T
-                else TradeDirection.NONE.value
-            )
-            point_reasons = buy_reasons(state) if point_signal == SignalType.BUY_T else sell_reasons(state) if point_signal == SignalType.SELL_T else []
-            if point_signal == SignalType.BUY_T and gold_reasons:
-                point_reasons = list(dict.fromkeys([*point_reasons, *gold_reasons]))
-            risks: list[str] = []
-            if point_signal == SignalType.BUY_T and l1_pressure:
-                risks.append("L1明显抛压仅否决金点，红色公式买候选保留")
-            if point_signal == SignalType.SELL_T:
-                if t_plus_one_restricted:
-                    risks.append("A股T+1限制：当前持仓可卖数量为0")
-                elif not has_position:
-                    risks.append("未录入本地持仓，绿色卖T仅作风险提示")
-            market_event = ""
-            if index_metrics:
-                metric = index_metrics[min(idx, len(index_metrics) - 1)]
-                if metric.get("turning"):
-                    market_event = "指数拐头"
-                elif metric.get("amount_expanding"):
-                    market_event = "指数量能放大"
-            elif market.index_turning:
-                market_event = "指数拐头"
-            sector_event = ""
-            if sector_metrics:
-                rows_at = [metrics[min(idx, len(metrics) - 1)] for metrics in sector_metrics if metrics]
-                if any(row.get("turning") or row.get("amount_expanding") for row in rows_at):
-                    sector_event = "板块分时转强"
-            elif sector and (sector.core_attack or sector.limit_up_count > 0 or sector.opened_limit_count > 0):
-                sector_event = "板块核心进攻"
-            flow_event = ""
-            if tx_available:
-                flow_event = "L1明显抛压" if l1_pressure else "L1买盘支持" if l1_support else "L1成交流中性"
-            source_quality = "tdx_formula_minute+l1_transaction" if tx_available else "tdx_formula_minute"
-            replay_points.append(
-                ReplayPoint(
-                    time=time_label,
-                    price=round(price, 2),
-                    change_pct=round(change_pct, 2),
-                    rebound_from_low_pct=round(rebound, 2),
-                    pullback_from_high_pct=round(pullback, 2),
-                    volume=round(volume, 2),
-                    minute_amount_ratio=round(amount_ratio, 2),
-                    signal=point_signal,
-                    reasons=list(dict.fromkeys(point_reasons)),
-                    signal_score=0,
-                    factor_flags=["公式买入原语"] if point_signal == SignalType.BUY_T else ["公式卖出原语"] if point_signal == SignalType.SELL_T else [],
-                    vwap=round(vwap, 4),
-                    flow_score=flow_score,
-                    strategy_version=self.strategy_version,
-                    signal_grade="公式买T" if point_signal == SignalType.BUY_T else "公式卖T" if point_signal == SignalType.SELL_T else "观察",
-                    confluence_window_bars=0,
-                    phase=point_phase,
-                    risks=risks,
-                    invalidation_price=round(number(state_value(state, "今日保护价", "protection_price", default=0)), 2),
-                    source_quality=source_quality,
-                    factor_scores={
-                        "多方力度": number(state_value(state, "多方力度", "duo_strength", default=0)),
-                        "空方力度": number(state_value(state, "空方力度", "kong_strength", default=0)),
-                        "主力吸筹": absorption,
-                        "趋势线距离_pct": number(state_value(state, "趋势线最近距离_pct", "trend_distance_pct", default=0)),
-                    },
-                    exit_score=0,
-                    market_event=market_event,
-                    sector_event=sector_event,
-                    stock_event=("接近白/黄趋势线" if bool(state_value(state, "是否接近趋势线", "near_trend_line", default=False)) else ""),
-                    flow_event=flow_event,
-                    t_plus_one_restricted=t_plus_one_restricted,
-                    direction=point_direction,
-                    action=point_action,
-                    setup="tdx_formula_buy" if point_signal == SignalType.BUY_T else "tdx_formula_sell" if point_signal == SignalType.SELL_T else "",
-                    regime="tdx_formula_runtime_v1",
-                    executable=bool(point_signal == SignalType.BUY_T or (point_signal == SignalType.SELL_T and has_position and not t_plus_one_restricted)),
-                    execution_reason="公式研究信号；执行前需结合持仓和风控" if point_signal != SignalType.WATCH else "",
-                    evidence_sequence=list(dict.fromkeys([*point_reasons, market_event, sector_event, flow_event])),
-                    validation_status="research_only",
-                    hypothesis_id="tdx_formula_runtime_v1",
-                )
-            )
-
-            marker_signal: SignalType | None = None
-            if buy_event:
-                marker_signal = SignalType.BUY_T
-            elif sell_event:
-                marker_signal = SignalType.SELL_T
-            if marker_signal is not None:
-                marker_reasons = buy_reasons(state) if marker_signal == SignalType.BUY_T else sell_reasons(state)
-                marker_gold = False
-                marker_gold_reasons: list[str] = []
-                marker_risks: list[str] = []
-                if marker_signal == SignalType.BUY_T:
-                    marker_gold, marker_gold_reasons = gold, gold_reasons
-                    marker_reasons = list(dict.fromkeys([*marker_reasons, *marker_gold_reasons]))
-                    if l1_pressure:
-                        marker_risks.append("L1明显抛压仅否决金点，红色公式买候选保留")
-                else:
-                    if t_plus_one_restricted:
-                        marker_risks.append("A股T+1限制：当前持仓可卖数量为0")
-                    elif not has_position:
-                        marker_risks.append("未录入本地持仓，绿色卖T仅作风险提示")
-                marker_phase = SignalPhase.CONFIRM.value if marker_signal == SignalType.BUY_T else SignalPhase.SELL_CONFIRM.value
-                marker_action = TradeAction.BUY_T.value if marker_signal == SignalType.BUY_T else TradeAction.SELL_BASE.value
-                marker_direction = TradeDirection.POSITIVE_T.value if marker_signal == SignalType.BUY_T else TradeDirection.REVERSE_T.value
-                marker = ReplayMarker(
-                    time=time_label,
-                    signal=marker_signal,
-                    price=round(price, 2),
-                    change_pct=round(change_pct, 2),
-                    reasons=list(dict.fromkeys(marker_reasons)),
-                    score=0,
-                    factor_flags=["公式买入原语"] if marker_signal == SignalType.BUY_T else ["公式卖出原语"],
-                    strategy_version=self.strategy_version,
-                    signal_grade="公式买T" if marker_signal == SignalType.BUY_T else "公式卖T",
-                    confluence_window_bars=0,
-                    phase=marker_phase,
-                    risks=list(dict.fromkeys(marker_risks)),
-                    invalidation_price=round(number(state_value(state, "今日保护价", "protection_price", default=0)), 2),
-                    source_quality=source_quality,
-                    factor_scores={
-                        "多方力度": number(state_value(state, "多方力度", "duo_strength", default=0)),
-                        "空方力度": number(state_value(state, "空方力度", "kong_strength", default=0)),
-                        "主力吸筹": absorption,
-                        "趋势线距离_pct": number(state_value(state, "趋势线最近距离_pct", "trend_distance_pct", default=0)),
-                    },
-                    exit_score=0,
-                    market_event=market_event,
-                    sector_event=sector_event,
-                    stock_event=("接近白/黄趋势线" if bool(state_value(state, "是否接近趋势线", "near_trend_line", default=False)) else ""),
-                    flow_event=flow_event,
-                    t_plus_one_restricted=t_plus_one_restricted,
-                    action_size_pct=0,
-                    direction=marker_direction,
-                    action=marker_action,
-                    setup="tdx_formula_buy" if marker_signal == SignalType.BUY_T else "tdx_formula_sell",
-                    regime="tdx_formula_runtime_v1",
-                    executable=bool(marker_signal == SignalType.BUY_T or (has_position and not t_plus_one_restricted)),
-                    execution_reason="公式研究信号；执行前需结合持仓和风控",
-                    evidence_sequence=list(dict.fromkeys([*marker_reasons, market_event, sector_event, flow_event])),
-                    validation_status="research_only",
-                    hypothesis_id="tdx_formula_runtime_v1",
-                    gold_resonance=marker_gold,
-                    resonance_reasons=marker_gold_reasons,
-                )
-                markers.append(marker)
-                timeline.append(marker)
-
-        if replay_points:
-            first_point = replay_points[0]
-            timeline.insert(
-                0,
-                ReplayMarker(
-                    time=first_point.time,
-                    signal=SignalType.WATCH,
-                    price=first_point.price,
-                    change_pct=first_point.change_pct,
-                    reasons=["开盘观察，等待公式买卖原语"],
-                    strategy_version=self.strategy_version,
-                    phase=SignalPhase.OBSERVE.value,
-                    source_quality="tdx_formula_minute",
-                    validation_status="research_only",
-                    hypothesis_id="tdx_formula_runtime_v1",
-                ),
-            )
-
-        prices_for_summary = [point.price for point in replay_points]
-        buy_count = sum(1 for marker in markers if marker.signal == SignalType.BUY_T)
-        sell_count = sum(1 for marker in markers if marker.signal == SignalType.SELL_T)
-        summary = [
-            "公式引擎：做T买卖点唯一来源为 做T公式.md + 趋势公式.md",
-            f"分钟点 {len(replay_points)} 个",
-        ]
-        if prices_for_summary:
-            summary.append(f"区间 {min(prices_for_summary):.2f} - {max(prices_for_summary):.2f}")
-        summary.append(f"公式候选 买T {buy_count} / 卖T {sell_count}")
-        if tx_available and transaction_flow:
-            summary.append(
-                f"L1成交流 {transaction_flow.count}笔，方向差{transaction_flow.imbalance_pct:+.1f}%；"
-                "只增强理由或否决金点，不单独生成买卖点"
-            )
-        if selected_sector:
-            summary.append(f"板块视图 {selected_sector}")
-        if not markers:
-            summary.append("未出现公式买卖原语")
-        return replay_points, markers, timeline, summary
-
-    def _rolling_ratio(self, values: list[float], index: int, window: int) -> float:
-        prior = [value for value in values[max(0, index - max(1, window)):index] if value > 0]
-        current = values[index] if index < len(values) else 0
-        if not prior or current <= 0:
-            return 1.0
-        ordered = sorted(prior)
-        baseline = ordered[len(ordered) // 2]
-        return clamp(current / baseline if baseline else 1.0, 0.2, 8.0)
-
-    def _slope_pct(self, prices: list[float], index: int, lookback: int) -> float:
-        if index <= 0 or not prices:
-            return 0.0
-        previous = prices[max(0, index - max(1, lookback))]
-        current = prices[index]
-        return (current - previous) / previous * 100 if previous else 0.0
-
-    def _context_metrics(self, rows: list[dict], prev_close: float, count: int) -> list[dict[str, float | bool]]:
-        if not rows:
-            return []
-        raw_prices = [float(row.get("price") or prev_close or 0) for row in rows]
-        positive_prices = sorted(price for price in raw_prices if price > 0)
-        reference_price = prev_close if prev_close > 0 else (
-            positive_prices[len(positive_prices) // 2] if positive_prices else 0
-        )
-        source_prices = self._normalize_replay_prices(raw_prices, reference_price)
-        source_amounts = [
-            max(float(row.get("amount") or 0), 0)
-            or max(float(row.get("vol") or row.get("volume") or 0), 0) * price * 100
-            for row, price in zip(rows, source_prices)
-        ]
-        output: list[dict[str, float | bool]] = []
-        low = source_prices[0] if source_prices else prev_close
-        for idx in range(count):
-            source_idx = min(len(source_prices) - 1, round(idx * (len(source_prices) - 1) / max(count - 1, 1)))
-            price = source_prices[source_idx]
-            low = min(low, price)
-            rebound = (price - low) / low * 100 if low else 0
-            ratio = self._rolling_ratio(source_amounts, source_idx, self.replay_volume_window)
-            slope = self._slope_pct(source_prices, source_idx, 3)
-            prior_slope = self._slope_pct(source_prices, source_idx - 3, 3) if source_idx >= 3 else 0.0
-            output.append({
-                "turning": bool(
-                    slope >= 0.01
-                    and (prior_slope <= 0 or rebound >= self.buy_index_rebound_pct)
-                    and rebound >= self.buy_index_rebound_pct * 0.5
-                ),
-                "amount_expanding": ratio >= self.buy_index_volume_ratio_min,
-                "slope_pct": slope,
-                "prior_slope_pct": prior_slope,
-                "ratio": ratio,
-            })
-        return output
 
     def _normalize_replay_prices(
         self,

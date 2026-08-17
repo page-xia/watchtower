@@ -89,7 +89,7 @@ class Subscription:
 
 1. **频道数量有界性**：参数组合理论上很多，但实际由前端固定产生（`useTerminalStream` 只发 board_level/sort/page/page_size/sector）。按 `page_size=40` 档和有限板块数，频道数 << 连接数；再加频道总数上限（如 256，超出回退 per-connection 循环）兜底。
 2. **一致性语义不变**：所有订阅者收到的字节流与现状逐字节等价（同一快照 + 同一串 delta），区别只是计算从 N 份变成 1 份。盘中 1s 的共享载荷 TTL 语义已在上一轮改动中确立，本次不叠加新的延迟。
-3. **连接级个性化**：现状唯一 per-connection 的东西就是 delta tracker 状态，本方案用「共享顺序流 + Resync 兜底」替代；`opening_markers` 等连接级挂载已在 service 层做成共享缓存，不阻塞广播化。
+3. **连接级个性化**：现状唯一 per-connection 的东西就是 delta tracker 状态，本方案用「共享顺序流 + Resync 兜底」替代，不阻塞广播化。
 4. **异常隔离**：发布者循环内捕获构建异常 → 本轮跳过（沿用现有「出错就等下一 tick」语义），不杀死频道；订阅者发送失败只移除自己。
 5. **与现有测试的兼容**：`test_terminal_stream_api.py` 走真实 WS 握手，协议不变应直接通过；新增 hub 单测覆盖共享构建与 Resync。
 

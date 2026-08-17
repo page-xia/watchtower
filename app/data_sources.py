@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import re
 import threading
 import time
@@ -32,6 +33,8 @@ from app.models import (
     TransactionTapePrint,
     WatchlistItem,
 )
+
+logger = logging.getLogger(__name__)
 
 
 SECURITY_NAMES = {
@@ -85,11 +88,12 @@ class BoardContext:
 
 
 def normalize_board_level(value: Any) -> int:
+    """板块口径：1/2/3 = easy_tdx 官方申万行业级别；4/5/6 = 通达信概念(GN)/风格(FG)/地区(DQ)板块。"""
     try:
         level = int(str(value or "").strip())
     except Exception:
         level = 3
-    return level if level in {1, 2, 3} else 3
+    return level if level in {1, 2, 3, 4, 5, 6} else 3
 
 
 class AuctionSnapshotTracker:
@@ -408,6 +412,18 @@ def _row_dict(row: Any) -> dict[str, Any]:
     if hasattr(row, "__dict__"):
         return {key: value for key, value in vars(row).items() if not key.startswith("_")}
     return {}
+
+
+@dataclass
+class RawQuoteLevel:
+    """五档价位行。必须定义在模块级：之前内联在 _quote_levels 里，
+
+    每条报价转换都会重新执行一遍 @dataclass 装饰器（exec 生成方法 +
+    inspect.signature），全市场 5214 只 × 买卖两侧每轮刷新白烧 ~4s CPU。
+    """
+
+    price: float
+    volume: float
 
 
 def _records_from_payload(payload: Any) -> list[dict[str, Any]]:
@@ -1284,8 +1300,18 @@ class EasyTdxMarketDataSource:
             tuple[str, str, int, bool],
             tuple[float, TransactionFlowObservation],
         ] = {}
+        # 全日逐笔磁带缓存：(code, trade_date) -> (cached_at, observation, 升序原始 tick 列表)
+        # 盘中增量对齐补新；历史/收盘后磁带不可变，走长 TTL。
+        self._transaction_tape_cache: dict[
+            tuple[str, str],
+            tuple[float, TransactionFlowObservation, list[dict[str, Any]]],
+        ] = {}
         self._trade_date_lookup_cache: tuple[float, str, set[str]] | None = None
         self._seed_snapshot_cache: tuple[str, int, MarketSnapshot] | None = None
+        # 批次快照缺返回个股（停牌/退市）的负缓存：补拉失败后在冷却期内不再逐只重试，
+        # 避免每轮全市场刷新都为长期停牌股浪费数百次单只请求。复牌股会被批次接口
+        # 自然带回，不经过补拉路径，因此负缓存不会挡住复牌。
+        self._quote_missing_cache: dict[str, float] = {}
 
     def _client(self) -> Any:
         try:
@@ -1624,34 +1650,63 @@ class EasyTdxMarketDataSource:
         skipped_codes: list[str] = []
         workers = min(self.quote_workers, len(chunks))
 
-        def fetch_chunk(start: int, chunk_codes: list[str]) -> tuple[int, list[Any], list[str], Exception | None]:
-            with self._client() as client:
-                rows, failed, failure = self._fetch_quote_chunk_with_recovery(client, chunk_codes)
-                return start, rows, failed, failure
+        # 每个 worker 持有一条长连接、串行处理自己分到的 chunk 组：
+        # 66 个 chunk 各建一次连接（TCP+握手 ~40ms/条）是纯浪费；长连接把整轮
+        # 全市场快照从 ~4.4s 压到亚秒级，也让详情页请求不再和连接风暴抢资源。
+        groups: list[list[tuple[int, list[str]]]] = [chunks[i::workers] for i in range(workers)]
+
+        def open_client() -> tuple[Any, Any]:
+            cm = self._client()
+            return cm, cm.__enter__()
+
+        def close_client(cm: Any) -> None:
+            try:
+                cm.__exit__(None, None, None)
+            except Exception:
+                pass
+
+        def fetch_group(
+            group: list[tuple[int, list[str]]],
+        ) -> list[tuple[int, list[Any], list[str], Exception | None]]:
+            results: list[tuple[int, list[Any], list[str], Exception | None]] = []
+            cm, client = open_client()
+            try:
+                for start, chunk_codes in group:
+                    rows, failed, failure = self._fetch_quote_chunk_with_recovery(client, chunk_codes)
+                    if failure is not None and not rows:
+                        # 连接级故障会在长连接上级联：整组失败前重建一次连接重试本 chunk
+                        close_client(cm)
+                        try:
+                            cm, client = open_client()
+                            rows, failed, failure = self._fetch_quote_chunk_with_recovery(client, chunk_codes)
+                        except Exception as reconnect_exc:
+                            rows, failed, failure = [], chunk_codes, reconnect_exc
+                    results.append((start, rows, failed, failure))
+            finally:
+                close_client(cm)
+            return results
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(fetch_chunk, start, chunk_codes): (start, chunk_codes)
-                for start, chunk_codes in chunks
-            }
+            futures = [executor.submit(fetch_group, group) for group in groups if group]
+            codes_by_start = {start: chunk_codes for start, chunk_codes in chunks}
             for future in as_completed(futures):
-                start, chunk_codes = futures[future]
                 try:
-                    result_start, rows, failed, failure = future.result()
+                    group_results = future.result()
                 except Exception as exc:  # pragma: no cover - provider dependent
-                    result_start, rows, failed, failure = start, [], chunk_codes, exc
-                raw_by_start[result_start] = rows
-                if failure is not None:
-                    skipped_codes.extend(failed)
-                    failed_chunks.append(
-                        self._quote_chunk_failure_meta(
-                            result_start,
-                            chunk_codes,
-                            recovered=len(rows),
-                            failed=failed,
-                            exc=failure,
+                    group_results = [(start, [], chunk_codes, exc) for start, chunk_codes in chunks]
+                for result_start, rows, failed, failure in group_results:
+                    raw_by_start[result_start] = rows
+                    if failure is not None:
+                        skipped_codes.extend(failed)
+                        failed_chunks.append(
+                            self._quote_chunk_failure_meta(
+                                result_start,
+                                codes_by_start.get(result_start, []),
+                                recovered=len(rows),
+                                failed=failed,
+                                exc=failure,
+                            )
                         )
-                    )
 
         raw_quotes: list[Any] = []
         for start, _chunk_codes in chunks:
@@ -1670,7 +1725,14 @@ class EasyTdxMarketDataSource:
             rows = _records_from_payload(result)
             if not rows:
                 if len(chunk_codes) > 1:
-                    recovered, failed = self._fetch_quotes_individually(api, chunk_codes)
+                    retryable = self._missing_codes_pending_retry(chunk_codes)
+                    recovered, failed = (
+                        self._fetch_quotes_individually(api, retryable) if retryable else ([], [])
+                    )
+                    cooled = [code for code in chunk_codes if code not in retryable]
+                    # 只把本轮真正补拉失败的计入负缓存；冷却中的不续期，到期还会再试
+                    self._mark_missing_codes(failed)
+                    failed = failed + cooled
                     return recovered, failed, DataSourceError("quote批次返回0条，已尝试逐只补拉")
                 return rows, [], None
             returned_codes = {
@@ -1680,16 +1742,30 @@ class EasyTdxMarketDataSource:
             }
             missing_codes = [code for code in chunk_codes if code not in returned_codes]
             if missing_codes:
-                recovered, failed = self._fetch_quotes_individually(api, missing_codes)
+                retryable = self._missing_codes_pending_retry(missing_codes)
+                recovered, failed = (
+                    self._fetch_quotes_individually(api, retryable) if retryable else ([], [])
+                )
+                cooled = [code for code in missing_codes if code not in retryable]
                 rows.extend(recovered)
+                # 只把本轮真正补拉失败的计入负缓存；冷却中的不续期，到期还会再试
+                self._mark_missing_codes(failed)
+                failed = failed + cooled
                 return rows, failed, DataSourceError(
                     f"quote批次少返回{len(missing_codes)}只，已尝试逐只补拉"
                 )
             return rows, [], None
         except Exception as exc:
             if self._quote_chunk_error_can_retry_individually(exc):
-                recovered, failed = self._fetch_quotes_individually(api, chunk_codes)
+                retryable = self._missing_codes_pending_retry(chunk_codes)
+                recovered, failed = (
+                    self._fetch_quotes_individually(api, retryable) if retryable else ([], [])
+                )
+                cooled = [code for code in chunk_codes if code not in retryable]
+                self._mark_missing_codes(failed)
+                failed = failed + cooled
             else:
+                # 连接级故障不算个股缺失证据，不进负缓存（下轮批次自然会再试）
                 recovered, failed = [], chunk_codes
             return recovered, failed, exc
 
@@ -1723,9 +1799,30 @@ class EasyTdxMarketDataSource:
                 continue
             if rows:
                 recovered.extend(rows)
+                self._quote_missing_cache.pop(code, None)
             else:
                 failed.append(code)
         return recovered, failed
+
+    def _missing_codes_pending_retry(self, codes: list[str]) -> list[str]:
+        """过滤掉补拉冷却期内的停牌/退市股，返回值得逐只重试的代码。"""
+        now_ts = time.time()
+        ttl = max(60, int(getattr(self.settings, "quote_missing_cache_seconds", 1800)))
+        return [
+            code
+            for code in codes
+            if now_ts - self._quote_missing_cache.get(code, 0.0) >= ttl
+        ]
+
+    def _mark_missing_codes(self, codes: list[str]) -> None:
+        now_ts = time.time()
+        for code in codes:
+            self._quote_missing_cache[code] = now_ts
+        if len(self._quote_missing_cache) > 4096:
+            cutoff = now_ts - 7200
+            self._quote_missing_cache = {
+                code: ts for code, ts in self._quote_missing_cache.items() if ts >= cutoff
+            }
 
     @staticmethod
     def _quote_chunk_error_can_retry_individually(exc: Exception) -> bool:
@@ -2192,23 +2289,31 @@ class EasyTdxMarketDataSource:
                 note="交易日格式无效，未请求逐笔成交数据",
             )
         rows_count = max(80, min(int(count or self.settings.transaction_rows), 2000))
-        cache_key = (normalized_code, normalized_date, rows_count, bool(full_session))
         now_ts = time.time()
+        current_date = china_now().strftime("%Y%m%d")
+        intraday_request = bool(
+            normalized_date == current_date
+            and is_trading_window()
+            and self._is_known_trade_date(normalized_date)
+        )
+        if full_session:
+            return self._fetch_full_session_tape(
+                normalized_code,
+                normalized_date,
+                intraday_request,
+                now_ts,
+            )
+
+        cache_key = (normalized_code, normalized_date, rows_count, False)
         cached = self._transaction_cache.get(cache_key)
         if cached and now_ts - cached[0] < max(1, self.settings.transaction_cache_seconds):
             return cached[1]
 
         try:
-            current_date = china_now().strftime("%Y%m%d")
-            intraday_request = bool(
-                normalized_date == current_date
-                and is_trading_window()
-                and self._is_known_trade_date(normalized_date)
-            )
-            page_size = 1800 if full_session else min(1800, max(rows_count, 600))
+            page_size = min(1800, max(rows_count, 600))
             ticks: list[dict[str, Any]] = []
             with self._history_client() as client:
-                for page_index in range(8 if full_session else 5):
+                for page_index in range(5):
                     start = page_index * page_size
                     raw = self._transaction_page(
                         client,
@@ -2224,19 +2329,19 @@ class EasyTdxMarketDataSource:
                         is_regular_transaction_time(self._transaction_row_from_tick(tick).get("time"))
                         for tick in ticks
                     )
-                    if (not full_session and regular_count >= rows_count) or len(batch) < page_size:
+                    if regular_count >= rows_count or len(batch) < page_size:
                         break
             rows = [self._transaction_row_from_tick(tick) for tick in ticks]
             rows = [row for row in rows if is_regular_transaction_time(row.get("time"))]
             rows.sort(key=lambda row: str(row.get("time") or ""))
-            rows = rows if full_session else rows[-rows_count:]
+            rows = rows[-rows_count:]
             source = "easy_tdx_transaction_data" if intraday_request else "easy_tdx_history_transaction_data"
             observation = self._transaction_flow_from_rows(
                 normalized_code,
                 normalized_date,
                 rows,
                 source,
-                full_session=full_session,
+                full_session=False,
             )
         except Exception as exc:  # pragma: no cover - network/server dependent
             observation = TransactionFlowObservation(
@@ -2250,6 +2355,188 @@ class EasyTdxMarketDataSource:
             oldest = min(self._transaction_cache, key=lambda key: self._transaction_cache[key][0])
             self._transaction_cache.pop(oldest, None)
         return observation
+
+    def _fetch_full_session_tape(
+        self,
+        code: str,
+        trade_date: str,
+        intraday_request: bool,
+        now_ts: float,
+    ) -> TransactionFlowObservation:
+        """全日逐笔磁带：历史/收盘后长 TTL 复用；盘中增量对齐补新。
+
+        easy_tdx 逐笔分页 start=0 返回最新一段（页内时间升序、页面向过去回溯），
+        盘中新成交追加在磁带尾部。因此盘中刷新只需拉最新一页与缓存磁带做后缀
+        对齐、补增量 tick，避免详情页 10s 轮询每次整段重拉最多 8 页（~1.4 万笔）。
+        对齐失败（新增超过一页 / 服务端改写历史）自动回退整段重拉。
+        """
+        cache_key = (code, trade_date)
+        static_ttl = max(60, int(getattr(self.settings, "transaction_tape_static_cache_seconds", 1800)))
+        live_ttl = max(1, int(self.settings.transaction_cache_seconds))
+        max_ticks = max(1800, int(getattr(self.settings, "transaction_tape_max_ticks", 8 * 1800)))
+        cached = self._transaction_tape_cache.get(cache_key)
+        if cached:
+            cached_at, cached_observation, cached_ticks = cached
+            age = now_ts - cached_at
+            # 非盘中请求的磁带不可变（历史日 / 收盘后），长 TTL 直接复用
+            if not intraday_request and age < static_ttl:
+                return cached_observation
+            if intraday_request:
+                if age < live_ttl:
+                    return cached_observation
+                if cached_ticks:
+                    incremental = self._incremental_tape(
+                        code,
+                        trade_date,
+                        cached_ticks,
+                        max_ticks,
+                    )
+                    if incremental is not None:
+                        merged_ticks, observation = incremental
+                        if observation is None:
+                            # 无新增成交：只刷新缓存时间
+                            observation = cached_observation
+                        self._transaction_tape_cache[cache_key] = (now_ts, observation, merged_ticks)
+                        return observation
+                    # 对齐失败：回退下面的整段重拉
+
+        ticks: list[dict[str, Any]] = []
+        try:
+            page_size = 1800
+            pages: list[list[dict[str, Any]]] = []
+            with self._history_client() as client:
+                for page_index in range(8):
+                    start = page_index * page_size
+                    raw = self._transaction_page(
+                        client,
+                        code,
+                        trade_date,
+                        intraday=intraday_request,
+                        start=start,
+                        count=page_size,
+                    )
+                    batch = _records_from_payload(raw)
+                    pages.append(batch)
+                    if len(batch) < page_size:
+                        break
+            # 页 0 是最新一段、页内升序；反序拼接成时间升序的完整磁带
+            ticks = [tick for page in reversed(pages) for tick in page]
+            observation = self._tape_observation_from_ticks(
+                code,
+                trade_date,
+                ticks,
+                intraday_request,
+                full_session=True,
+            )
+        except Exception as exc:  # pragma: no cover - network/server dependent
+            if cached:
+                # 网络抖动时宁可返回略旧的磁带，也不让详情页逐笔面板掉线
+                return cached[1]
+            observation = TransactionFlowObservation(
+                source="easy_tdx_transaction_data",
+                trade_date=trade_date,
+                note=f"行情服务器未返回逐笔成交：{exc}",
+            )
+
+        self._transaction_tape_cache[cache_key] = (now_ts, observation, ticks)
+        if len(self._transaction_tape_cache) > 8:
+            oldest = min(self._transaction_tape_cache, key=lambda key: self._transaction_tape_cache[key][0])
+            self._transaction_tape_cache.pop(oldest, None)
+        return observation
+
+    def _incremental_tape(
+        self,
+        code: str,
+        trade_date: str,
+        cached_ticks: list[dict[str, Any]],
+        max_ticks: int,
+    ) -> tuple[list[dict[str, Any]], TransactionFlowObservation | None] | None:
+        """盘中增量补新：拉最新一页，与缓存磁带做后缀对齐。
+
+        返回 (合并后的升序磁带, observation)；observation 为 None 表示无新增
+        成交（调用方复用旧 observation）；对齐失败或网络异常返回 None。
+        """
+        try:
+            with self._history_client() as client:
+                raw = self._transaction_page(
+                    client,
+                    code,
+                    trade_date,
+                    intraday=True,
+                    start=0,
+                    count=1800,
+                )
+            page = _records_from_payload(raw)
+        except Exception:
+            return None
+        if not page:
+            return None
+        page_keys = [self._tape_tick_key(tick) for tick in page]
+        cached_keys = [self._tape_tick_key(tick) for tick in cached_ticks]
+        anchor = cached_keys[-1]
+        k = len(cached_keys)
+        overlap = -1
+        # 从页尾向前找缓存磁带最后一笔的位置：命中越靠后，新增越少
+        attempts = 0
+        for i in range(len(page) - 1, -1, -1):
+            if page_keys[i] != anchor:
+                continue
+            j = i + 1
+            if j > k:
+                continue
+            attempts += 1
+            if attempts > 16:
+                break
+            if page_keys[:j] == cached_keys[k - j:]:
+                overlap = j
+                break
+        if overlap < 0:
+            return None
+        new_ticks = page[overlap:]
+        if not new_ticks:
+            return cached_ticks, None
+        merged = cached_ticks + new_ticks
+        if len(merged) > max_ticks:
+            merged = merged[-max_ticks:]
+        observation = self._tape_observation_from_ticks(
+            code,
+            trade_date,
+            merged,
+            intraday_request=True,
+            full_session=True,
+        )
+        return merged, observation
+
+    @staticmethod
+    def _tape_tick_key(tick: dict[str, Any]) -> tuple[str, str, str, str]:
+        """NaN 安全的 tick 对齐键（原始字典可能带 NaN 的 unknown_last，不能直接比字典）。"""
+        return (
+            str(tick.get("datetime") or tick.get("time") or ""),
+            str(tick.get("price") or ""),
+            str(tick.get("vol") or tick.get("volume") or ""),
+            str(tick.get("buyorsell") or ""),
+        )
+
+    def _tape_observation_from_ticks(
+        self,
+        code: str,
+        trade_date: str,
+        ticks: list[dict[str, Any]],
+        intraday_request: bool,
+        *,
+        full_session: bool,
+    ) -> TransactionFlowObservation:
+        rows = [self._transaction_row_from_tick(tick) for tick in ticks]
+        rows = [row for row in rows if is_regular_transaction_time(row.get("time"))]
+        rows.sort(key=lambda row: str(row.get("time") or ""))
+        source = "easy_tdx_transaction_data" if intraday_request else "easy_tdx_history_transaction_data"
+        return self._transaction_flow_from_rows(
+            code,
+            trade_date,
+            rows,
+            source,
+            full_session=full_session,
+        )
 
     def _is_known_trade_date(self, trade_date: str) -> bool:
         today = china_now().strftime("%Y%m%d")
@@ -2807,11 +3094,6 @@ class EasyTdxMarketDataSource:
         output: list[Any] = []
         volume_prefix = "bid" if side == "bid" else "ask"
 
-        @dataclass
-        class RawLevel:
-            price: float
-            volume: float
-
         for level in range(1, 6):
             price = self._raw_number(raw, f"{side}{level}")
             volume = self._first_raw_number(
@@ -2822,7 +3104,7 @@ class EasyTdxMarketDataSource:
                 f"{volume_prefix}_volume{level}",
             )
             if volume > 0:
-                output.append(RawLevel(price=price, volume=volume))
+                output.append(RawQuoteLevel(price=price, volume=volume))
         return output
 
     def _fetch_indices(self, api: Any, seed_indices: list[IndexSnapshot]) -> list[IndexSnapshot]:
@@ -3550,8 +3832,10 @@ class EasyTdxDetailDataSource:
     CHANLUN_SOURCE = "easy_tdx_chanlun"
     INDICATORS = ["MACD", "KDJ", "RSI", "BOLL", "OBV", "ATR"]
 
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(self, settings: AppSettings, store: Any | None = None, moneyflow_provider: Any | None = None) -> None:
         self.settings = settings
+        self._store = store
+        self._moneyflow_provider = moneyflow_provider
         self._cache: dict[tuple[str, str], tuple[float, DetailDataPayload]] = {}
         self._daily_kline_cache: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
 
@@ -3575,7 +3859,7 @@ class EasyTdxDetailDataSource:
         normalized_code = str(code or "").strip().zfill(6)
         if len(normalized_code) != 6 or not normalized_code.isdigit():
             return []
-        row_count = max(120, min(int(count or 180), 400))
+        row_count = max(120, min(int(count or 180), 800))
         now_ts = time.time()
         ttl = max(0, int(self.settings.fundamentals_cache_seconds))
         key = (normalized_code, row_count)
@@ -3592,6 +3876,52 @@ class EasyTdxDetailDataSource:
             self._daily_kline_cache.pop(oldest, None)
         return [dict(row) for row in rows]
 
+    def fetch_index_daily_close_map(self, code: str, count: int = 420) -> dict[str, float]:
+        """指数日K收盘（date→close），给日线公式的 INDEXC 用。带进程内缓存。"""
+        normalized_code = str(code or "").strip().zfill(6)
+        if normalized_code not in INDEX_MARKET_IDS:
+            return {}
+        row_count = max(120, min(int(count or 420), 800))
+        now_ts = time.time()
+        ttl = max(0, int(self.settings.fundamentals_cache_seconds))
+        key = (f"index:{normalized_code}", row_count)
+        cached = self._daily_kline_cache.get(key)
+        if ttl and cached and now_ts - cached[0] <= ttl:
+            return dict(cached[1])  # type: ignore[arg-type]
+        result: dict[str, float] = {}
+        try:
+            from easy_tdx import KlineCategory, Market, TdxClient
+
+            with TdxClient(timeout=max(1.0, float(self.settings.easy_tdx_f10_timeout_seconds))) as client:
+                raw_rows = _records_from_payload(
+                    client.get_index_bars(
+                        Market(market_id_for_index_code(normalized_code)),
+                        normalized_code,
+                        KlineCategory.DAY,
+                        0,
+                        row_count,
+                    )
+                )
+            for raw in raw_rows:
+                date = self._date_from_detail_row(raw)
+                close = self._float(raw.get("close"))
+                if date and close > 0:
+                    result[date] = close
+        except Exception:
+            result = {}
+        self._daily_kline_cache[key] = (now_ts, dict(result))  # type: ignore[assignment]
+        return dict(result)
+
+    def fetch_belong_board_rows(self, code: str) -> list[dict[str, Any]]:
+        """个股所属板块（行业/概念/风格/地域，TDX 官方板块族谱）。"""
+        normalized_code = str(code or "").strip().zfill(6)
+        if len(normalized_code) != 6 or not normalized_code.isdigit():
+            return []
+        with self._mac_client() as client:
+            return _records_from_payload(
+                client.get_belong_board(_market_id_for_tdx_code(normalized_code), normalized_code)
+            )
+
     def _cached(self, kind: str, code: str, loader: Any) -> DetailDataPayload:
         normalized_code = str(code or "").strip().zfill(6)
         if len(normalized_code) != 6 or not normalized_code.isdigit():
@@ -3606,6 +3936,19 @@ class EasyTdxDetailDataSource:
         cached = self._cache.get(key)
         if ttl and cached and now_ts - cached[0] <= ttl:
             return cached[1].model_copy(deep=True)
+        # 持久层：资金流/技术指标/缠论均为日频数据，18h 内直接复用，
+        # 重启/发版后详情页秒开；过期或缺失才走实时拉取。
+        store_key = f"{kind}:{normalized_code}"
+        persist_ttl = max(0, int(getattr(self.settings, "f10_cache_seconds", 64800)))
+        if self._store is not None and persist_ttl:
+            doc = self._store.load(store_key)
+            if doc is not None and now_ts - float(doc["fetched_ts"]) <= persist_ttl:
+                try:
+                    payload = DetailDataPayload.model_validate(doc["payload"])
+                    self._cache[key] = (now_ts, payload)
+                    return payload.model_copy(deep=True)
+                except Exception as exc:
+                    logger.warning("detail extras cache invalid: %s error=%r", store_key, exc)
         try:
             payload = loader(normalized_code)
         except Exception as exc:  # pragma: no cover - network/server dependent
@@ -3615,10 +3958,54 @@ class EasyTdxDetailDataSource:
                 note=f"easy_tdx详情扩展数据不可用：{jsonable_market_value(exc)}",
             )
         self._cache[key] = (now_ts, payload)
+        if payload.available and self._store is not None:
+            self._store.save(store_key, payload.model_dump(mode="json"), now_ts)
         if len(self._cache) > 256:
             oldest = min(self._cache, key=lambda item: self._cache[item][0])
             self._cache.pop(oldest, None)
         return payload.model_copy(deep=True)
+
+    def refresh_stale(self, codes: list[str], max_age_seconds: int, limit: int = 30) -> dict[str, Any]:
+        """盘前增量预热：对候选股票刷新缓存缺失/过期的三类扩展数据。"""
+        now_ts = time.time()
+        unique: list[str] = []
+        seen: set[str] = set()
+        for raw in codes:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            code = text.zfill(6)
+            if len(code) == 6 and code.isdigit() and code not in seen:
+                seen.add(code)
+                unique.append(code)
+            if len(unique) >= limit:
+                break
+        kinds: tuple[str, ...] = ("capital_flow", "technical_indicators", "chanlun")
+        stats: dict[str, Any] = {"candidates": len(unique), "refreshed": 0, "skipped_fresh": 0, "failed": 0}
+        for code in unique:
+            for kind in kinds:
+                store_key = f"{kind}:{code}"
+                age = self._store.age_seconds(store_key, now_ts) if self._store is not None else None
+                if age is not None and age <= max_age_seconds:
+                    stats["skipped_fresh"] += 1
+                    continue
+                loader = {
+                    "capital_flow": self._fetch_capital_flow,
+                    "technical_indicators": self._fetch_technical_indicators,
+                    "chanlun": self._fetch_chanlun,
+                }[kind]
+                try:
+                    payload = loader(code)
+                except Exception as exc:  # pragma: no cover - 网络/服务端相关
+                    logger.warning("detail extras preopen refresh failed: %s error=%r", store_key, exc)
+                    stats["failed"] += 1
+                    continue
+                self._cache[(kind, code)] = (now_ts, payload)
+                if payload.available and self._store is not None:
+                    self._store.save(store_key, payload.model_dump(mode="json"), now_ts)
+                stats["refreshed"] += 1
+                time.sleep(0.2)
+        return stats
 
     def _fetch_capital_flow(self, code: str) -> DetailDataPayload:
         with self._mac_client() as client:
@@ -3627,21 +4014,40 @@ class EasyTdxDetailDataSource:
                 max_rows=80,
             )
         latest = rows[-1] if rows else {}
-        tables = [self._table("资金流历史", rows, row_count=len(rows))] if rows else []
+        tables = [self._table("资金流·最新一期（easy_tdx）", rows, row_count=len(rows))] if rows else []
+        summary: dict[str, Any] = {
+            "latest_date": latest.get("date"),
+            "main_net": latest.get("main_net"),
+            "large_net": latest.get("large_net"),
+            "mid_net": latest.get("mid_net"),
+            "small_net": latest.get("small_net"),
+        }
+        # easy_tdx 资金流只有最新一期单点；历史日级序列由 tushare moneyflow 补充。
+        if self._moneyflow_provider is not None:
+            try:
+                history = self._moneyflow_provider(code, 40)
+            except Exception as exc:  # pragma: no cover - 网络/限流相关
+                logger.warning("moneyflow provider failed: %s error=%r", code, exc)
+                history = []
+            if history:
+                tables.append(
+                    self._table("历史资金流·近40日（tushare）", history[-40:], row_count=len(history))
+                )
+                recent5 = history[-5:]
+                recent10 = history[-10:]
+                summary["main_net_5d"] = sum(float(r.get("main_net") or 0) for r in recent5)
+                summary["main_net_10d"] = sum(float(r.get("main_net") or 0) for r in recent10)
+                inflow_days = sum(1 for r in recent10 if float(r.get("main_net") or 0) > 0)
+                summary["inflow_days_10d"] = inflow_days
+                summary["history_latest_date"] = history[-1].get("date")
         return DetailDataPayload(
-            available=bool(rows),
+            available=bool(rows or tables),
             source=self.CAPITAL_FLOW_SOURCE,
             code=code,
             fetched_at=china_now().isoformat(timespec="seconds"),
-            summary={
-                "latest_date": latest.get("date"),
-                "main_net": latest.get("main_net"),
-                "large_net": latest.get("large_net"),
-                "mid_net": latest.get("mid_net"),
-                "small_net": latest.get("small_net"),
-            },
+            summary=summary,
             tables=tables,
-            note="easy_tdx MacClient.get_capital_flow 原始资金流字段；仅按个股详情页按需读取。",
+            note="最新一期资金流来自 easy_tdx；历史日级序列来自 tushare moneyflow（主力=特大单+大单）。仅按个股详情页按需读取。",
         )
 
     def _fetch_technical_indicators(self, code: str) -> DetailDataPayload:
@@ -4164,10 +4570,17 @@ class EasyTdxBoardDataSource:
             )
         )
 
+    # board_level 4/5/6 → 通达信概念(GN)/风格(FG)/地区(DQ)板块类型
+    _TDX_BOARD_TYPES = {4: "GN", 5: "FG", 6: "DQ"}
+    _TAXONOMY_LABELS = {4: "通达信概念板块", 5: "通达信风格板块", 6: "通达信地区板块"}
+
     def _fetch_context(self, level: int) -> BoardContext:
         from easy_tdx import BoardType
 
-        board_type = getattr(BoardType, f"YJ_LEVEL{level}")
+        # level 4/5/6 = 通达信概念/风格/地区板块：与申万行业并列的独立查看口径，
+        # 不混入申万聚合；一只票可同时属于多个概念/风格，成员列表各自独立聚合。
+        tdx_type = self._TDX_BOARD_TYPES.get(level)
+        board_type = getattr(BoardType, tdx_type) if tdx_type else getattr(BoardType, f"YJ_LEVEL{level}")
         with self._mac_client() as client:
             list_rows = dataframe_records(client.get_board_list(board_type, count=10000))
             try:
@@ -4202,7 +4615,7 @@ class EasyTdxBoardDataSource:
             if (sector := self._sector_from_board_row(by_code[code], level)) is not None
         ]
         if not sectors:
-            raise DataSourceError(f"easy_tdx未返回{level}级官方板块。")
+            raise DataSourceError(f"easy_tdx未返回{self._TAXONOMY_LABELS.get(level, f'{level}级官方板块')}。")
         sectors.sort(
             key=lambda sector: (
                 sector.heat_score,
@@ -4246,8 +4659,9 @@ class EasyTdxBoardDataSource:
         main_net_yi = main_net_amount / 100_000_000 if main_net_amount else 0
         flow_delta = main_net_yi if main_net_amount else (amount / 100_000_000) * (1 if change_pct > 0 else -1 if change_pct < 0 else 0)
         heat_score = self._heat_score(change_pct, up_count, down_count, total_count, amount, main_net_amount)
+        taxonomy_label = self._TAXONOMY_LABELS.get(level, f"官方{level}级板块")
         reasons = [
-            f"官方{level}级板块涨幅{change_pct:+.2f}%",
+            f"{taxonomy_label}涨幅{change_pct:+.2f}%",
             f"{up_count}/{total_count or up_count + down_count}上涨",
         ]
         if main_net_amount:
@@ -4332,7 +4746,21 @@ class MarketDataRouter:
         self.live = EasyTdxMarketDataSource(settings, self.close_source)
         self.minute_replay = EasyTdxMinuteReplaySource(settings)
         self.f10 = EasyTdxF10DataSource(settings)
-        self.detail_data = EasyTdxDetailDataSource(settings)
+        from .f10_store import F10CacheStore
+        from .f10_tushare import TushareF10DataSource
+
+        self.f10_store = F10CacheStore(settings.data_dir / "f10_cache", state_store=state_store)
+        self.f10_full = TushareF10DataSource(settings, easy_tdx_f10=self.f10, store=self.f10_store)
+        self.detail_extras_store = F10CacheStore(
+            settings.data_dir / "detail_extras_cache",
+            state_store=state_store,
+            namespace="detail_extras",
+        )
+        self.detail_data = EasyTdxDetailDataSource(
+            settings,
+            store=self.detail_extras_store,
+            moneyflow_provider=self.f10_full.fetch_moneyflow_daily,
+        )
         self.boards = EasyTdxBoardDataSource(settings, state_store=state_store)
         self._live_cache: MarketSnapshot | None = None
         self._live_cache_at: float = 0.0
@@ -4528,6 +4956,25 @@ class MarketDataRouter:
     def fetch_fundamentals(self, code: str) -> FundamentalPayload:
         return self.f10.fetch(code)
 
+    def fetch_f10_full(self, code: str, force: bool = False) -> Any:
+        """聚合 F10（tushare_pro 为主 + easy_tdx 股本结构补充），按需调用。
+
+        三层缓存：内存(1h) → 持久缓存(18h) → 实时拉取；force=True 强制实时拉。
+        """
+        return self.f10_full.fetch(code, force=force)
+
+    def refresh_f10_stale(self, codes: list[str], max_age_seconds: int, limit: int = 80) -> dict[str, Any]:
+        """盘前 F10 增量预热：只刷新缓存缺失/过期的候选股票。"""
+        return self.f10_full.refresh_stale(codes, max_age_seconds=max_age_seconds, limit=limit)
+
+    def f10_cache_index(self) -> dict[str, float]:
+        store = getattr(self, "f10_store", None)
+        return store.list_index() if store is not None else {}
+
+    def refresh_detail_extras_stale(self, codes: list[str], max_age_seconds: int, limit: int = 30) -> dict[str, Any]:
+        """盘前预热：资金流/技术指标/缠论三类日频扩展数据的增量刷新。"""
+        return self.detail_data.refresh_stale(codes, max_age_seconds=max_age_seconds, limit=limit)
+
     def fetch_capital_flow(self, code: str) -> DetailDataPayload:
         return self.detail_data.fetch_capital_flow(code)
 
@@ -4539,6 +4986,12 @@ class MarketDataRouter:
 
     def fetch_daily_kline_rows(self, code: str, count: int = 180) -> list[dict[str, Any]]:
         return self.detail_data.fetch_daily_kline_rows(code, count=count)
+
+    def fetch_index_daily_close_map(self, code: str, count: int = 420) -> dict[str, float]:
+        return self.detail_data.fetch_index_daily_close_map(code, count=count)
+
+    def fetch_belong_board_rows(self, code: str) -> list[dict[str, Any]]:
+        return self.detail_data.fetch_belong_board_rows(code)
 
     def fetch_board_context(self, board_level: Any = 3) -> BoardContext:
         return self.boards.fetch_context(board_level)
@@ -4564,6 +5017,8 @@ class MarketDataRouter:
                 "daily_trend_kline": True,
                 "daily_trend_kline_protocol": "MacClient.get_stock_kline(Period.DAILY, Adjust.QFQ)",
                 "official_board_levels": [1, 2, 3],
+                "tdx_board_levels": {4: "概念(GN)", 5: "风格(FG)", 6: "地区(DQ)"},
+                "tdx_board_note": "board_level=4/5/6 为通达信概念/风格/地区板块，与申万行业并列的独立查看口径，不混入申万聚合。",
                 "official_board_protocol": "MacClient.get_board_list/get_board_ranking/get_board_members",
                 "official_board_source": EasyTdxBoardDataSource.SOURCE,
             }

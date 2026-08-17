@@ -17,6 +17,7 @@ POSITION_FILE = DATA_DIR / "positions.json"
 INTRADAY_WATCHTOWER_DB_FILE = DATA_DIR / "runtime" / "intraday_watchtower.sqlite"
 AUCTION_HISTORY_FILE = DATA_DIR / "runtime" / "auction_snapshots.jsonl"
 OPENING_DECISION_FILE = DATA_DIR / "runtime" / "opening_decisions.jsonl"
+WEBHOOK_SUBSCRIPTIONS_FILE = DATA_DIR / "webhook_subscriptions.json"
 
 
 def load_yaml(path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -38,6 +39,12 @@ class AppSettings:
         self.themes_file = Path(os.getenv("THEMES_FILE", str(THEMES_FILE)))
         self.rules_file = Path(os.getenv("TRADING_RULES_FILE", str(RULES_FILE)))
         self.position_file = Path(os.getenv("WATCH_POSITION_FILE", str(POSITION_FILE)))
+        # 飞书 webhook 信号推送：订阅持久化文件 + 同票推送去重窗口 + 投递超时
+        self.webhook_subscriptions_file = Path(
+            os.getenv("WATCH_WEBHOOK_SUBSCRIPTIONS_FILE", str(WEBHOOK_SUBSCRIPTIONS_FILE))
+        )
+        self.push_signal_dedup_seconds = max(30, int(os.getenv("WATCH_PUSH_SIGNAL_DEDUP_SECONDS", "300")))
+        self.push_http_timeout_seconds = max(1.0, float(os.getenv("WATCH_PUSH_HTTP_TIMEOUT_SECONDS", "6.0")))
         self.persistence_backend = os.getenv("WATCH_PERSISTENCE_BACKEND", "local").strip().lower() or "local"
         self.cloudbase_env_id = os.getenv("WATCH_CLOUDBASE_ENV_ID", "").strip()
         self.cloudbase_api_token = os.getenv("WATCH_CLOUDBASE_API_TOKEN", "").strip()
@@ -55,7 +62,9 @@ class AppSettings:
         self.cloudbase_database_instance = os.getenv("WATCH_CLOUDBASE_DATABASE_INSTANCE", "(default)").strip() or "(default)"
         self.cloudbase_database_name = os.getenv("WATCH_CLOUDBASE_DATABASE_NAME", "(default)").strip() or "(default)"
         self.cloudbase_api_base_url = os.getenv("WATCH_CLOUDBASE_API_BASE_URL", "").strip()
-        self.cloudbase_api_timeout_seconds = max(0.5, float(os.getenv("WATCH_CLOUDBASE_API_TIMEOUT_SECONDS", "3.0")))
+        # CloudBase REST 网关偶发慢请求（消息表全表 count 经常 >3s），
+        # 3s 超时会把状态接口拖成全 0、把批量写入拖成 500，默认放宽到 15s。
+        self.cloudbase_api_timeout_seconds = max(0.5, float(os.getenv("WATCH_CLOUDBASE_API_TIMEOUT_SECONDS", "15.0")))
         # 星球消息证据/状态读缓存：消息按批次推送入库，读侧不需要秒级新鲜度，
         # 默认 60s，避免每次打开详情都对 CloudBase MySQL REST 做全量查询风暴。
         self.message_store_cache_seconds = max(0.0, float(os.getenv("WATCH_MESSAGE_STORE_CACHE_SECONDS", "60")))
@@ -139,25 +148,29 @@ class AppSettings:
             "yes",
         }
         self.easy_tdx_timeout_seconds = float(os.getenv("WATCH_EASY_TDX_TIMEOUT_SECONDS", "1.2"))
-        self.easy_tdx_quote_workers = max(1, int(os.getenv("WATCH_EASY_TDX_QUOTE_WORKERS", "8")))
+        self.easy_tdx_quote_workers = max(1, int(os.getenv("WATCH_EASY_TDX_QUOTE_WORKERS", "12")))
+        # 批次快照缺返回个股（停牌/退市）的补拉负缓存冷却期
+        self.quote_missing_cache_seconds = int(os.getenv("WATCH_QUOTE_MISSING_CACHE_SECONDS", "1800"))
         self.easy_tdx_f10_timeout_seconds = float(os.getenv("WATCH_EASY_TDX_F10_TIMEOUT_SECONDS", "4.0"))
         self.fundamentals_cache_seconds = int(os.getenv("WATCH_FUNDAMENTALS_CACHE_SECONDS", "3600"))
-        self.transaction_cache_seconds = int(os.getenv("WATCH_TRANSACTION_CACHE_SECONDS", "5"))
-        self.transaction_rows = int(os.getenv("WATCH_TRANSACTION_ROWS", "240"))
-        # 开盘窗口菱形引擎：~40 只有界观察池，盘中 09:30-10:00 每 6s 一轮，
-        # 分笔 tape 只读池内票（非全市场轮询），10:00 后自动停转。
-        self.opening_window_engine_enabled = os.getenv("WATCH_OPENING_WINDOW_ENGINE", "1").lower() in {
+        # F10 聚合数据（tushare 财务/股东/分红等）属低频变化数据：持久缓存 18h 内直接复用，
+        # 盘前 08:40 起对候选池（自选+持仓+近期查看）做一轮增量预热，只刷超过 12h 的缓存。
+        self.f10_cache_seconds = int(os.getenv("WATCH_F10_CACHE_SECONDS", "64800"))
+        self.f10_preopen_refresh = os.getenv("WATCH_F10_PREOPEN_REFRESH", "1").lower() in {
             "1",
             "true",
             "yes",
         }
-        self.opening_window_tick_seconds = max(3, int(os.getenv("WATCH_OPENING_WINDOW_TICK_SECONDS", "6")))
-        self.opening_window_tape_count = max(400, int(os.getenv("WATCH_OPENING_WINDOW_TAPE_COUNT", "1200")))
-        self.opening_window_tape_workers = max(2, int(os.getenv("WATCH_OPENING_WINDOW_TAPE_WORKERS", "8")))
-        self.opening_window_pool_sector_top = max(1, int(os.getenv("WATCH_OPENING_WINDOW_POOL_SECTOR_TOP", "5")))
-        self.opening_window_pool_sector_members = max(1, int(os.getenv("WATCH_OPENING_WINDOW_POOL_SECTOR_MEMBERS", "3")))
-        self.opening_window_pool_board_top = max(5, int(os.getenv("WATCH_OPENING_WINDOW_POOL_BOARD_TOP", "20")))
-        self.opening_window_warn_confirm_ticks = max(1, int(os.getenv("WATCH_OPENING_WINDOW_WARN_CONFIRM_TICKS", "2")))
+        self.f10_preopen_time = os.getenv("WATCH_F10_PREOPEN_TIME", "08:40").strip() or "08:40"
+        self.f10_preopen_window_minutes = max(5, int(os.getenv("WATCH_F10_PREOPEN_WINDOW_MINUTES", "25")))
+        self.f10_preopen_max_codes = max(1, int(os.getenv("WATCH_F10_PREOPEN_MAX_CODES", "80")))
+        self.f10_preopen_stale_seconds = int(os.getenv("WATCH_F10_PREOPEN_STALE_SECONDS", "43200"))
+        self.transaction_cache_seconds = int(os.getenv("WATCH_TRANSACTION_CACHE_SECONDS", "5"))
+        # 全日逐笔磁带缓存：历史/收盘后磁带不可变，长 TTL 直接复用；
+        # 盘中超过 transaction_cache_seconds 后走增量对齐补新，不再整段重拉。
+        self.transaction_tape_static_cache_seconds = int(os.getenv("WATCH_TRANSACTION_TAPE_STATIC_CACHE_SECONDS", "1800"))
+        self.transaction_tape_max_ticks = max(1800, int(os.getenv("WATCH_TRANSACTION_TAPE_MAX_TICKS", str(8 * 1800))))
+        self.transaction_rows = int(os.getenv("WATCH_TRANSACTION_ROWS", "240"))
         self.auction_history_max_points = int(os.getenv("WATCH_AUCTION_HISTORY_MAX_POINTS", "180"))
         self.auction_history_file = Path(os.getenv("WATCH_AUCTION_HISTORY_FILE", str(AUCTION_HISTORY_FILE)))
         # 暗盘资金模块：盘中大单推断走独立慢循环（默认 120s 一轮、24 只有界池、
@@ -213,7 +226,13 @@ class AppSettings:
             "easy_tdx_quote_workers": self.easy_tdx_quote_workers,
             "easy_tdx_f10_timeout_seconds": self.easy_tdx_f10_timeout_seconds,
             "fundamentals_cache_seconds": self.fundamentals_cache_seconds,
+            "f10_cache_seconds": self.f10_cache_seconds,
+            "f10_preopen_refresh": self.f10_preopen_refresh,
+            "f10_preopen_time": self.f10_preopen_time,
+            "f10_preopen_max_codes": self.f10_preopen_max_codes,
             "transaction_cache_seconds": self.transaction_cache_seconds,
+            "transaction_tape_static_cache_seconds": self.transaction_tape_static_cache_seconds,
+            "transaction_tape_max_ticks": self.transaction_tape_max_ticks,
             "transaction_rows": self.transaction_rows,
             "auction_history_max_points": self.auction_history_max_points,
             "opening_decision_file": str(self.opening_decision_file),

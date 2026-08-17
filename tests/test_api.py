@@ -100,14 +100,14 @@ def test_stream_preview_signature_includes_watch_marker() -> None:
             "latest_change_pct": 9.9,
             "source_quality": "trajectory_stock_features",
             "markers": [
-                {"time": "13:26", "signal": "买T", "gold_resonance": False},
+                {"time": "13:26", "signal": "买T", "price": 52.63},
             ],
         },
     }
 
     signature = main_module._preview_item_signature(item)
 
-    assert "13:26:买T:0" in signature
+    assert "13:26:买T:52.63" in signature
     assert "公式买T" in signature
     assert "半导体设备" in signature
     assert "48:9.9:trajectory_stock_features" in signature
@@ -194,6 +194,7 @@ def test_signal_detail_extras_endpoint_can_request_f10_fundamentals(monkeypatch)
             include_indicators=False,
             include_chanlun=False,
             include_auction_history=True,
+            include_messages=True,
         ):
             assert code == "300476"
             assert sector == "PCB"
@@ -203,6 +204,7 @@ def test_signal_detail_extras_endpoint_can_request_f10_fundamentals(monkeypatch)
             assert include_indicators is False
             assert include_chanlun is False
             assert include_auction_history is True
+            assert include_messages is True
             return SimpleNamespace(
                 model_dump=lambda mode="json": {
                     "code": code,
@@ -811,39 +813,6 @@ def test_opening_decision_endpoint_returns_checkpoint_and_reasons(monkeypatch) -
     assert payload["can_execute"] is True
     assert payload["top_candidates"][0]["action"] == "确认买T"
     assert "分时放量" in payload["top_candidates"][0]["reasons"]
-
-
-def test_opening_research_endpoint_reads_local_report_without_credentials(monkeypatch, tmp_path) -> None:
-    report_path = tmp_path / "runtime" / "strategy-research" / "latest_l1.json"
-    report_path.parent.mkdir(parents=True)
-    report_path.write_text(
-        json.dumps(
-            {
-                "generated_at": "2026-08-07T16:00:00",
-                "sample": {"size": 80},
-                "date_summaries": [{"date": "20260807", "opening_buy_events": 0}],
-                "opening": {
-                    "checkpoints": ["09:33", "09:35", "09:37"],
-                    "records_count": 240,
-                    "action_counts": {"确认买T": 0},
-                },
-                "data_quality": {"level2_available": False},
-                "methodology": {"limitations": ["样本较少"]},
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(main_module.settings, "data_dir", tmp_path)
-
-    response = TestClient(app).get("/api/opening/research")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["available"] is True
-    assert payload["opening"]["checkpoints"] == ["09:33", "09:35", "09:37"]
-    assert payload["limitations"] == ["样本较少"]
-    assert "WATCH_INGEST_TOKEN" not in json.dumps(payload, ensure_ascii=False)
 
 
 def test_dashboard_sector_filter_limits_signals_to_selected_board() -> None:

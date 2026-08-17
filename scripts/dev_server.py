@@ -23,6 +23,82 @@ def _server_env() -> dict[str, str]:
     if VENV_DIR.exists():
         env["VIRTUAL_ENV"] = str(VENV_DIR)
         env["PATH"] = str(VENV_SCRIPTS) + os.pathsep + env.get("PATH", "")
+    return _inject_cloudbase_message_env(env)
+
+
+# 本地起服务只需要消息存储的 CloudBase 连接参数。容器专属的路径/端口/持久化
+# 配置（/tmp 路径、WATCH_PORT、cloudbase_nosql 状态后端等）绝不注入，本地行为不变。
+_CLOUDBASE_MESSAGE_ENV_KEYS = (
+    "WATCH_CLOUDBASE_ENV_ID",
+    "WATCH_CLOUDBASE_API_TOKEN",
+    "WATCH_CLOUDBASE_MYSQL_INSTANCE",
+    "WATCH_CLOUDBASE_MYSQL_SCHEMA",
+    "WATCH_CLOUDBASE_MYSQL_OPENID",
+    "WATCH_MESSAGE_STORE_BACKEND",
+)
+
+
+def _find_tcb_cli() -> str | None:
+    import shutil
+
+    for name in ("tcb", "tcb.cmd"):
+        found = shutil.which(name)
+        if found:
+            return found
+    candidates = [
+        Path(os.environ.get("APPDATA", "")) / "npm" / "tcb.cmd",
+        Path("G:/KimiData/daimon-share/daimon/npm-global/tcb.cmd"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _inject_cloudbase_message_env(env: dict[str, str]) -> dict[str, str]:
+    """本地缺 CloudBase 消息库配置时，从 CloudRun 服务配置临时拉取注入。
+
+    密钥只进子进程环境变量、不落盘（遵循 README 的密钥约束）；拉取失败
+    不阻断启动，仅提示——此时星球消息面板为空是预期表现。
+    """
+    if env.get("WATCH_CLOUDBASE_API_TOKEN"):
+        return env
+    cloudbaserc = ROOT / "cloudbaserc.json"
+    tcb = _find_tcb_cli()
+    if not cloudbaserc.exists() or not tcb:
+        return env
+    import json
+    import subprocess
+
+    try:
+        rc = json.loads(cloudbaserc.read_text(encoding="utf-8"))
+        env_id = str(rc.get("envId") or "").strip()
+        service = str((rc.get("cloudrun") or {}).get("name") or "").strip()
+        if not (env_id and service):
+            return env
+        result = subprocess.run(
+            [tcb, "cloudrun", "detail", "--service-name", service, "--env-id", env_id, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        raw = result.stdout or ""
+        detail = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+        server_config = (detail.get("data") or {}).get("ServerConfig") or detail.get("ServerConfig") or {}
+        env_params = server_config.get("EnvParams") or ""
+        params = json.loads(env_params) if isinstance(env_params, str) else dict(env_params)
+        injected = [
+            key
+            for key in _CLOUDBASE_MESSAGE_ENV_KEYS
+            if params.get(key) and not env.get(key)
+        ]
+        for key in injected:
+            env[key] = str(params[key])
+        if injected:
+            print(f"已从 CloudRun 服务配置注入本地消息库连接（仅进程内，不落盘）: {', '.join(injected)}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"CloudBase 消息库连接注入跳过（{exc!r}）；本地星球消息将不可用。")
     return env
 
 

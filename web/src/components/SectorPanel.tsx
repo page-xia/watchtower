@@ -1,9 +1,17 @@
-import { memo } from "react"
-import { Crown } from "lucide-react"
+import { memo, useState } from "react"
+import { ChevronDown, Crown } from "lucide-react"
 import type { SectorRank } from "@/types/api"
 import { fmtPct, pctClass } from "@/lib/format"
 import { HeatBar } from "@/components/widgets"
 import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { cn } from "@/lib/utils"
 
 interface SectorPanelProps {
@@ -12,6 +20,22 @@ interface SectorPanelProps {
   onSelect: (name: string | null) => void
   boardLevel: number
   onBoardLevel: (level: number) => void
+}
+
+// 板块口径菜单：1/2/3 = 申万行业级别；4/5/6 = 通达信概念(GN)/风格(FG)/地区(DQ)
+const LEVEL_LABELS: Record<number, string> = {
+  1: "板块 · 1级",
+  2: "板块 · 2级",
+  3: "板块 · 3级",
+  4: "概念",
+  5: "风格",
+  6: "地区",
+}
+
+const PANEL_TITLES: Record<number, string> = {
+  4: "概念强弱",
+  5: "风格强弱",
+  6: "地区强弱",
 }
 
 const SectorRow = memo(function SectorRow({
@@ -70,12 +94,19 @@ const SectorRow = memo(function SectorRow({
 
 export function SectorPanel({ sectors, selected, onSelect, boardLevel, onBoardLevel }: SectorPanelProps) {
   const sorted = [...sectors].sort((a, b) => b.heat_score - a.heat_score)
+  const [menuOpen, setMenuOpen] = useState(false)
+  // 口径 + 级别收成一个菜单：悬停或点击展开，避免头部 tab 越塞越多
+  const currentLabel = LEVEL_LABELS[boardLevel] ?? `板块 · ${boardLevel}级`
+  const pick = (level: number) => {
+    if (level !== boardLevel) onBoardLevel(level)
+    setMenuOpen(false)
+  }
   return (
     <section className="terminal-panel flex h-full min-h-0 flex-col">
       <header className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
         <div>
           <div className="panel-title">板块扫描</div>
-          <h2 className="text-sm font-bold">板块强弱</h2>
+          <h2 className="text-sm font-bold">{PANEL_TITLES[boardLevel] ?? "板块强弱"}</h2>
         </div>
         <div className="flex items-center gap-1">
           <Button
@@ -92,19 +123,43 @@ export function SectorPanel({ sectors, selected, onSelect, boardLevel, onBoardLe
           >
             全
           </Button>
-          {[1, 2, 3].map((lv) => (
-            <button
-              key={lv}
-              type="button"
-              onClick={() => onBoardLevel(lv)}
-              className={cn(
-                "rounded px-1.5 py-0.5 text-[10px]",
-                boardLevel === lv ? "bg-primary/20 text-primary" : "text-muted-foreground hover:bg-muted",
-              )}
-            >
-              {lv}级
-            </button>
-          ))}
+          <div onMouseEnter={() => setMenuOpen(true)} onMouseLeave={() => setMenuOpen(false)}>
+            <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen} modal={false}>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="flex h-6 items-center gap-0.5 rounded border border-input bg-secondary px-1.5 text-[10px] font-semibold text-foreground outline-none hover:bg-accent"
+                  title="切换板块口径 / 级别"
+                >
+                  {currentLabel}
+                  <ChevronDown className="h-3 w-3 text-muted-foreground" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" sideOffset={4} className="min-w-[120px]">
+                <DropdownMenuLabel className="text-[10px] text-muted-foreground">官方板块（申万）</DropdownMenuLabel>
+                {[1, 2, 3].map((lv) => (
+                  <DropdownMenuItem
+                    key={lv}
+                    className={cn("text-[11px]", boardLevel === lv && "bg-accent font-semibold")}
+                    onSelect={() => pick(lv)}
+                  >
+                    {LEVEL_LABELS[lv]}
+                  </DropdownMenuItem>
+                ))}
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel className="text-[10px] text-muted-foreground">通达信</DropdownMenuLabel>
+                {[4, 5, 6].map((lv) => (
+                  <DropdownMenuItem
+                    key={lv}
+                    className={cn("text-[11px]", boardLevel === lv && "bg-accent font-semibold")}
+                    onSelect={() => pick(lv)}
+                  >
+                    {LEVEL_LABELS[lv]}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </div>
       </header>
       <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto p-1.5">
@@ -116,7 +171,11 @@ export function SectorPanel({ sectors, selected, onSelect, boardLevel, onBoardLe
             onClick={() => onSelect(selected === s.name ? null : s.name)}
           />
         ))}
-        {sorted.length === 0 && <div className="p-4 text-center text-xs text-muted-foreground">暂无板块数据</div>}
+        {sorted.length === 0 && (
+          <div className="p-4 text-center text-xs text-muted-foreground">
+            暂无{PANEL_TITLES[boardLevel] ? PANEL_TITLES[boardLevel].replace("强弱", "") : "板块"}数据
+          </div>
+        )}
       </div>
     </section>
   )

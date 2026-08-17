@@ -74,8 +74,6 @@ def test_dashboard_service_uses_cloud_backed_stores_when_configured(monkeypatch)
     assert isinstance(service.watchlist_store, CloudBackedWatchlistStore)
     assert isinstance(service.position_store, CloudBackedPositionStore)
     assert service.trajectory_store.state_store is not None
-    assert service.opening_window_engine is not None
-    assert service.opening_window_engine.state_store is service.state_store
     assert service.data_source.boards.state_store is service.state_store
 
 

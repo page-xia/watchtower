@@ -22,15 +22,20 @@ from app.data_sources import (
 )
 from app.market_schedule import market_refresh_policy
 from app.message_store import MessageStore
+from app.webhook_push import SignalPushPool, WebhookSubscriptionStore
 from app.dark_pool import DarkPoolMonitor
-from app.opening7 import opening_decision_markers
-from app.opening_window_engine import OpeningWindowEngine
+from app.formula_engine import (
+    SIGNAL_VERSION,
+    ZuoTDayContext,
+    compute_zuot_series,
+)
 from app.models import (
     AnalysisRecord,
     ConfluenceSnapshot,
     DashboardPayload,
     DetailChartSeries,
     EventItem,
+    FormulaOverlay,
     FormulaState,
     IndexReplayDetail,
     IndexSnapshot,
@@ -47,6 +52,7 @@ from app.models import (
     SectorFlowSeries,
     ReplayMarker,
     ReplayPoint,
+    RiskRewardPlan,
     SectorSnapshot,
     SignalDetailChartPayload,
     SignalDetailExtrasPayload,
@@ -68,11 +74,6 @@ from app.models import (
 )
 from app.signal_engine import SignalEngine
 from app.opening_strategy import OpeningStrategy
-from app.research_artifacts import (
-    summarize_data_manifests,
-    summarize_matched_control,
-    summarize_parameter_discovery,
-)
 from app.storage import (
     AnalysisStore,
     CloudBackedPositionStore,
@@ -83,6 +84,7 @@ from app.storage import (
     WatchlistStore,
 )
 from app.trajectory_store import IntradayWatchtowerStore
+from app.trend_line_store import TrendLineStore, near_trend_match
 
 
 logger = logging.getLogger(__name__)
@@ -126,6 +128,23 @@ class SharedMinuteChartRows:
 
 
 @dataclass
+class StockDetailBundle:
+    """详情页共享计算结果：分钟行 + 分时图序列 + 做T公式状态 + 买卖标记。
+
+    chart/overlay/详情三个入口共用，配合短 TTL 单飞缓存保证每股每次只算一次。
+    """
+
+    rows: list[dict[str, Any]]
+    chart: DetailChartSeries
+    formula_result: Any
+    formula_state: FormulaState
+    formula_overlay: FormulaOverlay
+    markers: list[SignalDetailOverlayMarker]
+    summary: list[str]
+    error: str | None = None
+
+
+@dataclass
 class BoardEntry:
     sort_key: tuple[Any, ...]
     quote: Quote
@@ -165,22 +184,19 @@ class DashboardService:
             state_store=self.state_store,
         )
         self.data_source = MarketDataRouter(settings, state_store=self.state_store)
+        # 短期/长期趋势线最新值缓存：榜单「低吸机会」过滤按当天口径复用，后台补算缺失代码
+        self.trend_line_store = TrendLineStore(
+            settings.data_dir / "runtime" / "trend_lines.json",
+            self.data_source.fetch_daily_kline_rows,
+        )
+        from app.stock_tags import StockTagStore
+
+        self.stock_tag_store = StockTagStore()
         self.engine = SignalEngine(load_yaml(settings.rules_file, {}))
         self.opening_strategy = OpeningStrategy(
             load_yaml(settings.rules_file, {}),
             persist_path=settings.opening_decision_file,
         )
-        # 开盘窗口菱形引擎：~40 只有界池，09:30-10:00 每 6s 一轮。
-        self.opening_window_engine: OpeningWindowEngine | None = None
-        if getattr(settings, "opening_window_engine_enabled", False):
-            self.opening_window_engine = OpeningWindowEngine(
-                settings,
-                context_provider=self._get_context,
-                tape_fetcher=self._fetch_transaction_flow,
-                position_checker=lambda code: bool(self.position_store.get(code)),
-                data_dir=settings.data_dir,
-                state_store=self.state_store,
-            )
         # 暗盘资金监控：盘中大单推断独立慢循环（默认 120s/24 只），
         # 盘后口径读本地 tushare_eod.sqlite；均不进 5 秒大盘刷新循环。
         self.dark_pool_monitor = DarkPoolMonitor(
@@ -247,25 +263,49 @@ class DashboardService:
         self._last_stock_mini_chart_missing_count: int = 0
         self._last_stock_mini_chart_loaded_count: int = 0
         self._last_visible_mini_chart_cache: dict[str, MiniIntradaySeries] = {}
+        # 当天最近一次做T买/卖点（方向/触发价/时间）：信号发生时被记录，
+        # 信号回到「观察」后仍供榜单距买卖点 ±% 与「置顶买点」排序使用。
+        self._last_action_lock = threading.Lock()
+        self._last_action_by_code: dict[str, dict[str, Any]] = {}
+        # 飞书 webhook 信号推送池：订阅注册持久化到 data/webhook_subscriptions.json，
+        # 每轮实盘信号构建后按票去重投递（同票 5 分钟内只推一次）。
+        self.push_pool = SignalPushPool(
+            WebhookSubscriptionStore(settings.webhook_subscriptions_file),
+            dedup_seconds=settings.push_signal_dedup_seconds,
+            timeout_seconds=settings.push_http_timeout_seconds,
+        )
         self._last_trajectory_cleanup: dict[str, Any] = {}
         self._last_trajectory_cleanup_day: str = ""
         self._trajectory_cleanup_lock = threading.Lock()
         self._trajectory_cleanup_thread: threading.Thread | None = None
+        # F10 盘前增量预热：每日 08:40 起（周一至周五）一轮，只刷过期缓存。
+        self._last_f10_preopen: dict[str, Any] = {}
+        self._last_f10_preopen_day: str = ""
+        self._f10_preopen_lock = threading.Lock()
+        self._f10_preopen_thread: threading.Thread | None = None
         self._previous_sector_ranks: dict[str, int] = {}
         self._historical_context_cache: dict[str, DashboardContext] = {}
-        self._research_validation_cache: tuple[float, str, str] | None = None
-        self._research_report_cache: tuple[str, int, int, dict[str, Any]] | None = None
-        # 详情页分钟级趋势状态缓存：key=(code, trade_date, 分钟数, 尾点时间, 尾点价格)。
-        # _trend_states_for_detail 对每个分钟点重跑日线趋势公式，chart/overlay
-        # 两个接口各算一遍；尾点变化（新分钟/新价格）时自动失效重算。
-        self._trend_states_cache: dict[tuple[str, str, int, str, float], tuple[float, list[dict[str, Any]]]] = {}
-        # 详情页基础上下文和分钟源的短 TTL 单飞缓存。
+        # 详情页基础上下文/分钟源/公式bundle 的短 TTL 单飞缓存。
+        # 缓存键只含 trade_date/code 等稳定维度，不绑 context.updated_at——
+        # 否则盘中每 5 秒刷新就全量失效，详情轮询等同冷启动。
         self._signal_detail_context_cache: dict[str, tuple[float, SignalDetailContext]] = {}
         self._signal_detail_context_cache_lock = threading.Lock()
         self._signal_detail_context_build_locks: dict[str, threading.Lock] = {}
         self._detail_minute_rows_cache: dict[str, tuple[float, SharedMinuteChartRows]] = {}
         self._detail_minute_rows_cache_lock = threading.Lock()
         self._detail_minute_rows_build_locks: dict[str, threading.Lock] = {}
+        # 详情页公式bundle缓存：chart/overlay/monolith 共享同一份
+        # 分钟归一化 + 做T公式序列 + 买卖标记，只算一次。
+        self._detail_bundle_cache: dict[str, tuple[float, StockDetailBundle]] = {}
+        self._detail_bundle_cache_lock = threading.Lock()
+        self._detail_bundle_build_locks: dict[str, threading.Lock] = {}
+        # 日K详情载荷缓存（公式+筹码+标签）：分钟级轮询削抖
+        self._detail_daily_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._detail_daily_cache_lock = threading.Lock()
+        self._detail_daily_build_locks: dict[str, threading.Lock] = {}
+        # 流通市值快照缓存（板块中军口径用）：按（日期, 库文件 mtime）失效
+        self._float_mcap_cache_key: tuple[str, int] | None = None
+        self._float_mcap_cache: dict[str, float] = {}
         # 详情页单票公式行缓存：轨迹库文件大、行按时间交错落盘，单票 180 行
         # 实际是随机页读，盘中与后台批量读写叠加时可能卡数秒。数据本身每
         # background_collector_seconds 才更新一次，短 TTL 内存缓存即可。
@@ -274,9 +314,6 @@ class DashboardService:
         self._dashboard_cache_by_key: dict[str, tuple[float, DashboardPayload]] = {}
         self._dashboard_cache_lock = threading.Lock()
         self._dashboard_build_locks: dict[str, threading.Lock] = {}
-        # 菱形流预览共享缓存：(cached_at, context_signature, items)
-        self._opening_markers_cache: tuple[float, str, list[dict[str, Any]]] | None = None
-        self._opening_markers_lock = threading.Lock()
 
     def _build_state_store(self, settings: AppSettings) -> JsonStateStore | None:
         if settings.persistence_backend != "cloudbase_nosql":
@@ -345,6 +382,8 @@ class DashboardService:
         page: int = 1,
         page_size: int = 80,
         fast: bool = False,
+        near_trend: bool = False,
+        pin_buy: bool = False,
         client_watchlist: list[WatchlistItem] | None = None,
     ) -> TerminalPayload:
         """Build the dense terminal view without the legacy signal-card payload.
@@ -356,8 +395,12 @@ class DashboardService:
         context = self._get_context()
         context = self._context_with_client_watchlist(context, client_watchlist)
         level = normalize_board_level(board_level)
-        cache_key = self._terminal_cache_key(context, sector, level, sort, page, page_size)
+        cache_key = self._terminal_cache_key(context, sector, level, sort, page, page_size, near_trend, pin_buy)
         ttl = self._payload_cache_ttl(context)
+        if (near_trend or pin_buy) and (ttl is None or ttl > 2.0):
+            # 低吸线值/最近买点可能由后台或详情页补算：冻结/静态期也不能按
+            # context 签名无限缓存，否则补算完成的结果永远不会进入载荷。
+            ttl = 2.0
         if fast:
             payload = self._cached_payload(
                 self._terminal_cache_by_key,
@@ -372,6 +415,8 @@ class DashboardService:
                     sort=sort,
                     page=page,
                     page_size=page_size,
+                    near_trend=near_trend,
+                    pin_buy=pin_buy,
                 ),
                 max_entries=24,
             )
@@ -389,12 +434,11 @@ class DashboardService:
                     sort=sort,
                     page=page,
                     page_size=page_size,
+                    near_trend=near_trend,
+                    pin_buy=pin_buy,
                 ),
                 max_entries=24,
             )
-        # 菱形流挂载共享短缓存（引擎独立于 context 缓存，预警/确认状态 6s 级变化）；
-        # 带上本 context 的行情快照，队列行回填实时价格/涨幅
-        payload.opening_markers = self._opening_markers_preview(context)
         return payload
 
     @staticmethod
@@ -480,7 +524,7 @@ class DashboardService:
 
         ttl=None（冻结/静态期）时缓存随 key 中的 context 签名失效，不做时间
         过期；ttl 为数（盘中）时超过 TTL 即重建。命中返回深拷贝，调用方可以
-        自由挂载连接级字段（如 opening_markers）而不污染缓存。
+        自由挂载连接级字段而不污染缓存。
         """
         now = time.time()
         with store_lock:
@@ -546,6 +590,8 @@ class DashboardService:
         sort: str,
         page: int,
         page_size: int,
+        near_trend: bool = False,
+        pin_buy: bool = False,
     ) -> str:
         return "|".join(
             [
@@ -556,6 +602,8 @@ class DashboardService:
                 str(sort or "activity"),
                 str(max(1, int(page or 1))),
                 str(max(1, int(page_size or 80))),
+                "near_trend" if near_trend else "",
+                "pin_buy" if pin_buy else "",
             ]
         )
 
@@ -590,6 +638,8 @@ class DashboardService:
         sort: str = "activity",
         page: int = 1,
         page_size: int = 80,
+        near_trend: bool = False,
+        pin_buy: bool = False,
         client_watchlist: list[WatchlistItem] | None = None,
     ) -> StockBoardPayload:
         context = self._get_context()
@@ -601,6 +651,8 @@ class DashboardService:
             sort=sort,
             page=page,
             page_size=page_size,
+            near_trend=near_trend,
+            pin_buy=pin_buy,
         )
 
     def sector_rank(
@@ -671,26 +723,23 @@ class DashboardService:
         client_watchlist: list[WatchlistItem] | None = None,
     ) -> SignalDetailChartPayload:
         info = self._signal_detail_context(code, sector=sector, trade_date=trade_date, client_watchlist=client_watchlist)
-        shared_rows = self._shared_stock_chart_rows(info)
-        chart = self._detail_chart_series(info, shared_rows.rows)
-        formula_rows = self._formula_rows_for_detail(info, shared_rows.rows)
-        trend_states = self._trend_states_for_detail(info, formula_rows)
-        formula_result = self._formula_series(formula_rows, trend_states=trend_states)
-        formula_state = self._formula_state_from_series(formula_result)
+        bundle = self._stock_detail_bundle(info)
         confluence_snapshot = self._confluence_snapshot(
             info,
-            chart=chart,
-            formula_state=formula_state,
+            chart=bundle.chart,
+            formula_state=bundle.formula_state,
         )
-        summary = self._detail_chart_summary(info, chart)
-        if shared_rows.error:
-            summary.append(f"分钟回放不可用：{shared_rows.error}")
-        research_status, research_note = self._research_validation_status()
+        summary = list(bundle.summary)
+        if bundle.error:
+            summary.append(f"分钟回放不可用：{bundle.error}")
         # 板块展示名统一走 _display_sector_name：内部行业代码映射成官方板块名
         sector_snapshot = info.sector_snapshot
         sector_display = self._display_sector_name(info.quote, sector_snapshot)
         if sector_snapshot is not None and sector_snapshot.name != sector_display:
             sector_snapshot = sector_snapshot.model_copy(update={"name": sector_display})
+        signal = info.signal.model_copy(
+            update={"risk_reward": self._zuot_risk_reward(info, bundle.formula_state)}
+        )
         return SignalDetailChartPayload(
             code=info.quote.code,
             name=info.quote.name,
@@ -699,17 +748,16 @@ class DashboardService:
             selected_sector=info.selected_sector,
             market=info.context.market,
             sector_snapshot=sector_snapshot,
-            current_signal=info.signal,
+            current_signal=signal,
             summary=summary,
-            chart=chart,
+            chart=bundle.chart,
+            formula_overlay=bundle.formula_overlay,
             order_flow=info.quote.order_flow,
             watchlisted=info.watchlist_item is not None,
             watchlist_tags=list(info.signal.watchlist_tags),
             position=info.position,
-            formula_state=formula_state,
+            formula_state=bundle.formula_state,
             confluence_snapshot=confluence_snapshot,
-            research_status=research_status,
-            research_note=research_note,
         )
 
     def signal_detail_overlay(
@@ -720,58 +768,29 @@ class DashboardService:
         client_watchlist: list[WatchlistItem] | None = None,
     ) -> SignalDetailOverlayPayload:
         info = self._signal_detail_context(code, sector=sector, trade_date=trade_date, client_watchlist=client_watchlist)
+        bundle = self._stock_detail_bundle(info)
         transaction_flow = self._fetch_transaction_flow(
             info.quote.code,
             info.actual_trade_date,
             full_session=True,
         )
-
-        minute_rows = self._shared_stock_chart_rows(info).rows
-        chart = self._detail_chart_series(info, minute_rows)
-        formula_rows = self._formula_rows_for_detail(info, minute_rows)
-        trend_states = self._trend_states_for_detail(info, formula_rows)
-        formula_result = self._formula_series(formula_rows, trend_states=trend_states)
-        formula_state = self._formula_state_from_series(formula_result, transaction_flow=transaction_flow)
         confluence_snapshot = self._confluence_snapshot(
             info,
-            chart=chart,
-            formula_state=formula_state,
+            chart=bundle.chart,
+            formula_state=bundle.formula_state,
             transaction_flow=transaction_flow,
         )
-        research_status, research_note = self._research_validation_status()
-        replay_points, formula_markers, _, _ = self.engine.build_replay_detail(
-            info.quote,
-            minute_rows,
-            info.context.market,
-            info.sector_snapshot,
-            selected_sector=info.selected_sector,
-            position=info.position,
-            transaction_flow=transaction_flow,
-            trend_states=trend_states,
-        )
-        markers = self._confirmed_overlay_markers(formula_markers, replay_points)
-        opening_markers = self._opening7_overlay_markers(info, minute_rows, transaction_flow)
-        # 与机会队列同源的开盘窗口引擎菱形优先并入；opening7 分钟代理只补
-        # 引擎没覆盖的（time, signal）时点，避免 09:31/09:33 双份菱形叠画。
-        engine_markers = self._opening_window_overlay_markers(info)
-        if engine_markers:
-            covered = {(m.time, m.signal) for m in engine_markers}
-            opening_markers = engine_markers + [
-                m for m in opening_markers if (m.time, m.signal) not in covered
-            ]
         return SignalDetailOverlayPayload(
             code=info.quote.code,
             name=info.quote.name,
             sector=self._display_sector_name(info.quote, info.sector_snapshot),
             trade_date=info.actual_trade_date,
             selected_sector=info.selected_sector,
-            markers=markers,
-            opening_markers=opening_markers,
+            frozen=bool(info.context.market.frozen),
+            markers=bundle.markers,
             transaction_flow=self._transaction_flow_summary(transaction_flow),
-            formula_state=formula_state,
+            formula_state=bundle.formula_state,
             confluence_snapshot=confluence_snapshot,
-            research_status=research_status,
-            research_note=research_note,
         )
 
     def signal_detail_extras(
@@ -784,24 +803,28 @@ class DashboardService:
         include_indicators: bool = False,
         include_chanlun: bool = False,
         include_auction_history: bool = True,
+        include_messages: bool = True,
         client_watchlist: list[WatchlistItem] | None = None,
     ) -> SignalDetailExtrasPayload:
         info = self._signal_detail_context(code, sector=sector, trade_date=trade_date, client_watchlist=client_watchlist)
-        sector_terms = self._message_evidence_terms(
-            info.quote,
-            info.signal,
-            info.sector_snapshot,
-            info.selected_sector,
-        )
         loaders: dict[str, Callable[[], Any]] = {
             "analysis": lambda: self.analysis_store.load(info.quote.code, info.actual_trade_date),
+        }
+        if include_messages:
+            # 星球消息证据要查 CloudBase（冷查询约 0.8-1.1s），是 extras 冷启动大头；
+            # 详情页默认看筹码 tab，前端切到「星球消息」tab 时才带 include_messages=true。
+            sector_terms = self._message_evidence_terms(
+                info.quote,
+                info.signal,
+                info.sector_snapshot,
+                info.selected_sector,
+            )
             # message_status（大表 count=exact）前端详情页并不消费，不再随 extras 加载；
             # 需要时走 /api/messages/status（独立 300s 缓存）。
-            "message_evidence": lambda: self.message_store.evidence_for(
+            loaders["message_evidence"] = lambda: self.message_store.evidence_for(
                 code=info.quote.code,
                 sector_terms=sector_terms,
-            ),
-        }
+            )
         if include_auction_history:
             loaders["auction_history"] = lambda: self.data_source.auction_history(
                 info.quote.code,
@@ -837,7 +860,6 @@ class DashboardService:
         capital_flow = results.get("capital_flow")
         technical_indicators = results.get("technical_indicators")
         chanlun = results.get("chanlun")
-        research_status, research_note = self._research_validation_status()
         payload = SignalDetailExtrasPayload(
             code=info.quote.code,
             name=info.quote.name,
@@ -850,8 +872,6 @@ class DashboardService:
             auction_history=auction_history,
             message_evidence=message_evidence,
             analysis=analysis,
-            research_status=research_status,
-            research_note=research_note,
         )
         if fundamentals is not None:
             payload.fundamentals = fundamentals
@@ -862,6 +882,303 @@ class DashboardService:
         if chanlun is not None:
             payload.chanlun = chanlun
         return payload
+
+    def signal_detail_f10(self, code: str, refresh: bool = False) -> Any:
+        """个股详情页 F10 聚合数据（tushare_pro + easy_tdx）。
+
+        三层缓存：内存(1h) → 持久缓存(18h) → 实时拉取；refresh=True 强制实时拉
+        并回写持久缓存。盘前另有定时增量预热（maybe_run_f10_preopen_refresh）。
+        """
+        return self.data_source.fetch_f10_full(code, force=refresh)
+
+    # -- 日K详情（AI主力狙击公式 + 筹码峰 + 题材概念标签） ----------------------
+
+    def signal_detail_daily(
+        self,
+        code: str,
+        sector: str | None = None,
+        trade_date: str | None = None,
+        count: int = 240,
+        client_watchlist: list[WatchlistItem] | None = None,
+    ) -> dict[str, Any]:
+        """日K详情载荷：日K线 + AI主力狙击三件套公式 + 筹码分布 + 题材概念标签。
+
+        数据边界（AGENTS.md）：日K/板块标签走 easy_tdx；换手率用 tushare 本地
+        daily_basic 流通股本快照（个股级数值，不参与板块分类）。
+        """
+        from app.chip_distribution import (
+            compute_chip_distribution,
+            compute_intraday_distribution,
+        )
+        from app.daily_formula_engine import DailyFormulaInput, compute_daily_formulas
+        from app.stock_tags import classify_belong_boards
+
+        info = self._signal_detail_context(code, sector=sector, trade_date=trade_date, client_watchlist=client_watchlist)
+        quote = info.quote
+        row_count = max(120, min(int(count or 240), 800))
+
+        def build() -> dict[str, Any]:
+            rows = self.data_source.fetch_daily_kline_rows(quote.code, count=row_count)
+            float_shares = self._lookup_float_shares(quote.code)
+            # 筹码峰固定取最近 250 根：日K 向前动态加载更多历史时筹码分布保持稳定，
+            # 避免可视窗口扩张导致峰形漂移、数字前后不一致。
+            chip = compute_chip_distribution(rows[-250:], float_shares=float_shares)
+
+            index_code = self._index_code_for_stock(quote.code)
+            index_close_map = (
+                self.data_source.fetch_index_daily_close_map(index_code, count=row_count + 60)
+                if index_code
+                else {}
+            )
+            formula_input = DailyFormulaInput.from_rows(
+                rows,
+                float_shares=float_shares,
+                index_close_by_date=index_close_map,
+                winner_pct=chip.get("winner_pct") if chip.get("available") else None,
+            )
+            formulas = compute_daily_formulas(formula_input)
+
+            minute_rows = self._shared_stock_chart_rows(info).rows
+            chip_intraday = compute_intraday_distribution(
+                minute_rows,
+                prev_close=float(quote.prev_close or 0),
+            )
+
+            tags = self.stock_tag_store.get_or_fetch(
+                quote.code,
+                fetcher=lambda c: classify_belong_boards(
+                    self.data_source.fetch_belong_board_rows(c), c
+                ),
+            )
+            sector_display = self._display_sector_name(quote, info.sector_snapshot)
+
+            return {
+                "code": quote.code,
+                "name": quote.name,
+                "sector": sector_display,
+                "trade_date": info.actual_trade_date,
+                "prev_close": float(quote.prev_close or 0),
+                "count": len(rows),
+                "bars": [
+                    {
+                        "date": str(row.get("date") or ""),
+                        "open": round(float(row.get("open") or 0), 3),
+                        "high": round(float(row.get("high") or 0), 3),
+                        "low": round(float(row.get("low") or 0), 3),
+                        "close": round(float(row.get("close") or 0), 3),
+                        "vol": round(float(row.get("vol") or 0), 1),
+                        "amount": round(float(row.get("amount") or 0), 1),
+                    }
+                    for row in rows
+                ],
+                "formulas": formulas,
+                "chip": chip,
+                "chip_intraday": chip_intraday,
+                "tags": {
+                    "available": bool(tags.get("industry") or tags.get("concepts")),
+                    "industry_official": sector_display if sector_display != "未归类" else "",
+                    "industry": tags.get("industry") or "",
+                    "concepts": tags.get("concepts") or [],
+                    "styles": tags.get("styles") or [],
+                    "regions": tags.get("regions") or [],
+                    "source": tags.get("source") or "",
+                    "stale": bool(tags.get("stale")),
+                },
+                "generated_at": china_now().isoformat(timespec="seconds"),
+            }
+
+        ttl = 20.0 if info.live_mode else 300.0
+        cache_key = "|".join([quote.code, info.actual_trade_date, str(row_count)])
+        return self._cached_value(
+            self._detail_daily_cache,
+            self._detail_daily_cache_lock,
+            self._detail_daily_build_locks,
+            cache_key,
+            ttl,
+            build,
+            max_entries=16,
+        )
+
+    def _float_mcap_map(self) -> dict[str, float]:
+        """最新一个交易日的流通市值（元），按 6 位代码索引。
+
+        数据源：tushare daily_basic 本地快照（circ_mv，万元；个股级数值，
+        不参与板块分类）。按（日期, 库文件 mtime）缓存——ingest 写库后
+        mtime 变化即重载；库缺失/查询失败返回空表，调用方回退成交额口径。
+        """
+        db_file = self.settings.data_dir / "runtime" / "tushare_eod.sqlite"
+        try:
+            mtime = int(db_file.stat().st_mtime)
+        except OSError:
+            return {}
+        cache_key = (china_now().strftime("%Y%m%d"), mtime)
+        if self._float_mcap_cache_key == cache_key:
+            return self._float_mcap_cache
+        result: dict[str, float] = {}
+        try:
+            import sqlite3
+
+            with sqlite3.connect(str(db_file), timeout=2) as conn:
+                row = conn.execute("SELECT MAX(trade_date) FROM daily_basic").fetchone()
+                latest = str(row[0]) if row and row[0] else ""
+                if latest:
+                    for ts_code, circ_mv in conn.execute(
+                        "SELECT ts_code, circ_mv FROM daily_basic WHERE trade_date = ?",
+                        (latest,),
+                    ):
+                        code = str(ts_code or "").split(".")[0].zfill(6)
+                        try:
+                            value = float(circ_mv) * 10_000.0  # 万元 → 元
+                        except (TypeError, ValueError):
+                            continue
+                        if len(code) == 6 and code.isdigit() and value > 0:
+                            result[code] = value
+        except Exception:
+            return {}
+        self._float_mcap_cache_key = cache_key
+        self._float_mcap_cache = result
+        return result
+
+    @staticmethod
+    def _capacity_leader(metric_quotes: list[Quote], float_mcaps: dict[str, float]) -> Quote | None:
+        """板块中军（市场"核心容量"口径）：成分股里流通市值第一。
+
+        市值数据缺失时回退成交额第一（盘口代理口径）。
+        """
+        if not metric_quotes:
+            return None
+        with_cap = [quote for quote in metric_quotes if (float_mcaps.get(quote.code) or 0) > 0]
+        if with_cap:
+            return max(with_cap, key=lambda quote: float_mcaps[quote.code])
+        return max(
+            metric_quotes,
+            key=lambda quote: (float(quote.amount or 0), quote.minute_amount_ratio, quote.change_pct),
+        )
+
+    def _lookup_float_shares(self, code: str) -> float | None:
+        db_file = self.settings.data_dir / "runtime" / "tushare_eod.sqlite"
+        if not db_file.exists():
+            return None
+        ts_code = f"{code}.{'SH' if code.startswith(('6', '5', '9')) else 'BJ' if code.startswith(('4', '8', '92')) else 'SZ'}"
+        try:
+            import sqlite3
+
+            with sqlite3.connect(str(db_file), timeout=2) as conn:
+                row = conn.execute(
+                    "SELECT float_share FROM daily_basic WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1",
+                    (ts_code,),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row or row[0] in (None, ""):
+            return None
+        try:
+            value = float(row[0])  # 万股
+        except (TypeError, ValueError):
+            return None
+        return value * 10_000.0 if value > 0 else None
+
+    @staticmethod
+    def _index_code_for_stock(code: str) -> str | None:
+        """个股对应的大盘指数（公式 INDEXC）：沪市→上证指数，深市→深证成指；北交所暂不映射。"""
+        if code.startswith(("6", "5", "9")):
+            return "000001"
+        if code.startswith(("0", "3", "2")):
+            return "399001"
+        return None
+
+    # -- F10 盘前增量预热 -----------------------------------------------------
+
+    def _f10_preopen_candidates(self, max_codes: int) -> list[str]:
+        """候选池：自选 + 持仓 + 持久缓存索引里的近期查看股票，去重限流。"""
+        codes: list[str] = []
+        seen: set[str] = set()
+
+        def push(raw: Any) -> None:
+            text = str(raw or "").strip()
+            if not text:
+                return
+            code = text.zfill(6)
+            if len(code) == 6 and code.isdigit() and code not in seen:
+                seen.add(code)
+                codes.append(code)
+
+        try:
+            for item in self.watchlist_store.list_items():
+                push(item.code)
+            for item in self.position_store.list_items():
+                push(item.code)
+        except Exception as exc:
+            logger.warning("f10 preopen candidates from stores failed: %r", exc)
+        index = self.data_source.f10_cache_index()
+        for code, _ in sorted(index.items(), key=lambda kv: kv[1], reverse=True):
+            push(code)
+        return codes[:max_codes]
+
+    def maybe_run_f10_preopen_refresh(self, *, reason: str = "daily_collector") -> dict[str, Any]:
+        """每日盘前窗口（默认 08:40 起 25 分钟内，周一至周五）触发一轮 F10 增量预热。
+
+        只刷缓存缺失或超过 f10_preopen_stale_seconds 的股票；每天最多一轮。
+        挂在 collect_once 上，与 trajectory 每日清理同一模式，不占 5s 行情循环。
+        """
+        settings = self.settings
+        if not getattr(settings, "f10_preopen_refresh", True):
+            return {"scheduled": False, "skipped": "disabled_by_settings", "reason": reason}
+        now = china_now()
+        if now.weekday() >= 5:
+            return {"scheduled": False, "skipped": "weekend", "reason": reason}
+        try:
+            hour_text, minute_text = str(settings.f10_preopen_time).split(":", 1)
+            start_minutes = int(hour_text) * 60 + int(minute_text)
+        except (ValueError, AttributeError):
+            start_minutes = 8 * 60 + 40
+        current_minutes = now.hour * 60 + now.minute
+        window = int(getattr(settings, "f10_preopen_window_minutes", 25))
+        if not (start_minutes <= current_minutes < start_minutes + window):
+            return {"scheduled": False, "skipped": "outside_preopen_window", "reason": reason}
+        day_key = now.strftime("%Y%m%d")
+        with self._f10_preopen_lock:
+            if self._last_f10_preopen_day == day_key:
+                return {"scheduled": False, "skipped": "already_refreshed_today", "reason": reason}
+            if self._f10_preopen_thread is not None and self._f10_preopen_thread.is_alive():
+                return {"scheduled": False, "skipped": "refresh_in_progress", "reason": reason}
+
+            def run() -> None:
+                try:
+                    candidates = self._f10_preopen_candidates(int(settings.f10_preopen_max_codes))
+                    stats = self.data_source.refresh_f10_stale(
+                        candidates,
+                        max_age_seconds=int(settings.f10_preopen_stale_seconds),
+                        limit=int(settings.f10_preopen_max_codes),
+                    )
+                    # 资金流/技术指标/缠论同为日频数据，随同一轮预热增量刷新；
+                    # MacClient 串行拉取较慢，候选收敛到前 30 只（自选+持仓优先）。
+                    extras_stats = self.data_source.refresh_detail_extras_stale(
+                        candidates[:30],
+                        max_age_seconds=int(settings.f10_preopen_stale_seconds),
+                        limit=30,
+                    )
+                    self._last_f10_preopen = {
+                        **stats,
+                        "extras": extras_stats,
+                        "day_key": day_key,
+                        "reason": reason,
+                    }
+                    logger.info("f10 preopen refresh done: %s", self._last_f10_preopen)
+                except Exception as exc:  # pragma: no cover - 防御性兜底
+                    self._last_f10_preopen = {"error": str(exc)[:200], "day_key": day_key}
+                    logger.warning("f10 preopen refresh error: %r", exc)
+                finally:
+                    with self._f10_preopen_lock:
+                        self._last_f10_preopen_day = day_key
+
+            self._f10_preopen_thread = threading.Thread(
+                target=run,
+                name="f10-preopen-refresh",
+                daemon=True,
+            )
+            self._f10_preopen_thread.start()
+        return {"scheduled": True, "reason": reason, "day_key": day_key}
 
     def _load_signal_detail_extra(
         self,
@@ -992,6 +1309,7 @@ class DashboardService:
                 preferred_sector_names={sector_snapshot.name},
                 positions={quote.code: position} if position else {},
                 formula_rows_by_code=scoped_formula_rows,
+                sector_name_mapper=self._display_sector_name,
             )
             if scoped_signals:
                 scoped_signal = scoped_signals[0]
@@ -1002,23 +1320,6 @@ class DashboardService:
                     }
                 )
         live_mode = context.snapshot.data_mode == "live" or context.source_status.get("active_source") == "easy_tdx"
-        minute_error: str | None = None
-        try:
-            minute_rows = self.data_source.fetch_minute_series(code, actual_trade_date, live=bool(live_mode))
-        except Exception as exc:
-            minute_rows = []
-            minute_error = str(exc)
-        market_bars, sector_bars = self._fetch_replay_context(
-            code,
-            actual_trade_date,
-            sector_snapshot,
-            live=bool(live_mode),
-            source_name=str(
-                context.source_status.get("active_source")
-                or context.snapshot.source_status.get("active_source")
-                or ""
-            ),
-        )
         detail_info = SignalDetailContext(
             context=context,
             actual_trade_date=actual_trade_date,
@@ -1030,50 +1331,18 @@ class DashboardService:
             watchlist_item=None,
             live_mode=live_mode,
         )
-        formula_rows = self._formula_rows_for_detail(detail_info, minute_rows)
-        trend_states = self._trend_states_for_detail(detail_info, formula_rows)
-        formula_result = self._formula_series(formula_rows, trend_states=trend_states)
-        replay_points, markers, signal_timeline, summary = self.engine.build_replay_detail(
-            detail_quote,
-            minute_rows,
-            context.market,
-            sector_snapshot,
-            selected_sector=selected_sector,
-            market_bars=market_bars,
-            sector_bars=sector_bars,
-            position=position,
+        bundle = self._stock_detail_bundle(detail_info)
+        minute_error = bundle.error
+        replay_points, markers, signal_timeline, summary = self._zuot_replay(
+            detail_info,
+            bundle,
             transaction_flow=transaction_flow,
-            trend_states=trend_states,
         )
-        research_status, research_note = self._research_validation_status()
         decision_markers = list(markers)
-        chart_series = self._detail_chart_series(
-            SignalDetailContext(
-                context=context,
-                actual_trade_date=actual_trade_date,
-                quote=detail_quote,
-                signal=signal,
-                sector_snapshot=sector_snapshot,
-                selected_sector=selected_sector,
-                position=position,
-                watchlist_item=None,
-                live_mode=live_mode,
-            ),
-            minute_rows,
-        )
-        formula_state = self._formula_state_from_series(formula_result, transaction_flow=transaction_flow)
+        chart_series = bundle.chart
+        formula_state = bundle.formula_state
         confluence_snapshot = self._confluence_snapshot(
-            SignalDetailContext(
-                context=context,
-                actual_trade_date=actual_trade_date,
-                quote=detail_quote,
-                signal=signal,
-                sector_snapshot=sector_snapshot,
-                selected_sector=selected_sector,
-                position=position,
-                watchlist_item=None,
-                live_mode=live_mode,
-            ),
+            detail_info,
             chart=chart_series,
             formula_state=formula_state,
             transaction_flow=transaction_flow,
@@ -1110,8 +1379,7 @@ class DashboardService:
                 }
             )
             summary.append(
-                f"公式协议：{latest_decision.time} {latest_decision.action} · "
-                f"{latest_decision.setup} · {research_status}"
+                f"做T公式：{latest_decision.time} {latest_decision.action} · {latest_decision.setup}"
             )
             if not fast and self.settings.trajectory_enabled:
                 for decision_marker in decision_markers:
@@ -1126,8 +1394,6 @@ class DashboardService:
                         # Replay persistence is observational and must not slow
                         # or fail the detail response.
                         pass
-        elif research_status != "deployable":
-            summary.append(f"研究状态：{research_status}；{research_note}")
         if minute_error:
             summary.append(f"分钟回放不可用：{minute_error}")
         if transaction_flow.available:
@@ -1172,8 +1438,6 @@ class DashboardService:
             decision_markers=decision_markers,
             formula_state=formula_state,
             confluence_snapshot=confluence_snapshot,
-            research_status=research_status,
-            research_note=research_note,
         )
 
     def index_detail(
@@ -1330,367 +1594,6 @@ class DashboardService:
     def load_analysis(self, code: str, trade_date: str | None = None) -> AnalysisRecord | None:
         return self.analysis_store.load(code, trade_date)
 
-    def _research_validation_status(self) -> tuple[str, str]:
-        """Read the latest local protocol status without exposing report data."""
-
-        now = time.monotonic()
-        cached = self._research_validation_cache
-        if cached and now - cached[0] < 15:
-            return cached[1], cached[2]
-        status = "research_only"
-        note = "尚未生成研究协议报告，详情点只作探索性复盘"
-        payload, _ = self._latest_research_report()
-        if payload:
-            protocol = payload.get("research_protocol") or payload.get("protocol") or {}
-            validation = protocol.get("validation") if isinstance(protocol, dict) else {}
-            if isinstance(validation, dict):
-                status = str(validation.get("validation_status") or validation.get("status") or status)
-                reasons = validation.get("reasons") or []
-                if isinstance(reasons, list) and reasons:
-                    note = "；".join(str(item) for item in reasons[:2])
-                else:
-                    note = "研究协议报告已生成，仍需样本外复核"
-            elif payload.get("strategy_v3", {}).get("validation_status"):
-                status = "sample_insufficient"
-                note = "旧版研究报告尚无研究优先协议结果"
-        self._research_validation_cache = (now, status, note)
-        return status, note
-
-    def _latest_research_report(self) -> tuple[dict[str, Any] | None, str]:
-        """Load only the local research artifact; never inspect upstream keys."""
-
-        import json
-
-        root = self.settings.data_dir / "runtime" / "strategy-research"
-        full_paths = [
-            root / "latest.json",
-            root / "latest_transactions.json",
-            root / "latest_proxy.json",
-        ]
-        summary_pairs = [
-            (root / "latest_summary.json", full_paths[0]),
-            (root / "latest_transactions_summary.json", full_paths[1]),
-            (root / "latest_proxy_summary.json", full_paths[2]),
-        ]
-        paths = []
-        for summary_path, source_path in summary_pairs:
-            if not summary_path.exists():
-                continue
-            if source_path.exists() and summary_path.stat().st_mtime_ns < source_path.stat().st_mtime_ns:
-                continue
-            paths.append(summary_path)
-        paths.extend(full_paths)
-        for path in paths:
-            if not path.exists():
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            cached = self._research_report_cache
-            if (
-                cached
-                and cached[0] == str(path)
-                and cached[1] == stat.st_mtime_ns
-                and cached[2] == stat.st_size
-            ):
-                return cached[3], str(path)
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if isinstance(payload, dict):
-                self._research_report_cache = (
-                    str(path),
-                    stat.st_mtime_ns,
-                    stat.st_size,
-                    payload,
-                )
-                return payload, str(path)
-        return None, ""
-
-    @staticmethod
-    def _research_metric_summary(metrics: Any) -> dict[str, Any]:
-        if not isinstance(metrics, dict):
-            return {}
-        allowed = {
-            "count",
-            "filled_count",
-            "no_fill_count",
-            "fill_rate_pct",
-            "target_observed_count",
-            "target_first_probability_pct",
-            "mean_net_r",
-            "median_net_r",
-            "mean_net_return_pct",
-            "median_net_return_pct",
-            "mean_mfe_pct",
-            "mean_mae_pct",
-            "mae_p90_pct",
-            "profit_factor",
-            "avg_win_r",
-            "avg_loss_r",
-            "bootstrap_mean_net_r",
-            "direction_counts",
-            "setup_counts",
-        }
-        return {key: metrics[key] for key in allowed if key in metrics}
-
-    def _research_validation_summary(self, value: Any) -> dict[str, Any]:
-        if not isinstance(value, dict):
-            return {}
-        allowed = (
-            "status",
-            "validation_status",
-            "date_count",
-            "raw_label_count",
-            "independent_event_count",
-            "filled_event_count",
-            "oos_event_count",
-            "oos_filled_event_count",
-            "oos_date_count",
-            "minimum_days",
-            "minimum_validation_days",
-            "minimum_events",
-            "walk_forward_complete",
-            "deployable",
-        )
-        result = {key: value[key] for key in allowed if key in value}
-        result["reasons"] = [str(item) for item in (value.get("reasons") or []) if str(item)]
-        result["base_oos_metrics"] = self._research_metric_summary(value.get("base_oos_metrics"))
-        result["pessimistic_oos_metrics"] = self._research_metric_summary(
-            value.get("pessimistic_oos_metrics")
-        )
-        directions: dict[str, Any] = {}
-        for name, item in (value.get("direction") or {}).items():
-            if not isinstance(item, dict):
-                continue
-            direction_summary = {
-                key: item[key]
-                for key in allowed
-                if key in item
-            }
-            direction_summary["reasons"] = [
-                str(reason) for reason in (item.get("reasons") or []) if str(reason)
-            ]
-            direction_summary["base_oos_metrics"] = self._research_metric_summary(
-                item.get("base_oos_metrics")
-            )
-            direction_summary["pessimistic_oos_metrics"] = self._research_metric_summary(
-                item.get("pessimistic_oos_metrics")
-            )
-            directions[str(name)] = direction_summary
-        if directions:
-            result["direction"] = directions
-        return result
-
-    @staticmethod
-    def _research_date_stability_summary(value: Any) -> dict[str, Any]:
-        if not isinstance(value, dict):
-            return {}
-        allowed = (
-            "date_count",
-            "positive_date_count",
-            "positive_date_rate_pct",
-            "largest_absolute_date_share_pct",
-        )
-        return {key: value[key] for key in allowed if key in value}
-
-    def _research_walk_forward_summary(self, value: Any) -> dict[str, Any]:
-        if not isinstance(value, dict):
-            return {}
-        allowed = (
-            "method",
-            "event_unit",
-            "minimum_training_days",
-            "required_total_days",
-            "date_count",
-            "initial_training_dates",
-            "initial_training_independent_event_count",
-            "fold_count",
-            "oos_dates",
-            "oos_independent_event_count",
-            "extra_pessimistic_round_trip_cost_pct",
-            "available",
-            "complete",
-        )
-        result = {key: value[key] for key in allowed if key in value}
-        result["base"] = self._research_metric_summary(value.get("base"))
-        result["pessimistic"] = self._research_metric_summary(value.get("pessimistic"))
-        result["date_stability"] = self._research_date_stability_summary(
-            value.get("date_stability")
-        )
-        directions: dict[str, Any] = {}
-        for name, item in (value.get("direction") or {}).items():
-            if not isinstance(item, dict):
-                continue
-            directions[str(name)] = {
-                "base": self._research_metric_summary(item.get("base")),
-                "pessimistic": self._research_metric_summary(item.get("pessimistic")),
-                "date_stability": self._research_date_stability_summary(
-                    item.get("date_stability")
-                ),
-            }
-        if directions:
-            result["direction"] = directions
-        return result
-
-    def _research_counterfactual_summary(self, value: Any) -> dict[str, Any]:
-        if not isinstance(value, dict):
-            return {}
-        result: dict[str, Any] = {}
-        for name, item in value.items():
-            if not isinstance(item, dict):
-                continue
-
-            def estimand(payload: Any) -> dict[str, Any]:
-                if not isinstance(payload, dict):
-                    return {}
-                return {
-                    "outcomes": int(payload.get("outcomes") or 0),
-                    "independent_outcomes": int(payload.get("independent_outcomes") or 0),
-                    "metrics": self._research_metric_summary(payload.get("metrics")),
-                    "estimand": str(payload.get("estimand") or ""),
-                }
-
-            comparison = item.get("candidate_comparison")
-            result[str(name)] = {
-                "note": str(item.get("note") or ""),
-                "comparison_basis": str(item.get("comparison_basis") or ""),
-                "available_estimands": [
-                    str(entry) for entry in (item.get("available_estimands") or [])
-                ],
-                "same_event": estimand(item.get("same_event")),
-                "regenerated": estimand(item.get("regenerated")),
-                "candidate_comparison": {
-                    str(key): scalar
-                    for key, scalar in (comparison.items() if isinstance(comparison, dict) else [])
-                    if isinstance(scalar, (str, int, float, bool)) or scalar is None
-                },
-            }
-        return result
-
-    def research_status(self) -> dict[str, Any]:
-        """Return a small, credential-free status view for the research loop."""
-
-        report, path = self._latest_research_report()
-        trajectory = self.trajectory_store.status()
-        if self._last_trajectory_cleanup:
-            trajectory = {**trajectory, "last_cleanup": dict(self._last_trajectory_cleanup)}
-        if not report:
-            return {
-                "available": False,
-                "research_status": "research_only",
-                "validation_status": "research_only",
-                "note": "暂无本地研究协议报告；不会生成确定性买卖建议",
-                "report_file": "",
-                "trajectory": trajectory,
-            }
-        protocol = report.get("research_protocol") or report.get("protocol") or {}
-        protocol = protocol if isinstance(protocol, dict) else {}
-        validation = protocol.get("validation") if isinstance(protocol.get("validation"), dict) else {}
-        sample = protocol.get("sample") if isinstance(protocol.get("sample"), dict) else {}
-        selection = sample.get("selection") if isinstance(sample.get("selection"), dict) else {}
-        legacy_quality = report.get("data_quality") if isinstance(report.get("data_quality"), dict) else {}
-        protocol_quality = (
-            protocol.get("data_quality")
-            if isinstance(protocol.get("data_quality"), dict)
-            else {}
-        )
-        # Keep legacy source labels when useful, but protocol measurements are
-        # authoritative for the research run that produced the candidates.
-        quality = {**legacy_quality, **protocol_quality}
-        if "flow_mode" not in quality:
-            quality["flow_mode"] = (
-                "easy_tdx_history_transaction"
-                if quality.get("transaction_source") in {"get_history_transaction_data", "trades.history"}
-                else "minute_price_amount_proxy"
-            )
-        variants: dict[str, Any] = {}
-        for name, item in (protocol.get("variants") or {}).items():
-            if isinstance(item, dict):
-                variants[str(name)] = {
-                    "outcomes": int(item.get("outcomes") or 0),
-                    "counterfactual": bool(item.get("counterfactual")),
-                    "note": str(item.get("note") or ""),
-                    "metrics": self._research_metric_summary(item.get("metrics")),
-                }
-        status = str(validation.get("status") or validation.get("validation_status") or report.get("research_status") or "research_only")
-        limitations = protocol.get("limitations") or report.get("methodology", {}).get("limitations", [])
-        return {
-            "available": True,
-            "generated_at": str(protocol.get("generated_at") or report.get("generated_at") or ""),
-            "run_id": str(protocol.get("run_id") or ""),
-            "protocol_version": str(protocol.get("protocol_version") or ""),
-            "research_status": status,
-            "validation_status": status,
-            "validation": self._research_validation_summary(validation),
-            "sample": {
-                "sample_count": int(sample.get("sample_count") or 0),
-                "stock_day_count": int(sample.get("stock_day_count") or 0),
-                "date_count": int(sample.get("date_count") or 0),
-                "dates": [str(item) for item in (sample.get("dates") or [])],
-                "one_word_count": int(sample.get("one_word_count") or 0),
-                "no_fill_retained": bool(sample.get("no_fill_retained", True)),
-                "transaction_sample_count": int(sample.get("transaction_sample_count") or 0),
-                "auction_available_count": int(sample.get("auction_available_count") or 0),
-                "daily_regime_available_count": int(sample.get("daily_regime_available_count") or 0),
-                "selection": {
-                    "method": str(selection.get("method") or ""),
-                    "date_count": int(selection.get("date_count") or 0),
-                    "stock_day_count": int(selection.get("stock_day_count") or 0),
-                    "distinct_code_count": int(selection.get("distinct_code_count") or 0),
-                    "one_word_retained": bool(selection.get("one_word_retained", True)),
-                    "future_filter_used": bool(selection.get("future_filter_used", False)),
-                    "per_date": [
-                        {
-                            "target_date": str(item.get("target_date") or ""),
-                            "selection_date": str(item.get("selection_date") or ""),
-                            "count": int(item.get("count") or 0),
-                        }
-                        for item in (selection.get("per_date") or [])
-                        if isinstance(item, dict)
-                    ],
-                },
-            },
-            "data_quality": {
-                key: quality[key]
-                for key in (
-                    "flow_mode",
-                    "historical_transactions_requested",
-                    "transaction_source",
-                    "status",
-                    "sample_count",
-                    "minute_coverage_mean",
-                    "transaction_coverage_mean",
-                    "transaction_minute_coverage_mean",
-                    "transaction_metadata_coverage_mean",
-                    "time_gap_sample_count",
-                    "transaction_gap_sample_count",
-                    "transaction_page_metadata_sample_count",
-                    "transaction_sequence_ordered_sample_count",
-                    "direction_counts",
-                    "daily_regime_status_counts",
-                    "daily_history",
-                    "auction_available_count",
-                    "level2_available",
-                    "decision_role",
-                    "note",
-                    "limitation",
-                )
-                if key in quality
-            },
-            "data_boundary": protocol.get("data_boundary") if isinstance(protocol.get("data_boundary"), dict) else {},
-            "leakage_checks": protocol.get("leakage_checks") if isinstance(protocol.get("leakage_checks"), dict) else {},
-            "execution_model": protocol.get("execution_model") if isinstance(protocol.get("execution_model"), dict) else {},
-            "walk_forward": self._research_walk_forward_summary(protocol.get("walk_forward")),
-            "variants": variants,
-            "pareto": protocol.get("pareto") if isinstance(protocol.get("pareto"), list) else [],
-            "limitations": [str(item) for item in limitations if str(item)],
-            "report_file": path,
-            "trajectory": trajectory,
-        }
-
     def cleanup_trajectory_history(self) -> dict[str, Any]:
         if not self.settings.trajectory_cleanup_on_start:
             self._last_trajectory_cleanup = {"skipped": "disabled_by_settings", "deleted_rows": 0}
@@ -1747,49 +1650,6 @@ class DashboardService:
             )
             self._trajectory_cleanup_thread.start()
         return {"scheduled": True, "reason": reason}
-
-    def research_protocol(self) -> dict[str, Any]:
-        """Expose the registered study design and aggregate results only."""
-
-        status = self.research_status()
-        report, _ = self._latest_research_report()
-        if not report:
-            return {**status, "hypotheses": [], "counterfactuals": {}, "parameter_discovery": {}}
-        protocol = report.get("research_protocol") or report.get("protocol") or {}
-        protocol = protocol if isinstance(protocol, dict) else {}
-        manifest_summary = protocol.get("data_manifest_summary")
-        if not isinstance(manifest_summary, dict):
-            manifest_summary = summarize_data_manifests(protocol.get("data_manifests"))
-        return {
-            **status,
-            "study_name": str(protocol.get("study_name") or ""),
-            "hypotheses": protocol.get("hypotheses") if isinstance(protocol.get("hypotheses"), list) else [],
-            "config": {
-                key: protocol.get("config", {}).get(key)
-                for key in (
-                    "protocol_version",
-                    "warmup_bars",
-                    "execution_delay_bars",
-                    "outcome_horizons",
-                    "minimum_days",
-                    "out_of_sample_days",
-                    "minimum_events",
-                    "quantile_bins",
-                )
-                if isinstance(protocol.get("config"), dict) and key in protocol.get("config", {})
-            },
-            "split": protocol.get("split") if isinstance(protocol.get("split"), dict) else {},
-            "walk_forward": self._research_walk_forward_summary(protocol.get("walk_forward")),
-            "counterfactuals": self._research_counterfactual_summary(
-                protocol.get("counterfactuals")
-            ),
-            "parameter_discovery": summarize_parameter_discovery(
-                protocol.get("parameter_discovery")
-            ),
-            "matched_control": summarize_matched_control(protocol.get("matched_control")),
-            "bias_register": protocol.get("bias_register") if isinstance(protocol.get("bias_register"), list) else [],
-            "data_manifest_summary": manifest_summary,
-        }
 
     def ingest_zsxq_messages(self, payload: ZsxqMessageIngestRequest) -> ZsxqMessageIngestResponse:
         response = self.message_store.upsert_messages(payload)
@@ -2058,6 +1918,7 @@ class DashboardService:
     def collect_once(self) -> dict[str, Any]:
         """Refresh and persist one backend-owned intraday observation."""
         self.start_trajectory_cleanup_thread(reason="daily_collector")
+        self.maybe_run_f10_preopen_refresh(reason="daily_collector")
         if self._context_cache:
             active_source = str(self._context_cache.source_status.get("active_source") or "")
             if active_source == "local_trajectory_bootstrap" or (
@@ -2078,98 +1939,11 @@ class DashboardService:
         }
 
     def close(self) -> None:
-        if self.opening_window_engine is not None:
-            self.opening_window_engine.stop()
         self.trajectory_store.close()
         self.message_store.close()
-
-    # -------------------------------------------------- opening window diamonds
-    def start_opening_window_engine(self) -> None:
-        if self.opening_window_engine is not None:
-            self.opening_window_engine.start()
-
-    def opening_markers_page(
-        self,
-        trade_date: str | None = None,
-        offset: int = 0,
-        limit: int = 20,
-        side: str | None = None,
-    ) -> dict[str, Any]:
-        """Paginated diamond markers, newest first; falls back to the latest
-        persisted day outside the window so the queue stays readable."""
-        if self.opening_window_engine is not None:
-            result = self.opening_window_engine.query(trade_date, offset=offset, limit=limit, side=side)
-            items = result.get("items") or []
-            items = self._opening_markers_with_live_quotes(
-                items, self._cached_context_quotes(), requested_date=str(result.get("trade_date") or "")
-            )
-            result["items"] = self._opening_markers_with_sector_names(items)
-            return result
-        return {"trade_date": trade_date or "", "total": 0, "offset": 0, "limit": limit, "items": []}
-
-    def _opening_markers_preview(self, context: DashboardContext | None = None) -> list[dict[str, Any]]:
-        if self.opening_window_engine is None:
-            return []
-        # 共享短缓存：该预览要对全市场快照建 code->quote 映射，之前每个 WS 连接
-        # 每个 tick 各算一遍；引擎状态 6s 级变化，盘中 1s / 盘后 30s TTL 足够。
-        ttl = (
-            float(self.settings.terminal_payload_live_cache_seconds)
-            if is_trading_window()
-            else 30.0
-        )
-        signature = self._context_signature(context) if context is not None else ""
-        now = time.time()
-        with self._opening_markers_lock:
-            cached = self._opening_markers_cache
-            if cached is not None and cached[1] == signature and now - cached[0] <= ttl:
-                return [dict(item) for item in cached[2]]
-        # 今天全部菱形实时挂载（按 code+rule 去重后有界，约池子规模）
-        items = self.opening_window_engine.latest(200)
-        if context is not None:
-            trade_date = str(context.source_status.get("trade_date") or "")
-            quotes = {quote.code: quote for quote in context.snapshot.quotes}
-            items = self._opening_markers_with_live_quotes(items, quotes, requested_date=trade_date)
-        items = self._opening_markers_with_sector_names(items)
-        with self._opening_markers_lock:
-            self._opening_markers_cache = (time.time(), signature, [dict(item) for item in items])
-        return items
-
-    def _cached_context_quotes(self) -> dict[str, Any] | None:
-        """读路径实时行情：只复用仍新鲜的 context 缓存，不触发重建。"""
-        context = self._context_cache
-        if context is None or not self._context_is_fresh():
-            return None
-        return {quote.code: quote for quote in context.snapshot.quotes}
-
-    @staticmethod
-    def _opening_markers_with_live_quotes(
-        items: list[dict[str, Any]],
-        quotes: dict[str, Any] | None,
-        requested_date: str = "",
-    ) -> list[dict[str, Any]]:
-        """队列行回填实时行情：菱形信号本体（首次触发 time/first_seen、信号时刻
-        price/change_pct）不动，另挂 live_* 字段供行显示实时价格/涨幅/成交额。
-        历史日或无新鲜快照时原样返回，前端退回信号时刻快照。"""
-        if not quotes:
-            return items
-        out: list[dict[str, Any]] = []
-        for marker in items:
-            if requested_date and str(marker.get("trade_date") or "") != requested_date:
-                out.append(marker)
-                continue
-            quote = quotes.get(str(marker.get("code") or "").zfill(6))
-            if quote is None:
-                out.append(marker)
-                continue
-            out.append(
-                dict(
-                    marker,
-                    live_price=round(float(getattr(quote, "price", 0) or 0), 3),
-                    live_change_pct=round(float(getattr(quote, "change_pct", 0) or 0), 2),
-                    live_amount=float(getattr(quote, "amount", 0) or 0),
-                )
-            )
-        return out
+        pool = getattr(self, "push_pool", None)
+        if pool is not None:
+            pool.close()
 
     @staticmethod
     def _looks_like_board_code(value: str) -> bool:
@@ -2210,27 +1984,6 @@ class DashboardService:
     def _stock_board_display_map(self) -> dict[str, str]:
         """个股 → 官方板块名称（申万三级，如「网络工程施工」）。"""
         return self._stock_board_display_map_for_level(3)
-
-    def _opening_markers_with_sector_names(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """队列里的内部行业代码（X410302 等）替换为官方板块显示名。
-
-        手动主题（PCB/AI硬件等中文名）原样保留；映射不到的代码保留原值，
-        便于发现未覆盖的板块。
-        """
-        if not any(self._looks_like_board_code(str(m.get("sector") or "")) for m in items):
-            return items
-        mapping = self._stock_board_display_map()
-        if not mapping:
-            return items
-        out: list[dict[str, Any]] = []
-        for marker in items:
-            sector = str(marker.get("sector") or "")
-            if self._looks_like_board_code(sector):
-                name = mapping.get(str(marker.get("code") or "").zfill(6))
-                if name:
-                    marker = dict(marker, sector=name)
-            out.append(marker)
-        return out
 
     def _record_intraday_context(
         self,
@@ -2548,6 +2301,7 @@ class DashboardService:
             preferred_sector_names=self._manual_theme_names(themes),
             positions=position_by_code,
             formula_rows_by_code=formula_rows_by_code,
+            sector_name_mapper=self._display_sector_name,
         )
         signals_all = self._decorate_signals(signals_all, watchlist, position_by_code)
         mark_stage("signal_build_ms")
@@ -2808,8 +2562,14 @@ class DashboardService:
             preferred_sector_names=self._manual_theme_names(themes),
             positions=position_by_code,
             formula_rows_by_code=formula_rows_by_code,
+            sector_name_mapper=self._display_sector_name,
         )
         signals_all = self._decorate_signals(signals_all, watchlist, position_by_code)
+        # 实盘刷新路径专属：自选股买卖点飞书推送。「置顶买点/黄金买点」是
+        # 现价贴近最近买点的展示态，不在这里触发；本地轨迹恢复/历史回放
+        # 路径也不投递，避免重启后把旧信号当新信号推出去。
+        if snapshot.data_mode == "live" and not snapshot_frozen:
+            self._dispatch_signal_pushes(signals_all)
         mark_stage("signal_build_ms")
         core_watch = self._core_watch(signals_all, themes, watchlist)
         events = self.engine.build_events(market, sectors, signals_all, clock_label=clock_label or None)
@@ -3026,6 +2786,7 @@ class DashboardService:
             preferred_sector_names=self._manual_theme_names(current_context.themes),
             positions=position_by_code,
             formula_rows_by_code=formula_rows_by_code,
+            sector_name_mapper=self._display_sector_name,
         )
         signals_all = self._decorate_signals(
             signals_all,
@@ -3087,14 +2848,22 @@ class DashboardService:
         return f"{self.settings.data_mode}:{session}"
 
     def _decorate_sector_ranks(self, sectors: list[SectorSnapshot]) -> list[SectorSnapshot]:
+        return self._decorate_ranks(sectors, self._previous_sector_ranks)
+
+    @staticmethod
+    def _decorate_ranks(
+        sectors: list[SectorSnapshot],
+        previous_ranks: dict[str, int],
+    ) -> list[SectorSnapshot]:
         current: dict[str, int] = {}
         decorated: list[SectorSnapshot] = []
         for rank, sector in enumerate(sectors, start=1):
             current[sector.name] = rank
-            previous = self._previous_sector_ranks.get(sector.name)
+            previous = previous_ranks.get(sector.name)
             rank_change = 0 if previous is None else previous - rank
             decorated.append(sector.model_copy(update={"rank_change": rank_change}))
-        self._previous_sector_ranks = current
+        previous_ranks.clear()
+        previous_ranks.update(current)
         return decorated
 
     def _selected_sector_codes(
@@ -3173,96 +2942,18 @@ class DashboardService:
             return []
         quote_by_code = {quote.code: quote for quote in context.snapshot.quotes}
         meta_by_name = {sector.name: sector for sector in board_context.sectors}
+        float_mcaps = self._float_mcap_map()
         built: list[SectorSnapshot] = []
         for name, member_codes in members_by_sector.items():
             quotes = [quote_by_code[code] for code in member_codes if code in quote_by_code]
             if not quotes:
                 continue
             base = meta_by_name.get(name)
-            metric_quotes, excluded_quotes = self.engine.sector_metric_quotes(quotes)
-            total = len(metric_quotes)
-            raw_total = len(quotes)
-            up_count = sum(1 for quote in metric_quotes if quote.change_pct > 0)
-            down_count = sum(1 for quote in metric_quotes if quote.change_pct < 0)
-            limit_up_count = sum(1 for quote in metric_quotes if quote.limit_up)
-            opened_limit_count = sum(1 for quote in metric_quotes if quote.opened_limit)
-            avg_change = sum(quote.change_pct for quote in metric_quotes) / total
-            amount = sum(max(float(quote.amount or 0), 0) for quote in metric_quotes)
-            flow_delta = sum(
-                max(float(quote.amount or 0), 0) * max(-10.0, min(10.0, float(quote.change_pct or 0))) / 100
-                for quote in metric_quotes
-            ) / 100_000_000
-            leader = max(
-                metric_quotes,
-                key=lambda quote: (
-                    quote.change_pct,
-                    quote.minute_amount_ratio,
-                    quote.amount,
-                ),
-            )
-            core_quotes = sorted(
-                metric_quotes,
-                key=lambda quote: (
-                    quote.amount,
-                    quote.minute_amount_ratio,
-                    quote.change_pct,
-                ),
-                reverse=True,
-            )[:5]
-            core_codes = list(dict.fromkeys([leader.code, *(quote.code for quote in core_quotes)]))
-            breadth = up_count / max(total, 1)
-            amount_yi = min(amount / 100_000_000, 180)
-            attack_count = sum(
-                1
-                for quote in metric_quotes
-                if quote.limit_up or (quote.change_pct >= 2.0 and quote.minute_amount_ratio >= 1.4)
-            )
-            heat_score = int(
-                max(
-                    0,
-                    min(
-                        100,
-                        round(
-                            45
-                            + avg_change * 5.0
-                            + (breadth - 0.5) * 34
-                            + min(18, attack_count * 2.8)
-                            + min(8, amount_yi * 0.04)
-                        ),
-                    ),
-                )
-            )
-            reasons = [
-                f"成分股{raw_total}只",
-                f"均涨{avg_change:+.2f}%",
-                f"{up_count}/{total}上涨",
-                f"成交额{amount / 100_000_000:.1f}亿",
-                f"动能代理{flow_delta:+.1f}亿",
-                f"领涨{leader.name}",
-            ]
-            exclusion_reason = self.engine.sector_exclusion_reason(excluded_quotes)
-            if exclusion_reason:
-                reasons.insert(1, exclusion_reason)
             built.append(
-                SectorSnapshot(
-                    name=name,
-                    heat_score=heat_score,
-                    avg_change_pct=round(avg_change, 2),
-                    up_count=up_count,
-                    down_count=down_count,
-                    total_count=total,
-                    limit_up_count=limit_up_count,
-                    opened_limit_count=opened_limit_count,
-                    core_attack=attack_count > 0,
-                    core_codes=core_codes,
-                    leader_code=leader.code,
-                    leader_name=leader.name,
-                    reasons=reasons,
-                    flow_delta=round(flow_delta, 2),
-                    raw_total_count=raw_total,
-                    new_listing_excluded_count=len(excluded_quotes),
-                    amount=round(amount, 2),
-                    main_net_amount=0,
+                self._aggregate_sector_snapshot(
+                    name,
+                    quotes,
+                    float_mcaps,
                     board_code=base.board_code if base else board_context.name_to_code.get(name, ""),
                     board_level=board_context.board_level,
                     board_source="easy_tdx_cached_members_local_quote_aggregation",
@@ -3279,6 +2970,108 @@ class DashboardService:
         )
         return self._decorate_sector_ranks(built)
 
+    def _aggregate_sector_snapshot(
+        self,
+        name: str,
+        quotes: list[Quote],
+        float_mcaps: dict[str, float],
+        *,
+        board_code: str,
+        board_level: int,
+        board_source: str,
+    ) -> SectorSnapshot:
+        """一组成分股行情 → 强弱指标快照（官方板块与手工主题共用同一口径）。"""
+        metric_quotes, excluded_quotes = self.engine.sector_metric_quotes(quotes)
+        total = len(metric_quotes)
+        raw_total = len(quotes)
+        up_count = sum(1 for quote in metric_quotes if quote.change_pct > 0)
+        down_count = sum(1 for quote in metric_quotes if quote.change_pct < 0)
+        limit_up_count = sum(1 for quote in metric_quotes if quote.limit_up)
+        opened_limit_count = sum(1 for quote in metric_quotes if quote.opened_limit)
+        avg_change = sum(quote.change_pct for quote in metric_quotes) / total
+        amount = sum(max(float(quote.amount or 0), 0) for quote in metric_quotes)
+        flow_delta = sum(
+            max(float(quote.amount or 0), 0) * max(-10.0, min(10.0, float(quote.change_pct or 0))) / 100
+            for quote in metric_quotes
+        ) / 100_000_000
+        leader = max(
+            metric_quotes,
+            key=lambda quote: (
+                quote.change_pct,
+                quote.minute_amount_ratio,
+                quote.amount,
+            ),
+        )
+        core_quotes = sorted(
+            metric_quotes,
+            key=lambda quote: (
+                quote.amount,
+                quote.minute_amount_ratio,
+                quote.change_pct,
+            ),
+            reverse=True,
+        )[:5]
+        core_codes = list(dict.fromkeys([leader.code, *(quote.code for quote in core_quotes)]))
+        capacity_leader = self._capacity_leader(metric_quotes, float_mcaps)
+        breadth = up_count / max(total, 1)
+        amount_yi = min(amount / 100_000_000, 180)
+        attack_count = sum(
+            1
+            for quote in metric_quotes
+            if quote.limit_up or (quote.change_pct >= 2.0 and quote.minute_amount_ratio >= 1.4)
+        )
+        heat_score = int(
+            max(
+                0,
+                min(
+                    100,
+                    round(
+                        45
+                        + avg_change * 5.0
+                        + (breadth - 0.5) * 34
+                        + min(18, attack_count * 2.8)
+                        + min(8, amount_yi * 0.04)
+                    ),
+                ),
+            )
+        )
+        reasons = [
+            f"成分股{raw_total}只",
+            f"均涨{avg_change:+.2f}%",
+            f"{up_count}/{total}上涨",
+            f"成交额{amount / 100_000_000:.1f}亿",
+            f"动能代理{flow_delta:+.1f}亿",
+            f"领涨{leader.name}",
+        ]
+        exclusion_reason = self.engine.sector_exclusion_reason(excluded_quotes)
+        if exclusion_reason:
+            reasons.insert(1, exclusion_reason)
+        return SectorSnapshot(
+            name=name,
+            heat_score=heat_score,
+            avg_change_pct=round(avg_change, 2),
+            up_count=up_count,
+            down_count=down_count,
+            total_count=total,
+            limit_up_count=limit_up_count,
+            opened_limit_count=opened_limit_count,
+            core_attack=attack_count > 0,
+            core_codes=core_codes,
+            leader_code=leader.code,
+            leader_name=leader.name,
+            capacity_leader_code=capacity_leader.code if capacity_leader else None,
+            capacity_leader_name=capacity_leader.name if capacity_leader else None,
+            reasons=reasons,
+            flow_delta=round(flow_delta, 2),
+            raw_total_count=raw_total,
+            new_listing_excluded_count=len(excluded_quotes),
+            amount=round(amount, 2),
+            main_net_amount=0,
+            board_code=board_code,
+            board_level=board_level,
+            board_source=board_source,
+        )
+
     def _terminal_payload_for_context(
         self,
         context: DashboardContext,
@@ -3287,6 +3080,8 @@ class DashboardService:
         sort: str,
         page: int,
         page_size: int,
+        near_trend: bool = False,
+        pin_buy: bool = False,
     ) -> TerminalPayload:
         payload_started_at = time.perf_counter()
         stage_started_at = payload_started_at
@@ -3332,6 +3127,7 @@ class DashboardService:
             else "signal_engine_theme_rank"
         )
         mark_stage("board_member_map_ms")
+        mode = "board"
         display_sector_names = {item.name for item in display_sectors}
         legacy_sector_names = {item.name for item in context.sectors}
         selected_sector = (
@@ -3423,6 +3219,8 @@ class DashboardService:
             sort=sort,
             page=page,
             page_size=page_size,
+            near_trend=near_trend,
+            pin_buy=pin_buy,
         )
         mark_stage("stock_board_ms")
         watchlist_preview, positions_preview = self._context_watch_previews(
@@ -3434,6 +3232,7 @@ class DashboardService:
         source_status.update(
             {
                 "selected_sector": selected_sector,
+                "sector_mode": mode,
                 "board_total": board.total,
                 "board_page": board.page,
                 "board_page_size": board.page_size,
@@ -3482,6 +3281,8 @@ class DashboardService:
         sort: str,
         page: int,
         page_size: int,
+        near_trend: bool = False,
+        pin_buy: bool = False,
     ) -> TerminalPayload:
         payload_started_at = time.perf_counter()
         stage_started_at = payload_started_at
@@ -3495,6 +3296,7 @@ class DashboardService:
 
         level = normalize_board_level(board_level)
         requested_sector = self._normalize_sector(sector)
+        mode = "board"
         display_sectors = context.sectors
         display_sector_names = {item.name for item in display_sectors}
         selected_sector = requested_sector if requested_sector in display_sector_names else None
@@ -3517,6 +3319,12 @@ class DashboardService:
             board_members_by_sector={},
             sort=normalized_sort,
         )
+        near_trend_ready = 0
+        near_trend_pending = 0
+        if near_trend:
+            board_entries, near_trend_ready, near_trend_pending = self._near_trend_filter_entries(board_entries)
+        if pin_buy:
+            board_entries = self._pin_buy_entries(board_entries)
         page_count = max(1, (len(board_entries) + normalized_page_size - 1) // normalized_page_size)
         normalized_page = min(normalized_page, page_count)
         board_preview_entries = self._visible_board_entries(
@@ -3553,6 +3361,10 @@ class DashboardService:
             board_level=level,
             board_source="signal_engine_theme_rank_fast",
             include_mini_charts=False,
+            near_trend=near_trend,
+            near_trend_ready=near_trend_ready,
+            near_trend_pending=near_trend_pending,
+            pin_buy=pin_buy,
         )
         mark_stage("stock_board_ms")
         watchlist_preview, positions_preview = self._context_watch_previews(
@@ -3570,6 +3382,7 @@ class DashboardService:
         source_status.update(
             {
                 "selected_sector": selected_sector,
+                "sector_mode": mode,
                 "board_total": board.total,
                 "board_page": board.page,
                 "board_page_size": board.page_size,
@@ -3623,6 +3436,8 @@ class DashboardService:
         sort: str,
         page: int,
         page_size: int,
+        near_trend: bool = False,
+        pin_buy: bool = False,
     ) -> StockBoardPayload:
         """Build only the paged stock table.
 
@@ -3689,6 +3504,8 @@ class DashboardService:
             sort=sort,
             page=page,
             page_size=page_size,
+            near_trend=near_trend,
+            pin_buy=pin_buy,
         )
 
     def _preview_board_codes(
@@ -3979,7 +3796,7 @@ class DashboardService:
         watch_item: WatchlistItem | None = None,
         position_item: PositionRecord | None = None,
     ) -> StockBoardItem:
-        stock_type, stock_tags, is_leader = self._classify_stock(
+        stock_type, stock_tags, is_leader, is_core = self._classify_stock(
             quote,
             sector_snapshot,
             theme_core_codes,
@@ -4005,6 +3822,8 @@ class DashboardService:
             signal_source="snapshot",
         )
         activity_score = self._activity_score(quote, sector_snapshot, signal_value, stock_tags)
+        zuot_resistance, zuot_support = self._zuot_levels_for_quote(quote)
+        last_action = self._last_action_for_code(quote.code)
         return StockBoardItem(
             code=quote.code,
             name=quote.name,
@@ -4016,18 +3835,23 @@ class DashboardService:
             minute_amount_ratio=quote.minute_amount_ratio,
             rebound_from_low_pct=round(self._rebound_from_quote(quote), 2),
             pullback_from_high_pct=round(self._pullback_from_quote(quote), 2),
+            resistance=zuot_resistance,
+            support=zuot_support,
             limit_up=quote.limit_up,
             limit_down=quote.limit_down,
             opened_limit=quote.opened_limit,
             signal=signal_value.signal,
             signal_score=signal_value.score,
+            last_action=str(last_action.get("last_action") or ""),
+            last_action_price=float(last_action.get("last_action_price") or 0),
+            last_action_time=str(last_action.get("last_action_time") or ""),
             stock_type=stock_type,
             stock_tags=stock_tags,
             activity_score=round(activity_score, 1),
             sector_heat_score=sector_snapshot.heat_score if sector_snapshot else 0,
             sector_rank=self._sector_rank(display_sectors, sector_snapshot),
             leader=is_leader,
-            core=bool(quote.core or quote.code in theme_core_codes),
+            core=is_core,
             watchlisted=watch_item is not None,
             position=position_item is not None,
             updated_at=quote.updated_at,
@@ -4054,18 +3878,11 @@ class DashboardService:
         time_label = self._mini_time_label(item.signal_time or item.updated_at)
         if not time_label:
             return []
-        gold = bool(
-            signal == SignalType.BUY_T
-            and (
-                "金色共振" in str(item.signal_grade or "")
-                or "金色共振" in {str(flag) for flag in item.factor_flags}
-            )
-        )
         base_reason = "公式买入原语" if signal == SignalType.BUY_T else "公式卖出原语"
         factor_reasons = [
             str(flag)
             for flag in item.factor_flags
-            if str(flag) in {"公式买入原语", "公式卖出原语", "金色共振"}
+            if str(flag) in {"公式买入原语", "公式卖出原语"}
         ]
         reasons = list(dict.fromkeys([base_reason, *factor_reasons]))
         return [
@@ -4074,9 +3891,7 @@ class DashboardService:
                 signal=signal,
                 price=round(float(item.price or 0), 3),
                 change_pct=round(float(item.change_pct or 0), 3),
-                gold_resonance=gold,
                 reasons=reasons,
-                resonance_reasons=["金色共振"] if gold else [],
             )
         ]
 
@@ -4457,6 +4272,90 @@ class DashboardService:
             )
             self._mini_chart_warm_thread.start()
 
+    def _mini_rows_need_session_fallback(self, rows: list[dict[str, Any]], trade_date: str) -> bool:
+        """轨迹特征只覆盖盘中活跃子集；新点开/新入榜的票可能从盘中才开始有行。
+
+        行数不足、或当前已过开盘而样本仍从盘中才开始时，回退 easy_tdx 全天
+        分钟线补出早盘段，避免缩略图只显示「打开之后」的半段。
+        """
+        regular = [
+            label
+            for label in (self._mini_row_time_label(row) for row in rows)
+            if self._is_regular_mini_time(label)
+        ]
+        if len(regular) < 2:
+            return True
+        today = china_now().strftime("%Y%m%d")
+        current_label = china_now().strftime("%H:%M") if str(trade_date) == today else "15:00"
+        if current_label <= "09:35":
+            return False
+        if regular[0] > "09:35":
+            return True
+        return bool(current_label >= "14:55" and regular[-1] < "14:50")
+
+    def _mini_chart_fallback_rows_by_code(
+        self,
+        trade_date: str,
+        codes: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """用 easy_tdx 当日分钟线补轨迹库未覆盖/起步过晚的榜单缩略图。"""
+        if not codes:
+            return {}
+        context = getattr(self, "_context_cache", None)
+        quotes = list(getattr(getattr(context, "snapshot", None), "quotes", []) or [])
+        quote_by_code = {quote.code: quote for quote in quotes}
+        today = china_now().strftime("%Y%m%d")
+        live = bool(
+            str(trade_date) == today
+            and is_trading_window()
+            and not bool(getattr(getattr(context, "market", None), "frozen", False))
+        )
+
+        def load(code: str) -> tuple[str, list[dict[str, Any]]]:
+            try:
+                minute_rows = self.data_source.fetch_minute_series(code, trade_date, live=live)
+            except Exception:
+                return code, []
+            quote = quote_by_code.get(code)
+            base = float(
+                getattr(quote, "prev_close", 0)
+                or getattr(quote, "open", 0)
+                or next((float(row.get("price") or 0) for row in minute_rows if float(row.get("price") or 0) > 0), 0.0)
+            )
+            output: list[dict[str, Any]] = []
+            for row in minute_rows:
+                label = self._mini_time_label(row.get("time") or row.get("captured_at"))
+                if not self._is_regular_mini_time(label):
+                    continue
+                try:
+                    price = float(row.get("price") or 0)
+                    amount = max(float(row.get("amount") or 0), 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if price <= 0:
+                    continue
+                output.append(
+                    {
+                        "captured_at": label,
+                        "price": price,
+                        "change_pct": round((price / base - 1.0) * 100.0, 3) if base > 0 else 0.0,
+                        "amount": amount,
+                        "minute_amount": amount,
+                        "minute_amount_ratio": 1.0,
+                    }
+                )
+            return code, output
+
+        result: dict[str, list[dict[str, Any]]] = {}
+        workers = min(4, len(codes))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mini-chart-fallback") as executor:
+            futures = [executor.submit(load, code) for code in codes]
+            for future in as_completed(futures):
+                code, rows = future.result()
+                if len(rows) >= 2:
+                    result[code] = rows
+        return result
+
     def _mini_chart_warm_worker(self) -> None:
         while True:
             with self._mini_chart_warm_lock:
@@ -4475,9 +4374,24 @@ class DashboardService:
                     else:
                         fallback = getattr(self.trajectory_store, "stock_feature_series_by_code", None)
                         rows_by_code = fallback(date, codes, max_rows=MINI_CHART_SOURCE_ROWS) if callable(fallback) else {}
+                    rows_by_code = dict(rows_by_code or {})
+                    fallback_codes = [
+                        code
+                        for code in codes
+                        if self._mini_rows_need_session_fallback(list(rows_by_code.get(code) or []), date)
+                    ]
+                    fallback_rows_by_code = self._mini_chart_fallback_rows_by_code(date, fallback_codes)
                     now_ts = time.time()
-                    for code, rows in (rows_by_code or {}).items():
-                        chart = self._mini_chart_from_stock_rows(list(rows or []))
+                    for code in codes:
+                        rows = list(rows_by_code.get(code) or [])
+                        source_quality = "trajectory_stock_features"
+                        if code in fallback_rows_by_code:
+                            rows = fallback_rows_by_code[code]
+                            source_quality = "easy_tdx_minute_fallback"
+                        chart = self._mini_chart_from_stock_rows(rows)
+                        if rows and source_quality == "easy_tdx_minute_fallback":
+                            chart = chart.model_copy(update={"source_quality": source_quality})
+                        # 无数据也写入 unavailable：30s TTL 内不再反复排队扫库/请求上游。
                         self._stock_mini_chart_cache[(date, code)] = (now_ts, chart)
                 except Exception:  # pragma: no cover - 预热失败不影响请求路径
                     pass
@@ -4683,6 +4597,8 @@ class DashboardService:
         page: int,
         page_size: int,
         include_mini_charts: bool = True,
+        near_trend: bool = False,
+        pin_buy: bool = False,
     ) -> StockBoardPayload:
         allowed_sorts = {"activity", "change", "amount", "volume_ratio", "order_flow", "signal"}
         normalized_sort = sort if sort in allowed_sorts else "activity"
@@ -4697,6 +4613,12 @@ class DashboardService:
             board_members_by_sector=board_members_by_sector,
             sort=normalized_sort,
         )
+        near_trend_ready = 0
+        near_trend_pending = 0
+        if near_trend:
+            entries, near_trend_ready, near_trend_pending = self._near_trend_filter_entries(entries)
+        if pin_buy:
+            entries = self._pin_buy_entries(entries)
         total = len(entries)
         page_count = max(1, (total + normalized_page_size - 1) // normalized_page_size)
         normalized_page = min(normalized_page, page_count)
@@ -4717,7 +4639,46 @@ class DashboardService:
             board_level=board_level,
             board_source=board_source,
             include_mini_charts=include_mini_charts,
+            near_trend=near_trend,
+            near_trend_ready=near_trend_ready,
+            near_trend_pending=near_trend_pending,
+            pin_buy=pin_buy,
         )
+
+    def _near_trend_filter_entries(self, entries: list[BoardEntry]) -> tuple[list[BoardEntry], int, int]:
+        """低吸区间过滤：短期/长期线低者为底（-1%）、高者为顶（+3%），现价落区间内。
+
+        线值来自 TrendLineStore（当天持久缓存）；缺失代码后台补算，本轮先不命中，
+        返回 (过滤后 entries, 已有线值代码数, 待补算代码数)。
+        """
+        today = china_now().strftime("%Y%m%d")
+        fresh = self.trend_line_store.get_fresh((entry.quote.code for entry in entries), today)
+        missing = [entry.quote.code for entry in entries if entry.quote.code not in fresh]
+        if missing:
+            self.trend_line_store.ensure(missing, today)
+        matched = [
+            entry
+            for entry in entries
+            if entry.quote.code in fresh
+            and near_trend_match(float(entry.quote.price or 0), fresh[entry.quote.code])
+        ]
+        return matched, len(fresh), len(missing)
+
+    def _pin_buy_distance(self, entry: BoardEntry) -> float | None:
+        """最近信号是买T 且现价 ≤ 买点+1% 时返回距离（%，可为负），否则 None。"""
+        action = self._last_action_for_code(entry.quote.code)
+        if str(action.get("last_action") or "") != SignalType.BUY_T.value:
+            return None
+        price = float(entry.quote.price or 0)
+        action_price = float(action.get("last_action_price") or 0)
+        if price <= 0 or action_price <= 0:
+            return None
+        distance = (price / action_price - 1.0) * 100.0
+        return distance if distance <= 1.0 else None
+
+    def _pin_buy_entries(self, entries: list[BoardEntry]) -> list[BoardEntry]:
+        """置顶买点过滤：只保留靠近上一个买点的票（现价 ≤ 买点+1%），保持原排序。"""
+        return [entry for entry in entries if self._pin_buy_distance(entry) is not None]
 
     def _fast_stock_board_entries(
         self,
@@ -4848,6 +4809,47 @@ class DashboardService:
             for entry in entries
         ]
 
+    def _last_action_updates_for_entries(
+        self,
+        entries: list[BoardEntry],
+        trade_date: str,
+    ) -> dict[str, dict[str, Any]]:
+        """当天最近一次做T买/卖点（方向 + 触发价）。
+
+        优先读内存事件表（信号发生/详情全天公式时写入）；缓存未覆盖的可见页
+        再按全天 tick 窗口扫本地特征，避免信号回到「观察」后买卖点消失。
+        """
+        updates: dict[str, dict[str, Any]] = {}
+        if not entries or not trade_date:
+            return updates
+        trajectory_enabled = bool(getattr(self.trajectory_store, "enabled", False))
+        for entry in entries:
+            quote = entry.quote
+            cached = self._last_action_for_code(quote.code)
+            if cached:
+                updates[quote.code] = cached
+                continue
+            if not trajectory_enabled:
+                continue
+            try:
+                rows = self._feature_series_small_cached(trade_date, quote.code, max_rows=2880)
+                if len(rows) < 2:
+                    continue
+                # 全天窗口：找当天最后一次买/卖触发，而非首页提升用的最近几根
+                event = self.engine._latest_cached_zuot_event(rows, quote, recent_bars=len(rows) + 1)
+            except Exception:
+                continue
+            if not event:
+                continue
+            price = float(event.get("price") or 0)
+            if price <= 0:
+                continue
+            self._record_last_action_event(quote.code, event["signal"], price, event.get("time"))
+            cached = self._last_action_for_code(quote.code)
+            if cached:
+                updates[quote.code] = cached
+        return updates
+
     def _stock_board_from_entries(
         self,
         context: DashboardContext,
@@ -4862,8 +4864,18 @@ class DashboardService:
         board_level: int,
         board_source: str,
         include_mini_charts: bool,
+        near_trend: bool = False,
+        near_trend_ready: int = 0,
+        near_trend_pending: int = 0,
+        pin_buy: bool = False,
     ) -> StockBoardPayload:
         signal_by_code = {signal.code: signal for signal in context.signals_all}
+        trade_date = str(
+            context.source_status.get("trade_date")
+            or context.snapshot.source_status.get("trade_date")
+            or china_now().strftime("%Y%m%d")
+        )
+        last_action_updates = self._last_action_updates_for_entries(visible_entries, trade_date)
         watchlist_by_code = {item.code: item for item in context.watchlist}
         position_by_code = {item.code: item for item in self.position_store.list_items()}
         theme_core_codes = {
@@ -4904,6 +4916,26 @@ class DashboardService:
             )
             for item in visible
         ]
+        # 低吸区间标记：只针对当前可见页（≤page_size 只）查当天线值缓存，
+        # 缺失的后台补算——不开「低吸机会」开关时也能在压/支列提示，且量有界。
+        if visible:
+            today = china_now().strftime("%Y%m%d")
+            visible_codes = [item.code for item in visible]
+            fresh_lines = self.trend_line_store.get_fresh(visible_codes, today)
+            missing_codes = [code for code in visible_codes if code not in fresh_lines]
+            if missing_codes:
+                self.trend_line_store.ensure(missing_codes, today)
+            visible = [
+                item.model_copy(
+                    update={
+                        "near_zone": near_trend_match(float(item.price or 0), fresh_lines[item.code])
+                        if item.code in fresh_lines
+                        else False,
+                        **last_action_updates.get(item.code, {}),
+                    }
+                )
+                for item in visible
+            ]
         updated_at = str(context.source_status.get("clock_label") or context.market.updated_at)
         return StockBoardPayload(
             scope="full_market" if self.settings.scan_scope == "full_market" else self.settings.scan_scope,
@@ -4918,6 +4950,10 @@ class DashboardService:
             data_mode=context.snapshot.data_mode,
             frozen=context.market.frozen,
             items=visible,
+            near_trend=near_trend,
+            near_trend_ready=near_trend_ready,
+            near_trend_pending=near_trend_pending,
+            pin_buy=pin_buy,
         )
 
     def _board_sort_key_for_quote(
@@ -4931,7 +4967,7 @@ class DashboardService:
         watchlisted: bool = False,
         position: bool = False,
     ) -> tuple[Any, ...]:
-        _stock_type, stock_tags, _is_leader = self._classify_stock(
+        _stock_type, stock_tags, _is_leader, _is_core = self._classify_stock(
             quote,
             sector,
             theme_core_codes,
@@ -4965,11 +5001,17 @@ class DashboardService:
         quote: Quote,
         sector: SectorSnapshot | None,
         theme_core_codes: set[str],
-    ) -> tuple[str, list[str], bool]:
+    ) -> tuple[str, list[str], bool, bool]:
         """Classify from current market structure; names are intentionally absent."""
         strong_sector = bool(sector and sector.heat_score >= self.engine.sector_watch_score)
-        is_leader = bool(sector and sector.leader_code == quote.code)
-        is_core = bool(quote.core or quote.code in theme_core_codes or (sector and quote.code in sector.core_codes))
+        # 标签口径对齐市场通用认知：
+        # 板块龙头 = 板块领涨股（涨幅第一，同花顺/东财板块页"领涨"口径；涨幅为负是领跌，不算龙头）；
+        # 核心容量 = 板块中军（板块内流通市值第一，无市值数据回退成交额第一），
+        # 或手工主题/自选显式标记的 core。不再按"领涨+成交额前5"批发核心标签。
+        is_leader = bool(sector and sector.leader_code == quote.code and quote.change_pct > 0)
+        explicit_core = bool(quote.core or quote.code in theme_core_codes)
+        sector_core = bool(sector and sector.capacity_leader_code and sector.capacity_leader_code == quote.code)
+        is_core = explicit_core or sector_core
         flow = quote.order_flow
         attack = quote.minute_amount_ratio >= self.engine.core_attack_volume_ratio and quote.change_pct > 0
         if flow.available and flow.direction in {"买盘增强", "放量承接"} and quote.change_pct >= 0:
@@ -5015,7 +5057,7 @@ class DashboardService:
             stock_type = "掉队/抛压"
         else:
             stock_type = "普通成员"
-        return stock_type, list(dict.fromkeys(tags)), is_leader
+        return stock_type, list(dict.fromkeys(tags)), is_leader, is_core
 
     def _activity_score(
         self,
@@ -5140,6 +5182,20 @@ class DashboardService:
             return 0
         return (quote.day_high - quote.price) / quote.day_high * 100
 
+    @staticmethod
+    def _zuot_levels_for_quote(quote: Quote) -> tuple[float, float]:
+        """做T当日常量（阻力/支撑）：与详情做T公式同一套 ZuoTDayContext 口径。"""
+        from app.formula_engine import ZuoTDayContext
+
+        ctx = ZuoTDayContext(
+            prev_close=float(quote.prev_close or 0),
+            day_high=float(quote.day_high or quote.high or 0),
+            day_low=float(quote.day_low or quote.low or 0),
+        )
+        if not ctx.levels_available:
+            return 0.0, 0.0
+        return round(ctx.resistance, 3), round(ctx.support, 3)
+
     def _payload_for_context(self, context: DashboardContext, sector: str | None = None) -> DashboardPayload:
         selected_sector = self._normalize_sector(sector)
         sector_focus = next((item for item in context.sectors if item.name == selected_sector), None) if selected_sector else None
@@ -5191,12 +5247,78 @@ class DashboardService:
                 filtered.append(event)
         return filtered or list(events)
 
+    def _record_last_action_event(
+        self,
+        code: str,
+        signal: SignalType | str,
+        price: Any,
+        time_label: Any,
+    ) -> None:
+        """记录当天最近一次做T买/卖点；只按时间向前推进，不回滚到更早事件。"""
+        normalized = str(code or "").zfill(6)
+        signal_text = signal.value if isinstance(signal, SignalType) else str(signal or "")
+        if len(normalized) != 6 or signal_text not in {SignalType.BUY_T.value, SignalType.SELL_T.value}:
+            return
+        try:
+            trigger_price = float(price or 0)
+        except (TypeError, ValueError):
+            return
+        if not isfinite(trigger_price) or trigger_price <= 0:
+            return
+        label = self._mini_time_label(time_label) or china_now().strftime("%H:%M")
+        lock = getattr(self, "_last_action_lock", None)
+        store = getattr(self, "_last_action_by_code", None)
+        if lock is None or store is None:
+            return
+        with lock:
+            existing = store.get(normalized)
+            existing_time = str(existing.get("last_action_time") or "") if existing else ""
+            if existing and existing_time and label and existing_time > label:
+                return
+            store[normalized] = {
+                "last_action": signal_text,
+                "last_action_price": round(trigger_price, 3),
+                "last_action_time": label,
+            }
+
+    def _record_last_action_signals(self, signals: list[TradeSignal]) -> None:
+        """从每轮首页信号里沉淀最近一次买卖点，信号回到「观察」后仍可排序/展示。"""
+        for signal in signals:
+            if signal.signal not in {SignalType.BUY_T, SignalType.SELL_T}:
+                continue
+            self._record_last_action_event(
+                signal.code,
+                signal.signal,
+                signal.trigger_price,
+                signal.updated_at,
+            )
+
+    def _last_action_for_code(self, code: str) -> dict[str, Any]:
+        normalized = str(code or "").zfill(6)
+        lock = getattr(self, "_last_action_lock", None)
+        store = getattr(self, "_last_action_by_code", None)
+        if lock is None or store is None:
+            return {}
+        with lock:
+            return dict(store.get(normalized) or {})
+
+    def _dispatch_signal_pushes(self, signals: list[TradeSignal]) -> None:
+        """把本轮实盘信号交给飞书推送池；推送异常绝不能影响行情刷新。"""
+        pool = getattr(self, "push_pool", None)
+        if pool is None:
+            return
+        try:
+            pool.process_signals(signals)
+        except Exception:
+            logger.exception("signal push pool failed")
+
     def _decorate_signals(
         self,
         signals: list[TradeSignal],
         watchlist: list[WatchlistItem],
         positions: dict[str, PositionRecord] | None = None,
     ) -> list[TradeSignal]:
+        self._record_last_action_signals(signals)
         watchlist_map = {item.code: item for item in watchlist}
         position_map = positions or {}
         decorated: list[TradeSignal] = []
@@ -5254,13 +5376,15 @@ class DashboardService:
         state_key: str,
         sectors: list[SectorSnapshot],
     ) -> list[SectorSnapshot]:
-        """板块资金动能成员口径：热度 top-N ∪ 资金净流入 top-5，带滞回防抖。
+        """板块资金动能成员口径：资金净流入 top-5 保底 ∪ 热度 top-N 补位，带滞回防抖。
 
-        盯盘口径：入围既看攻击热度（广度/涨停/核心票），也看真金白银
-        （flow_delta > 0 的今日累计净额 top-5）——避免「净流入第一但广度
-        一般」的板块被热度榜挡在门外。上轮已展示的板块，只要仍在热度
-        top-(N+3) 或资金 top-8 内就保留，防止榜单边界板块随每次快照闪进
-        闪出。总量封顶 N+2。state_key 为空时不读写上轮名单（一次性构建）。
+        盯盘口径：这是资金动能面板，真金白银（flow_delta > 0 的今日累计净额
+        top-5）必须保底入围——旧顺序让热度 top-N 先占席、资金榜补到 cap 即止，
+        资金第 4/5 名会被热度榜挤掉（如 2026-08-17 资金第 4 的半导体设备缺席）。
+        资金保底后热度按序补到 cap，被截断的是热度榜尾部而非资金榜头部。
+        上轮已展示的板块，只要仍在热度 top-(N+3) 或资金 top-8 内就保留，防止
+        榜单边界板块随每次快照闪进闪出。总量封顶 N+2。state_key 为空时不读写
+        上轮名单（一次性构建）。
         """
         limit = max(1, int(getattr(self.engine, "sector_flow_top_n", 10) or 10))
         money_pick = 5
@@ -5272,13 +5396,13 @@ class DashboardService:
             reverse=True,
         )
         members: dict[str, SectorSnapshot] = {}
-        for sector in ranked[:limit]:
-            members.setdefault(sector.name, sector)
         for sector in money_ranked[:money_pick]:
-            if len(members) >= cap:
-                break
             if float(getattr(sector, "flow_delta", 0.0) or 0.0) > 0:
                 members.setdefault(sector.name, sector)
+        for sector in ranked[:limit]:
+            if len(members) >= cap:
+                break
+            members.setdefault(sector.name, sector)
         if not state_key:
             return list(members.values())[:cap]
         with self._sector_flow_lock:
@@ -5388,13 +5512,18 @@ class DashboardService:
             if allow_deferred:
                 # 首屏不等 80GB 轨迹库的冷读：先返回过期缓存/空，
                 # 后台重建后清终端缓存，下一轮 WS 增量带出曲线。
-                self._schedule_sector_flow_trajectory_refresh(
-                    cache_key,
-                    trade_date,
-                    sectors,
-                    member_code_loader,
-                    getattr(snapshot, "quotes", None),
-                )
+                # 快照为空（冷启动、上下文尚未就绪）时不要调度：没有 quotes
+                # 的重建无法做 L1 真值锚定，未锚定结果会占住冻结缓存 300s，
+                # 把「成交额毛口径」当成定数展示（2026-08-17 本地/生产分歧
+                # 的诱因之一）。
+                if getattr(snapshot, "quotes", None):
+                    self._schedule_sector_flow_trajectory_refresh(
+                        cache_key,
+                        trade_date,
+                        sectors,
+                        member_code_loader,
+                        snapshot.quotes,
+                    )
                 if cached and cached[1]:
                     return cached[1]
                 if getattr(self, "state_store", None) is not None:
@@ -5789,8 +5918,13 @@ class DashboardService:
     def _anchor_series_to_truth(series: SectorFlowSeries, truth_total: float | None) -> SectorFlowSeries:
         """总量锚定：分钟线形态不动，整体缩放到 L1 主动净额真值。
 
-        比值越界（含与原曲线方向矛盾）时保留原曲线——宁可显示原口径，
-        也不把一个形态可疑的缩放结果摆上台。
+        守卫只挡「方向矛盾/垃圾形态」：比值 <= 0（符号相反，含成交额口径把
+        净流入板块算成净流出的情形）或超出 [0.05, 20] 时保留原曲线。
+        不能再设 3 倍上限——成交额增量×方向形态在震荡日会正负对冲、系统性
+        低估真值（2026-08-17 种子 6.3x、消费电子组件 3.1x 都是真实情形），
+        真值本身来自收盘外/内盘计数器、覆盖率 >=80% 才到这里，量级差异不是
+        拒绝理由；被守卫静默拦下会让同一面板混排两种口径，本地/生产各漏
+        锚不同的板块，数值完全对不上。
         """
         if truth_total is None or not series.points:
             return series
@@ -5798,7 +5932,7 @@ class DashboardService:
         if shape_total == 0:
             return series
         ratio = truth_total / shape_total
-        if not 0.2 <= ratio <= 3.0:
+        if not 0.05 <= ratio <= 20.0:
             return series
         return series.model_copy(
             update={
@@ -6230,77 +6364,6 @@ class DashboardService:
             }
         )
 
-    def _fetch_replay_context(
-        self,
-        code: str,
-        trade_date: str,
-        sector: SectorSnapshot | None,
-        *,
-        live: bool,
-        source_name: str,
-    ) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]]]:
-        """Load the market and sector context used by the intraday replay.
-
-        A stock replay is more useful when its turning point is compared with
-        the index and the sector leaders at the same minute.  Keep this work
-        bounded: one index plus at most four representative stocks, fetched in
-        parallel.  Test/fake sources deliberately return no auxiliary rows so
-        unit tests remain deterministic and do not accidentally reach a live
-        data provider.
-        """
-        normalized_source = str(source_name or "").strip().lower()
-        if normalized_source in {"test", "fake", "mock", "fixture"}:
-            return [], []
-
-        representative_codes: list[str] = []
-        if sector:
-            candidates = [*sector.core_codes, sector.leader_code]
-            for candidate in candidates:
-                normalized = str(candidate or "").strip().zfill(6)
-                if normalized and normalized != code and normalized not in representative_codes:
-                    representative_codes.append(normalized)
-        representative_codes = representative_codes[:4]
-
-        def fetch_index() -> list[dict[str, Any]]:
-            try:
-                return list(self.data_source.fetch_index_minute_series("000001", trade_date, live=live) or [])
-            except Exception:
-                return []
-
-        def fetch_sector(candidate: str) -> list[dict[str, Any]]:
-            try:
-                return list(self.data_source.fetch_minute_series(candidate, trade_date, live=live) or [])
-            except Exception:
-                return []
-
-        market_rows: list[dict[str, Any]] = []
-        sector_rows: list[list[dict[str, Any]]] = []
-        jobs: dict[Any, tuple[str, str | None]] = {}
-        try:
-            with ThreadPoolExecutor(max_workers=min(4, 1 + len(representative_codes))) as executor:
-                index_future = executor.submit(fetch_index)
-                jobs[index_future] = ("index", None)
-                for candidate in representative_codes:
-                    future = executor.submit(fetch_sector, candidate)
-                    jobs[future] = ("sector", candidate)
-                for future in as_completed(jobs):
-                    kind, _candidate = jobs[future]
-                    try:
-                        rows = future.result()
-                    except Exception:
-                        rows = []
-                    if not rows:
-                        continue
-                    if kind == "index":
-                        market_rows = rows
-                    else:
-                        sector_rows.append(rows)
-        except Exception:
-            # Auxiliary context is optional.  A provider failure must not make
-            # the primary stock detail unavailable.
-            return [], []
-        return market_rows, sector_rows
-
     def _scan_items_from_quotes(self, quotes: list[Quote]) -> list[WatchlistItem]:
         return [
             WatchlistItem(
@@ -6383,15 +6446,22 @@ class DashboardService:
                 rows_by_code[code] = rows
         return rows_by_code
 
-    def _feature_series_small_cached(self, trade_date: str, code: str) -> list[dict[str, Any]]:
+    def _feature_series_small_cached(
+        self,
+        trade_date: str,
+        code: str,
+        *,
+        max_rows: int = 180,
+    ) -> list[dict[str, Any]]:
         """单票公式行的短 TTL 缓存；数据更新节奏等于采集间隔。"""
-        key = (trade_date, code)
+        bounded_rows = max(2, min(int(max_rows or 180), 2880))
+        key = (trade_date, code, bounded_rows)
         now = time.time()
         cached = self._formula_rows_small_cache.get(key)
         ttl = max(5.0, float(self.settings.background_collector_seconds))
         if cached and now - cached[0] < ttl:
             return cached[1]
-        rows = self.trajectory_store.stock_feature_series(trade_date, code, max_rows=180)
+        rows = self.trajectory_store.stock_feature_series(trade_date, code, max_rows=bounded_rows)
         self._formula_rows_small_cache[key] = (now, rows)
         if len(self._formula_rows_small_cache) > 64:
             oldest_key = min(
@@ -6471,9 +6541,13 @@ class DashboardService:
         requested_sector = self._normalize_sector(sector)
         base_context = self._get_context()
         current_context = self._context_with_client_watchlist(base_context, normalized_watchlist or None)
+        # 缓存键只用稳定维度：context.updated_at 每次全市场刷新都会变，
+        # 绑进键里等于盘中每次轮询都冷启动（分钟行+公式全部重算）。
+        # 新鲜度由短 TTL 保证，图表尾部的实时价由 _merge_live_quote_tail 合并。
         cache_key = "|".join(
             [
-                self._context_signature(base_context),
+                str(base_context.source_status.get("trade_date") or ""),
+                str(bool(base_context.market.frozen)),
                 normalized_code,
                 str(requested_sector or ""),
                 str(trade_date or ""),
@@ -6538,6 +6612,7 @@ class DashboardService:
                     preferred_sector_names={sector_snapshot.name},
                     positions={quote.code: position} if position else {},
                     formula_rows_by_code=scoped_formula_rows,
+                    sector_name_mapper=self._display_sector_name,
                 )
                 if scoped_signals:
                     scoped_signal = scoped_signals[0]
@@ -6668,20 +6743,360 @@ class DashboardService:
         except Exception:
             return {}
 
-    def _formula_series(
-        self,
-        minute_rows: list[dict[str, Any]],
-        *,
-        trend_states: list[dict[str, Any]] | None = None,
-    ) -> Any:
-        if not minute_rows:
-            return None
-        try:
-            from app.formula_engine import compute_formula_series
+    @staticmethod
+    def _day_context_for_quote(quote: Quote) -> ZuoTDayContext:
+        """做T公式日级常量输入（通达信 DYNAINFO 等价物）。
 
-            return compute_formula_series(minute_rows, trend_states=trend_states)
-        except Exception:
-            return None
+        量比无直接行情字段，沿用现有分钟量比代理；换手率需要流通股本，
+        不在分时热路径拉取 F10，缺省时前端显示 --。
+        """
+        flow = quote.order_flow
+        return ZuoTDayContext(
+            prev_close=float(quote.prev_close or 0),
+            day_high=float(quote.day_high or 0),
+            day_low=float(quote.day_low or 0),
+            change_pct=float(quote.change_pct or 0),
+            volume_ratio=float(quote.minute_amount_ratio or 1) or 1.0,
+            turnover_rate=None,
+            total_amount=float(quote.amount or 0),
+            outer_volume=float(flow.active_buy_volume or 0),
+            inner_volume=float(flow.active_sell_volume or 0),
+        )
+
+    def _stock_detail_bundle(self, info: SignalDetailContext) -> StockDetailBundle:
+        """详情页共享 bundle：分钟行 + 分时序列 + 做T公式 + 买卖标记。
+
+        chart/overlay/详情三个入口共用同一份计算结果；新做T公式为 O(n)
+        递推，重建成本毫秒级，缓存只用于削掉并发重复与高频轮询抖动。
+        """
+        cache_key = "|".join(
+            [
+                info.actual_trade_date,
+                info.quote.code,
+                str(bool(info.live_mode)),
+            ]
+        )
+
+        def build() -> StockDetailBundle:
+            shared = self._shared_stock_chart_rows(info)
+            rows = shared.rows
+            chart = self._detail_chart_series(info, rows)
+            formula_rows = self._formula_rows_for_detail(info, rows)
+            day = self._day_context_for_quote(info.quote)
+            formula_result = None
+            if formula_rows:
+                try:
+                    formula_result = compute_zuot_series(formula_rows, day)
+                except Exception:
+                    formula_result = None
+            formula_state = self._zuot_state_model(formula_result)
+            formula_overlay = self._zuot_formula_overlay(formula_result, info.quote.prev_close)
+            markers = self._zuot_overlay_markers(info, formula_result)
+            if markers:
+                # 详情页拿的是全天分钟公式；把最后一个买卖点回填给榜单的全天窗口缓存。
+                latest = markers[-1]
+                self._record_last_action_event(info.quote.code, latest.signal, latest.price, latest.time)
+            summary = self._detail_chart_summary(info, chart)
+            return StockDetailBundle(
+                rows=rows,
+                chart=chart,
+                formula_result=formula_result,
+                formula_state=formula_state,
+                formula_overlay=formula_overlay,
+                markers=markers,
+                summary=summary,
+                error=shared.error,
+            )
+
+        ttl = 4.0 if info.live_mode else 30.0
+        return self._cached_value(
+            self._detail_bundle_cache,
+            self._detail_bundle_cache_lock,
+            self._detail_bundle_build_locks,
+            cache_key,
+            ttl,
+            build,
+            max_entries=24,
+        )
+
+    @staticmethod
+    def _zuot_state_model(formula_result: Any) -> FormulaState:
+        latest = getattr(formula_result, "latest", None) if formula_result is not None else None
+        if not latest:
+            return FormulaState()
+        data = {
+            key: value
+            for key, value in dict(latest).items()
+            if key in FormulaState.model_fields
+        }
+        data["price"] = float(dict(latest).get("close") or 0)
+        data["source_quality"] = str(dict(latest).get("source_quality") or SIGNAL_VERSION)
+        return FormulaState(**data)
+
+    @staticmethod
+    def _zuot_formula_overlay(formula_result: Any, prev_close: float) -> FormulaOverlay:
+        day = getattr(formula_result, "day", None) if formula_result is not None else None
+        base = float(prev_close or 0)
+        if day is None or base <= 0 or not day.levels_available:
+            return FormulaOverlay()
+
+        def pct(value: float) -> float:
+            return round((float(value) / base - 1.0) * 100.0, 3)
+
+        return FormulaOverlay(
+            available=True,
+            resistance_pct=pct(day.resistance),
+            support_pct=pct(day.support),
+            resistance=round(float(day.resistance), 3),
+            support=round(float(day.support), 3),
+        )
+
+    def _zuot_overlay_markers(
+        self,
+        info: SignalDetailContext,
+        formula_result: Any,
+    ) -> list[SignalDetailOverlayMarker]:
+        """做T公式买卖标记：买=LONGCROSS(支撑,现价,2)，卖=LONGCROSS(现价,阻力,2)。"""
+        states = list(getattr(formula_result, "states", []) or []) if formula_result is not None else []
+        if not states:
+            return []
+        has_position = bool(info.position and info.position.quantity > 0)
+        t_plus_one_restricted = bool(has_position and info.position.available_quantity <= 0)
+        prev_close = float(info.quote.prev_close or 0)
+        markers: list[SignalDetailOverlayMarker] = []
+        for index, state in enumerate(states):
+            side = "buy" if state.get("buy_signal") else "sell" if state.get("sell_signal") else ""
+            if not side:
+                continue
+            price = float(state.get("close") or 0)
+            change_pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
+            time_label = str(state.get("time") or "")[:5]
+            if side == "buy":
+                reasons = ["LONGCROSS(支撑,现价,2) 回踩支撑↖买"]
+                risks: list[str] = []
+                invalidation = float(state.get("support") or 0)
+            else:
+                reasons = ["LONGCROSS(现价,阻力,2) 冲高兑现↗卖"]
+                risks = []
+                if t_plus_one_restricted:
+                    risks.append("A股T+1限制：当前持仓可卖数量为0")
+                elif not has_position:
+                    risks.append("未录入本地持仓，绿色卖T仅作风险提示")
+                invalidation = float(state.get("resistance") or 0)
+            markers.append(
+                SignalDetailOverlayMarker(
+                    id=f"zuot|{time_label}|{side}|{index}",
+                    time=time_label,
+                    signal=SignalType.BUY_T if side == "buy" else SignalType.SELL_T,
+                    price=round(price, 2),
+                    change_pct=round(change_pct, 2),
+                    phase=SignalPhase.CONFIRM.value if side == "buy" else SignalPhase.SELL_CONFIRM.value,
+                    reasons=reasons,
+                    risks=risks,
+                    invalidation_price=round(invalidation, 2),
+                    source_quality=SIGNAL_VERSION,
+                    direction=TradeDirection.POSITIVE_T.value if side == "buy" else TradeDirection.REVERSE_T.value,
+                    action=TradeAction.BUY_T.value if side == "buy" else TradeAction.SELL_BASE.value,
+                    setup="zuot_support_rebound" if side == "buy" else "zuot_resistance_fade",
+                    regime=SIGNAL_VERSION,
+                    executable=False,
+                    execution_reason="做T公式信号；执行前需结合持仓与L1逐笔确认",
+                    t_plus_one_restricted=t_plus_one_restricted,
+                )
+            )
+        return markers
+
+    def _zuot_risk_reward(self, info: SignalDetailContext, formula_state: FormulaState) -> RiskRewardPlan:
+        """用做T公式的阻力/支撑给出当前价位的盈亏比计划（支撑低吸→阻力高抛）。"""
+        price = float(info.quote.price or 0)
+        support = float(formula_state.support or 0)
+        resistance = float(formula_state.resistance or 0)
+        if price <= 0 or support <= 0 or resistance <= support:
+            return RiskRewardPlan(context="等待阻力/支撑有效")
+        risk_pct = (price - support) / price * 100
+        reward_pct = (resistance - price) / price * 100
+        ratio = reward_pct / risk_pct if risk_pct > 0 else 0.0
+        min_required = 1.5
+        favorable = bool(risk_pct > 0 and ratio >= min_required)
+        return RiskRewardPlan(
+            available=True,
+            favorable=favorable,
+            context="支撑低吸 → 阻力高抛" if favorable else "当前价位盈亏比不足",
+            structure="阻力/支撑通道",
+            status="盈亏比占优" if favorable else "盈亏比不足",
+            direction=TradeDirection.POSITIVE_T.value,
+            action=TradeAction.BUY_T.value,
+            entry_price=round(price, 2),
+            support_price=round(support, 2),
+            invalidation_price=round(support, 2),
+            target_price=round(resistance, 2),
+            risk_pct=round(risk_pct, 2),
+            expected_reward_pct=round(reward_pct, 2),
+            reward_risk_ratio=round(ratio, 2),
+            min_required_ratio=min_required,
+            reasons=[f"目标阻力 {resistance:.2f} / 失效支撑 {support:.2f}"],
+            risks=[] if favorable else ["现价距阻力过近或已跌破支撑，等待回踩"],
+        )
+
+    def _zuot_replay(
+        self,
+        info: SignalDetailContext,
+        bundle: StockDetailBundle,
+        *,
+        transaction_flow: TransactionFlowObservation | None = None,
+    ) -> tuple[list[ReplayPoint], list[ReplayMarker], list[ReplayMarker], list[str]]:
+        """分钟回放点 + 做T买卖标记（买卖点的唯一来源：做T公式.md）。"""
+        chart = bundle.chart
+        if not chart.point_count:
+            return [], [], [], ["暂无分钟回放数据"]
+        states = list(getattr(bundle.formula_result, "states", []) or [])
+        has_position = bool(info.position and info.position.quantity > 0)
+        t_plus_one_restricted = bool(has_position and info.position.available_quantity <= 0)
+        tx_available = bool(transaction_flow and transaction_flow.available)
+
+        replay_points: list[ReplayPoint] = []
+        markers: list[ReplayMarker] = []
+        running_low = chart.prices[0] if chart.prices else 0.0
+        running_high = running_low
+        for index in range(chart.point_count):
+            price = chart.prices[index]
+            running_low = min(running_low, price)
+            running_high = max(running_high, price)
+            rebound = (price - running_low) / running_low * 100 if running_low else 0.0
+            pullback = (running_high - price) / running_high * 100 if running_high else 0.0
+            state = states[index] if index < len(states) else {}
+            buy = bool(state.get("buy_signal"))
+            sell = bool(state.get("sell_signal"))
+            point_signal = SignalType.BUY_T if buy else SignalType.SELL_T if sell else SignalType.WATCH
+            if buy:
+                point_reasons = ["LONGCROSS(支撑,现价,2) 回踩支撑↖买"]
+                point_risks: list[str] = []
+                invalidation = float(state.get("support") or 0)
+            elif sell:
+                point_reasons = ["LONGCROSS(现价,阻力,2) 冲高兑现↗卖"]
+                point_risks = []
+                if t_plus_one_restricted:
+                    point_risks.append("A股T+1限制：当前持仓可卖数量为0")
+                elif not has_position:
+                    point_risks.append("未录入本地持仓，绿色卖T仅作风险提示")
+                invalidation = float(state.get("resistance") or 0)
+            else:
+                point_reasons = []
+                point_risks = []
+                invalidation = 0.0
+            point_phase = (
+                SignalPhase.CONFIRM.value
+                if buy
+                else SignalPhase.SELL_CONFIRM.value
+                if sell
+                else SignalPhase.OBSERVE.value
+            )
+            point_action = (
+                TradeAction.BUY_T.value if buy else TradeAction.SELL_BASE.value if sell else TradeAction.OBSERVE.value
+            )
+            point_direction = (
+                TradeDirection.POSITIVE_T.value
+                if buy
+                else TradeDirection.REVERSE_T.value
+                if sell
+                else TradeDirection.NONE.value
+            )
+            factor_scores = {
+                "大单净额_万": float(state.get("fund_flow") or 0),
+                "大单买_万": float(state.get("big_buy_amount") or 0),
+                "大单卖_万": float(state.get("big_sell_amount") or 0),
+            }
+            replay_points.append(
+                ReplayPoint(
+                    time=chart.times[index],
+                    price=price,
+                    change_pct=chart.change_pcts[index],
+                    rebound_from_low_pct=round(rebound, 2),
+                    pullback_from_high_pct=round(pullback, 2),
+                    volume=chart.volumes[index],
+                    minute_amount_ratio=chart.amount_ratios[index],
+                    signal=point_signal,
+                    reasons=point_reasons,
+                    factor_flags=["公式买入原语"] if buy else ["公式卖出原语"] if sell else [],
+                    vwap=chart.vwaps[index],
+                    flow_score=chart.flow_scores[index],
+                    signal_grade="公式买T" if buy else "公式卖T" if sell else "观察",
+                    phase=point_phase,
+                    risks=point_risks,
+                    invalidation_price=round(invalidation, 2),
+                    source_quality=SIGNAL_VERSION,
+                    factor_scores=factor_scores,
+                    t_plus_one_restricted=t_plus_one_restricted,
+                    direction=point_direction,
+                    action=point_action,
+                    setup="zuot_support_rebound" if buy else "zuot_resistance_fade" if sell else "",
+                    regime=SIGNAL_VERSION,
+                    executable=False,
+                    execution_reason="做T公式信号；执行前需结合持仓与L1逐笔确认" if point_signal != SignalType.WATCH else "",
+                    evidence_sequence=point_reasons,
+                )
+            )
+            if buy or sell:
+                markers.append(
+                    ReplayMarker(
+                        time=chart.times[index],
+                        signal=point_signal,
+                        price=price,
+                        change_pct=chart.change_pcts[index],
+                        reasons=point_reasons,
+                        factor_flags=["公式买入原语"] if buy else ["公式卖出原语"],
+                        signal_grade="公式买T" if buy else "公式卖T",
+                        phase=point_phase,
+                        risks=point_risks,
+                        invalidation_price=round(invalidation, 2),
+                        source_quality=SIGNAL_VERSION,
+                        factor_scores=factor_scores,
+                        t_plus_one_restricted=t_plus_one_restricted,
+                        direction=point_direction,
+                        action=point_action,
+                        setup="zuot_support_rebound" if buy else "zuot_resistance_fade",
+                        regime=SIGNAL_VERSION,
+                        executable=False,
+                        execution_reason="做T公式信号；执行前需结合持仓与L1逐笔确认",
+                        evidence_sequence=point_reasons,
+                    )
+                )
+
+        timeline: list[ReplayMarker] = list(markers)
+        if replay_points:
+            first_point = replay_points[0]
+            timeline.insert(
+                0,
+                ReplayMarker(
+                    time=first_point.time,
+                    signal=SignalType.WATCH,
+                    price=first_point.price,
+                    change_pct=first_point.change_pct,
+                    reasons=["开盘观察，等待做T公式买卖信号"],
+                    phase=SignalPhase.OBSERVE.value,
+                    source_quality=SIGNAL_VERSION,
+                ),
+            )
+
+        buy_count = sum(1 for marker in markers if marker.signal == SignalType.BUY_T)
+        sell_count = sum(1 for marker in markers if marker.signal == SignalType.SELL_T)
+        summary = [
+            "公式引擎：做T买卖点唯一来源为 做T公式.md（阻力/支撑/均线系统）",
+            f"分钟点 {len(replay_points)} 个",
+        ]
+        if chart.prices:
+            summary.append(f"区间 {min(chart.prices):.2f} - {max(chart.prices):.2f}")
+        summary.append(f"公式信号 买T {buy_count} / 卖T {sell_count}")
+        if tx_available and transaction_flow:
+            summary.append(
+                f"L1成交流 {transaction_flow.count}笔，方向差{transaction_flow.imbalance_pct:+.1f}%；"
+                "只作承接/抛压确认，不单独生成买卖点"
+            )
+        if info.selected_sector:
+            summary.append(f"板块视图 {info.selected_sector}")
+        if not markers:
+            summary.append("未出现做T公式买卖信号")
+        return replay_points, markers, timeline, summary
 
     def _formula_rows_for_detail(
         self,
@@ -6747,231 +7162,6 @@ class DashboardService:
             )
         return output
 
-    def _trend_states_for_detail(
-        self,
-        info: SignalDetailContext,
-        minute_rows: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        if not minute_rows:
-            return []
-        last_row = minute_rows[-1]
-        cache_key = (
-            info.quote.code,
-            info.actual_trade_date,
-            len(minute_rows),
-            str(last_row.get("time") or last_row.get("datetime") or "")[:5],
-            self._safe_float(last_row.get("close") or last_row.get("price") or last_row.get("last")),
-        )
-        now = time.time()
-        cached = self._trend_states_cache.get(cache_key)
-        if cached and now - cached[0] < 60:
-            return [dict(state) for state in cached[1]]
-        states = self._compute_trend_states_for_detail(info, minute_rows)
-        self._trend_states_cache[cache_key] = (now, [dict(state) for state in states])
-        if len(self._trend_states_cache) > 64:
-            oldest_key = min(self._trend_states_cache, key=lambda key: self._trend_states_cache[key][0])
-            self._trend_states_cache.pop(oldest_key, None)
-        return states
-
-    def _compute_trend_states_for_detail(
-        self,
-        info: SignalDetailContext,
-        minute_rows: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        try:
-            daily_rows = self.data_source.fetch_daily_kline_rows(info.quote.code, count=180)
-        except Exception:
-            return []
-        prior_rows = self._daily_trend_prefix_rows(daily_rows, info.actual_trade_date)
-        if not prior_rows:
-            return []
-        try:
-            from app.formula_engine import compute_trend_line_series
-        except Exception:
-            return []
-
-        raw_prices = [
-            self._safe_float(row.get("close") or row.get("price") or row.get("last"))
-            for row in minute_rows
-        ]
-        prices = self.engine._normalize_replay_prices(
-            raw_prices,
-            info.quote.prev_close,
-            info.quote.day_low,
-            info.quote.day_high,
-        )
-        fallback_times = self.engine._session_times(len(minute_rows))
-        states: list[dict[str, Any]] = []
-        base_rows = prior_rows[-160:]
-        for idx, price in enumerate(prices):
-            if price <= 0:
-                continue
-            row = minute_rows[idx]
-            time_label = str(
-                row.get("time")
-                or row.get("datetime")
-                or (fallback_times[idx] if idx < len(fallback_times) else "")
-            )[:5]
-            trend_rows = [
-                *base_rows,
-                {
-                    "date": info.actual_trade_date,
-                    "time": time_label,
-                    "open": price,
-                    "high": price,
-                    "low": price,
-                    "close": price,
-                    "price": price,
-                },
-            ]
-            result = compute_trend_line_series(
-                trend_rows,
-                source_quality="tdx_formula_daily_trend_intraday",
-            )
-            state = self._formula_state_dict(result.latest)
-            if not state:
-                continue
-            state["time"] = time_label
-            state["trend_source_quality"] = "tdx_formula_daily_trend_intraday"
-            states.append(state)
-        return states
-
-    def _daily_trend_prefix_rows(
-        self,
-        daily_rows: list[dict[str, Any]],
-        trade_date: str,
-    ) -> list[dict[str, Any]]:
-        normalized: list[dict[str, Any]] = []
-        for row in daily_rows:
-            if not isinstance(row, dict):
-                continue
-            date = self._date_from_trend_row(row)
-            close = self._safe_float(row.get("close") or row.get("price") or row.get("last"))
-            if not date or close <= 0:
-                continue
-            if date >= str(trade_date or ""):
-                continue
-            normalized.append(
-                {
-                    "date": date,
-                    "open": self._safe_float(row.get("open"), close),
-                    "high": self._safe_float(row.get("high"), close),
-                    "low": self._safe_float(row.get("low"), close),
-                    "close": close,
-                    "price": close,
-                }
-            )
-        normalized.sort(key=lambda row: str(row.get("date") or ""))
-        return normalized
-
-    @staticmethod
-    def _date_from_trend_row(row: dict[str, Any]) -> str:
-        value = row.get("date") or row.get("trade_date") or row.get("datetime") or row.get("time")
-        if hasattr(value, "strftime"):
-            try:
-                return value.strftime("%Y%m%d")
-            except Exception:
-                return ""
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        digits = "".join(ch for ch in text[:10] if ch.isdigit())
-        return digits[:8] if len(digits) >= 8 else ""
-
-    def _formula_state_from_series(
-        self,
-        formula_result: Any,
-        *,
-        transaction_flow: TransactionFlowObservation | None = None,
-    ) -> FormulaState:
-        states = list(getattr(formula_result, "states", []) or []) if formula_result is not None else []
-        latest = getattr(formula_result, "latest", None) if formula_result is not None else None
-        raw = self._formula_state_dict(latest or (states[-1] if states else {}))
-        if not raw:
-            return FormulaState()
-        l1_pressure = self._l1_sell_pressure(transaction_flow)
-        l1_support = self._l1_buy_support(transaction_flow)
-        buy_candidate = bool(
-            self._formula_state_raw_value(raw, "buy_candidate", default=False)
-            or self._formula_state_raw_value(raw, "赶快出手", "fast_trigger", default=False)
-            or self._safe_float(self._formula_state_raw_value(raw, "主力吸筹", "main_absorption")) > 0
-        )
-        gold, reasons = self._evaluate_gold_resonance(
-            raw,
-            buy_candidate=buy_candidate,
-            l1_sell_pressure=l1_pressure,
-            l1_buy_support=l1_support,
-        )
-        raw["gold_resonance"] = gold
-        raw["是否金色共振"] = gold
-        raw["resonance_reasons"] = reasons
-        return self._formula_state_model(raw, point_count=len(states))
-
-    def _formula_state_model(self, raw: dict[str, Any], *, point_count: int = 0) -> FormulaState:
-        duo = self._safe_float(self._formula_state_raw_value(raw, "多方力度", "duo_strength"))
-        kong = self._safe_float(self._formula_state_raw_value(raw, "空方力度", "kong_strength"))
-        absorption = self._safe_float(self._formula_state_raw_value(raw, "主力吸筹", "main_absorption"))
-        fast_trigger = bool(self._formula_state_raw_value(raw, "赶快出手", "fast_trigger", default=False))
-        protection = self._safe_float(self._formula_state_raw_value(raw, "今日保护价", "protection_price"))
-        white = self._safe_float(self._formula_state_raw_value(raw, "白线", "white_line"))
-        yellow = self._safe_float(self._formula_state_raw_value(raw, "黄线", "yellow_line"))
-        white_distance = self._safe_float(self._formula_state_raw_value(raw, "白线距离_pct", "white_distance_pct"))
-        yellow_distance = self._safe_float(self._formula_state_raw_value(raw, "黄线距离_pct", "yellow_distance_pct"))
-        trend_distance = self._safe_float(
-            self._formula_state_raw_value(raw, "趋势线最近距离_pct", "trend_distance_pct"),
-            min(abs(white_distance), abs(yellow_distance)) if (white_distance or yellow_distance) else 0,
-        )
-        trend_threshold = self._safe_float(
-            self._formula_state_raw_value(raw, "趋势线接近阈值_pct", "near_trend_threshold_pct"),
-            3.0,
-        )
-        near = bool(self._formula_state_raw_value(raw, "是否接近趋势线", "near_trend_line", default=False))
-        near_name = str(self._formula_state_raw_value(raw, "near_trend_line_name", default="") or "")
-        gold = bool(self._formula_state_raw_value(raw, "是否金色共振", "gold_resonance", default=False))
-        reasons = [
-            str(item)
-            for item in self._formula_state_raw_value(raw, "resonance_reasons", default=[]) or []
-            if str(item)
-        ]
-        data = {
-            "多方力度": round(duo, 3),
-            "空方力度": round(kong, 3),
-            "主力吸筹": round(absorption, 3),
-            "赶快出手": fast_trigger,
-            "今日保护价": round(protection, 3),
-            "白线": round(white, 3),
-            "黄线": round(yellow, 3),
-            "白线距离_pct": round(white_distance, 3),
-            "黄线距离_pct": round(yellow_distance, 3),
-            "趋势线最近距离_pct": round(trend_distance, 3),
-            "趋势线接近阈值_pct": round(trend_threshold, 3),
-            "是否接近趋势线": near,
-            "是否金色共振": gold,
-            "duo_strength": round(duo, 3),
-            "kong_strength": round(kong, 3),
-            "main_absorption": round(absorption, 3),
-            "fast_trigger": fast_trigger,
-            "protection_price": round(protection, 3),
-            "white_line": round(white, 3),
-            "yellow_line": round(yellow, 3),
-            "white_distance_pct": round(white_distance, 3),
-            "yellow_distance_pct": round(yellow_distance, 3),
-            "trend_distance_pct": round(trend_distance, 3),
-            "near_trend_threshold_pct": round(trend_threshold, 3),
-            "near_trend_line": near,
-            "near_trend_line_name": near_name,
-            "gold_resonance": gold,
-            "resonance_reasons": reasons,
-            "source_quality": str(raw.get("source_quality") or "tdx_formula"),
-            "trend_source_quality": str(raw.get("trend_source_quality") or "trend_unavailable"),
-            "point_count": int(point_count or raw.get("point_count") or 0),
-            "trigger_note": str(
-                raw.get("trigger_note")
-                or "赶快出手源码为0；实盘触发按CROSS(多方力度,6.78)观察"
-            ),
-        }
-        return FormulaState(**data)
-
     @staticmethod
     def _l1_sell_pressure(transaction_flow: TransactionFlowObservation | None) -> bool:
         if not transaction_flow or not transaction_flow.available:
@@ -6991,55 +7181,6 @@ class DashboardService:
             or transaction_flow.imbalance_pct >= 18
             or transaction_flow.large_imbalance_pct >= 8
         )
-
-    def _evaluate_gold_resonance(
-        self,
-        formula_state: dict[str, Any],
-        *,
-        buy_candidate: bool,
-        l1_sell_pressure: bool,
-        l1_buy_support: bool,
-    ) -> tuple[bool, list[str]]:
-        try:
-            from app.formula_engine import evaluate_gold_resonance
-
-            gold, reasons = evaluate_gold_resonance(
-                formula_state,
-                buy_candidate=buy_candidate,
-                l1_sell_pressure=l1_sell_pressure,
-                l1_buy_support=l1_buy_support,
-            )
-            return bool(gold), [str(item) for item in reasons]
-        except Exception:
-            if not buy_candidate or l1_sell_pressure:
-                return False, ["L1抛压否决"] if l1_sell_pressure else []
-            formula_buy_candidate = bool(
-                self._formula_state_raw_value(formula_state, "buy_candidate", default=False)
-            )
-            fast = bool(self._formula_state_raw_value(formula_state, "赶快出手", "fast_trigger", default=False))
-            absorption = self._safe_float(
-                self._formula_state_raw_value(formula_state, "主力吸筹", "main_absorption")
-            )
-            near = bool(
-                self._formula_state_raw_value(formula_state, "是否接近趋势线", "near_trend_line", default=False)
-            )
-            if not (formula_buy_candidate or fast or absorption > 0):
-                return False, ["非公式买T候选"]
-            if not near:
-                return False, []
-            reasons: list[str] = []
-            if fast and absorption > 0:
-                reasons.append("赶快出手+主力吸筹")
-            elif fast:
-                reasons.append("赶快出手=CROSS(多方力度,6.78)")
-            elif absorption > 0:
-                reasons.append("主力吸筹>0")
-            elif formula_buy_candidate:
-                reasons.append("公式买T候选")
-            reasons.append("接近白/黄趋势线")
-            if l1_buy_support:
-                reasons.append("L1逐笔买盘支持")
-            return True, reasons
 
     def _confluence_snapshot(
         self,
@@ -7065,7 +7206,7 @@ class DashboardService:
         score += 20 if volume_expanding else 0
         score += 25 if sector_attack else 0
         score += 20 if index_turning else 0
-        score += 10 if formula_state.gold_resonance else 0
+        score += 10 if formula_state.buy_signal else 0
         summary = []
         summary.append("L1承接增强" if tx_support else "L1抛压" if tx_pressure else "L1成交流待确认")
         summary.append("分时放量" if volume_expanding else "量能平稳")
@@ -7122,9 +7263,8 @@ class DashboardService:
         """
         cache_key = "|".join(
             [
-                self._context_signature(info.context),
-                info.quote.code,
                 info.actual_trade_date,
+                info.quote.code,
                 str(bool(info.live_mode)),
             ]
         )
@@ -7297,252 +7437,6 @@ class DashboardService:
         return summary
 
     @staticmethod
-    def _overlay_side(marker: ReplayMarker) -> str:
-        action = str(marker.action or "").strip()
-        phase = str(marker.phase or "").strip()
-        signal = marker.signal
-        if action in {"buy_t", "buyback", "risk_rebuy"} and (
-            phase in {SignalPhase.CONFIRM.value, SignalPhase.RETEST_ADD.value}
-            or signal == SignalType.BUY_T
-        ):
-            return "buy"
-        if action in {"sell_old", "sell_base"} and (
-            phase in {SignalPhase.SELL_CONFIRM.value, SignalPhase.DEFENSE.value}
-            or signal == SignalType.SELL_T
-        ):
-            return "sell"
-        if signal == SignalType.BUY_T and phase not in {SignalPhase.PRE_ALERT.value, SignalPhase.CANCEL.value}:
-            return "buy"
-        if signal == SignalType.SELL_T and phase not in {SignalPhase.REDUCE_ALERT.value, SignalPhase.CANCEL.value}:
-            return "sell"
-        return ""
-
-    def _confirmed_overlay_markers(
-        self,
-        markers: list[ReplayMarker],
-        reference_points: list[dict[str, Any]],
-    ) -> list[SignalDetailOverlayMarker]:
-        if not markers:
-            return []
-        def _field(obj: Any, name: str, default: Any = None) -> Any:
-            if isinstance(obj, dict):
-                return obj.get(name, default)
-            return getattr(obj, name, default)
-
-        point_by_time = {
-            str(_field(point, "time", "") or "")[:5]: (index, point)
-            for index, point in enumerate(reference_points)
-        }
-        candidates: list[tuple[int, str, SignalDetailOverlayMarker]] = []
-        for index, marker in enumerate(markers):
-            raw_time = str(marker.time or "")
-            source_point = None
-            point_index = index
-            if raw_time.lower().startswith("bar_"):
-                try:
-                    bar_index = int(raw_time.split("_", 1)[1])
-                except Exception:
-                    bar_index = -1
-                if 0 <= bar_index < len(reference_points):
-                    source_point = reference_points[bar_index]
-                    point_index = bar_index
-            if source_point is None:
-                lookup = point_by_time.get(raw_time[:5])
-                if lookup is not None:
-                    point_index, source_point = lookup
-            side = self._overlay_side(marker)
-            if not side:
-                continue
-            if source_point is not None:
-                time_label = str(_field(source_point, "time", raw_time) or raw_time)[:5]
-                price = float(marker.price or _field(source_point, "price", 0) or 0)
-                change_pct = float(marker.change_pct or _field(source_point, "change_pct", 0) or 0)
-                source_quality = str(marker.source_quality or _field(source_point, "source_quality", "minute_proxy") or "minute_proxy")
-                invalidation_price = float(marker.invalidation_price or _field(source_point, "invalidation_price", 0) or 0)
-                exit_score = int(marker.exit_score or _field(source_point, "exit_score", 0) or 0)
-            else:
-                time_label = raw_time[:5]
-                price = float(marker.price or 0)
-                change_pct = float(marker.change_pct or 0)
-                source_quality = str(marker.source_quality or "minute_proxy")
-                invalidation_price = float(marker.invalidation_price or 0)
-                exit_score = int(marker.exit_score or 0)
-            market_event = str(marker.market_event or (_field(source_point, "market_event", "") if source_point is not None else ""))
-            sector_event = str(marker.sector_event or (_field(source_point, "sector_event", "") if source_point is not None else ""))
-            stock_event = str(marker.stock_event or (_field(source_point, "stock_event", "") if source_point is not None else ""))
-            flow_event = str(marker.flow_event or (_field(source_point, "flow_event", "") if source_point is not None else ""))
-            overlay_marker = SignalDetailOverlayMarker(
-                id=f"{time_label}|{marker.action}|{marker.phase}|{index}",
-                time=time_label,
-                signal=SignalType.BUY_T if side == "buy" else SignalType.SELL_T,
-                price=round(price, 2),
-                change_pct=round(change_pct, 2),
-                phase=str(marker.phase or SignalPhase.OBSERVE.value),
-                reasons=list(marker.reasons or []),
-                risks=list(marker.risks or []),
-                score=int(marker.score or 0),
-                exit_score=exit_score,
-                invalidation_price=round(invalidation_price, 2),
-                source_quality=source_quality,
-                action_size_pct=int(marker.action_size_pct or 0),
-                direction=str(marker.direction or TradeDirection.NONE.value),
-                action=str(marker.action or TradeAction.OBSERVE.value),
-                setup=str(marker.setup or ""),
-                regime=str(marker.regime or ""),
-                executable=bool(marker.executable),
-                execution_reason=str(marker.execution_reason or ""),
-                validation_status=str(marker.validation_status or "research_only"),
-                hypothesis_id=str(marker.hypothesis_id or ""),
-                t_plus_one_restricted=bool(marker.t_plus_one_restricted),
-                risk_reward=marker.risk_reward,
-                market_event=market_event,
-                sector_event=sector_event,
-                stock_event=stock_event,
-                flow_event=flow_event,
-                gold_resonance=bool(marker.gold_resonance),
-                resonance_reasons=list(marker.resonance_reasons or []),
-            )
-            candidates.append((point_index, side, overlay_marker))
-
-        if not candidates:
-            return []
-
-        candidates.sort(key=lambda item: (item[0], item[2].id))
-        sides_by_time: dict[str, set[str]] = {}
-        for _, side, marker in candidates:
-            sides_by_time.setdefault(marker.time, set()).add(side)
-
-        filtered: list[SignalDetailOverlayMarker] = []
-        seen_keys: set[tuple[str, str]] = set()
-        for _, side, marker in candidates:
-            if len(sides_by_time.get(marker.time, set())) > 1:
-                continue
-            key = (marker.time, side)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            filtered.append(marker)
-        return filtered
-
-    def _opening7_overlay_markers(
-        self,
-        info: SignalDetailContext,
-        minute_rows: list[dict[str, Any]],
-        transaction_flow: TransactionFlowObservation,
-    ) -> list[SignalDetailOverlayMarker]:
-        """Opening-7-minute regime markers (09:31 sell gate / 09:33 buy).
-
-        Research-signal overlay from the opening7 event-study rules; rendered
-        with deep red/green on the minute chart and never auto-executable.
-        """
-        try:
-            indices = list(getattr(info.context.market, "indices", []) or [])
-            index_snapshot = next(
-                (item for item in indices if str(getattr(item, "code", "")) == "000001"),
-                indices[0] if indices else None,
-            )
-            index_prev_close = float(getattr(index_snapshot, "prev_close", 0) or 0) if index_snapshot else 0.0
-            index_code = str(getattr(index_snapshot, "code", "") or "000001") if index_snapshot else "000001"
-            index_rows: list[dict[str, Any]] = []
-            if index_prev_close > 0:
-                index_rows = list(
-                    self.data_source.fetch_index_minute_series(
-                        index_code,
-                        info.actual_trade_date,
-                        live=bool(info.live_mode),
-                    )
-                    or []
-                )
-            raw_markers = opening_decision_markers(
-                minute_rows=minute_rows,
-                index_rows=index_rows,
-                index_prev_close=index_prev_close,
-                prev_close=float(info.quote.prev_close or 0),
-                open_price=float(info.quote.open or 0),
-                position=bool(info.position),
-                flow_points=list(transaction_flow.points or []) if transaction_flow.available else [],
-                # 无持仓票也显示 09:31 菱形（回避追高语义），避免开盘高点买入
-                sell_gate_for_all=True,
-            )
-        except Exception:
-            # Opening markers are an additive overlay; never break the detail.
-            return []
-        results: list[SignalDetailOverlayMarker] = []
-        for marker in raw_markers:
-            side = str(marker.side or "")
-            results.append(
-                SignalDetailOverlayMarker(
-                    id=f"opening7|{marker.time}|{side}|{marker.rule}",
-                    time=str(marker.time)[:5],
-                    signal=SignalType.BUY_T if side == "buy" else SignalType.SELL_T,
-                    price=round(float(marker.price or 0), 2),
-                    change_pct=round(float(marker.change_pct or 0), 2),
-                    phase=SignalPhase.CONFIRM.value if side == "buy" else SignalPhase.SELL_CONFIRM.value,
-                    reasons=list(marker.reasons or []),
-                    source_quality=str(marker.source_quality or "minute_proxy"),
-                    action="buy_t" if side == "buy" else "sell_old",
-                    setup="opening7_regime",
-                    regime=str(marker.regime or ""),
-                    executable=False,
-                    execution_reason="研究信号：开盘7分钟制度分层规则，需样本外验证，不自动执行",
-                    validation_status="research_only",
-                    hypothesis_id="opening7_regime",
-                )
-            )
-        return results
-
-    def _opening_window_overlay_markers(
-        self,
-        info: SignalDetailContext,
-    ) -> list[SignalDetailOverlayMarker]:
-        """机会队列同源的开盘窗口菱形（OpeningWindowEngine 持久化记录）。
-
-        详情页不再只依赖 opening7 分钟代理重算——引擎用 6s tick + L1 分笔
-        在 09:30-10:00 产出的菱形才是用户在队列里看到的那些；这里按
-        code + trade_date 直接取回，保证「队列有点、详情有同一个点」。
-        引擎未启用或当天无记录时返回空，调用方回退到 opening7 代理。
-        """
-        engine = self.opening_window_engine
-        if engine is None:
-            return []
-        try:
-            result = engine.query(info.actual_trade_date, offset=0, limit=200)
-        except Exception:
-            return []  # 叠加层永远不应弄崩详情页
-        results: list[SignalDetailOverlayMarker] = []
-        for item in result.get("items", []):
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("code") or "") != info.quote.code:
-                continue
-            side = str(item.get("side") or "")
-            if side not in {"buy", "sell"}:
-                continue
-            time_label = str(item.get("time") or "")[:5]
-            if len(time_label) != 5:
-                continue
-            results.append(
-                SignalDetailOverlayMarker(
-                    id=f"opening_window|{item.get('id')}",
-                    time=time_label,
-                    signal=SignalType.BUY_T if side == "buy" else SignalType.SELL_T,
-                    price=round(float(item.get("price") or 0), 2),
-                    change_pct=round(float(item.get("change_pct") or 0), 2),
-                    phase=SignalPhase.CONFIRM.value if side == "buy" else SignalPhase.SELL_CONFIRM.value,
-                    reasons=list(item.get("reasons") or []),
-                    source_quality=str(item.get("source_quality") or "live_l1"),
-                    action="buy_t" if side == "buy" else "sell_old",
-                    setup=str(item.get("label") or item.get("rule") or "opening_window"),
-                    regime=str(item.get("regime") or ""),
-                    executable=False,
-                    execution_reason="开盘窗口菱形信号（与机会队列同源），需样本外验证，不自动执行",
-                    validation_status=str(item.get("validation_status") or "research_only"),
-                    hypothesis_id="opening_window_engine",
-                )
-            )
-        return results
-
-    @staticmethod
     def _transaction_flow_summary(transaction_flow: TransactionFlowObservation) -> dict[str, Any]:
         payload = transaction_flow.model_dump(mode="json", exclude={"points"})
         payload["point_count"] = len(transaction_flow.points)
@@ -7624,8 +7518,6 @@ class DashboardService:
             "regime": getattr(point, "regime", ""),
             "executable": getattr(point, "executable", False),
             "execution_reason": getattr(point, "execution_reason", ""),
-            "gold_resonance": bool(getattr(point, "gold_resonance", False)),
-            "resonance_reasons": list(getattr(point, "resonance_reasons", []) or [])[:4],
             "invalidation_price": getattr(point, "invalidation_price", 0),
             "risk_reward": {
                 key: risk_reward.get(key)
@@ -7874,8 +7766,7 @@ class DashboardService:
             # new point or change its action.
             "decision_markers": decision_markers,
             "canonical_action_points": compact_markers,
-            "research_status": detail.research_status,
-            "research_note": detail.research_note,
+            "strategy_version": detail.current_signal.strategy_version,
             "research_evidence": {
                 "direction": latest_decision.get("direction", detail.current_signal.direction),
                 "action": latest_decision.get("action", detail.current_signal.action),
@@ -7960,7 +7851,7 @@ class DashboardService:
         result["decision"] = detail.current_signal.signal.value
         result.setdefault("t_direction", direction_map.get(detail.current_signal.direction, "观察"))
         result.setdefault("confidence", detail.current_signal.score)
-        result.setdefault("confidence_reason", detail.current_signal.execution_reason or detail.research_note)
+        result.setdefault("confidence_reason", detail.current_signal.execution_reason or "做T公式信号需结合盘面确认")
         result.setdefault("market_read", market_event or detail.market.trend)
         result.setdefault(
             "sector_read",
@@ -7991,8 +7882,8 @@ class DashboardService:
         result["buy_points"] = buy_points
         result["sell_points"] = sell_points
         result["canonical_decision_markers"] = [marker.model_dump(mode="json") for marker in markers]
-        result["research_status"] = detail.research_status
-        result["decision_source"] = "tdx_formula_engine"
+        result["strategy_version"] = detail.current_signal.strategy_version
+        result["decision_source"] = "zuot_tdx_levels"
         result["ai_role"] = "解释结构化证据；不生成或修改买卖点"
         return result
 
@@ -8060,7 +7951,7 @@ class DashboardService:
             ),
             "next_action": next_action,
             "confidence": detail.current_signal.score,
-            "confidence_reason": detail.current_signal.execution_reason or detail.research_note,
+            "confidence_reason": detail.current_signal.execution_reason or "做T公式信号需结合盘面确认",
             "watch_items": [
                 "指数放量方向",
                 "板块核心票强弱",
@@ -8069,8 +7960,8 @@ class DashboardService:
             ],
             "message_evidence": message_basis,
             "canonical_decision_markers": [marker.model_dump(mode="json") for marker in detail.decision_markers],
-            "research_status": detail.research_status,
-            "decision_source": "tdx_formula_engine",
+            "strategy_version": detail.current_signal.strategy_version,
+            "decision_source": "zuot_tdx_levels",
             "ai_role": "解释结构化证据；不生成或修改买卖点",
         }
 
@@ -8360,7 +8251,7 @@ class DashboardService:
         self._detail_minute_rows_build_locks = {}
 
     def _clear_payload_caches(self) -> None:
-        """清空共享载荷缓存（terminal/dashboard/菱形预览）。
+        """清空共享载荷缓存（terminal/dashboard）。
 
         原子替换容器而不是 clear()，避免与持锁读线程并发迭代冲突；构建锁字典
         一并替换，正在构建的线程仍持有旧锁引用，完成后写入新容器即可。
@@ -8371,5 +8262,3 @@ class DashboardService:
         with self._dashboard_cache_lock:
             self._dashboard_cache_by_key = {}
             self._dashboard_build_locks = {}
-        with self._opening_markers_lock:
-            self._opening_markers_cache = None

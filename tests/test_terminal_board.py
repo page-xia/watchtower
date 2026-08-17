@@ -901,10 +901,10 @@ def test_terminal_payload_cache_is_shared_across_calls_in_live_window(tmp_path, 
     assert builds["count"] == 1
 
     # 命中返回深拷贝：连接级字段挂载不污染共享缓存
-    first.opening_markers.append({"code": "000001"})
+    first.watchlist_codes.append("000001")
     third = service.terminal(board_level=3, page=1, page_size=20, fast=True)
     assert builds["count"] == 1
-    assert third.opening_markers == []
+    assert third.watchlist_codes == []
 
     # 不同视图参数各自独立缓存
     service.terminal(board_level=3, page=2, page_size=20, fast=True)
@@ -1014,12 +1014,19 @@ def test_bootstrapped_terminal_uses_trajectory_sector_flow(tmp_path, monkeypatch
 
     # 首帧不阻塞：sector_flow 先为空，后台从本地轨迹重建后随增量带出
     assert payload.sector_flow == []
-    threads = list(service._sector_flow_refresh_threads.values())
-    assert threads
-    for thread in threads:
-        thread.join(timeout=10)
+    # 本地轨迹读取已优化到毫秒级，后台线程可能在断言前就跑完并把自己
+    # 从登记表里弹出——以结果为准：轮询等待重建完成（fetch_minute_series
+    # 仍被 monkeypatch 为直接抛错，若走了分钟线源会立刻炸）。
+    import time
 
+    deadline = time.time() + 10
     payload = service.terminal(board_level=3, page_size=20)
+    while not payload.sector_flow and time.time() < deadline:
+        for thread in list(service._sector_flow_refresh_threads.values()):
+            thread.join(timeout=0.5)
+        time.sleep(0.05)
+        payload = service.terminal(board_level=3, page_size=20)
+
     assert payload.sector_flow
     series = payload.sector_flow[0]
     # 统一净流入口径：每分钟全成员成交额增量×方向（亿），不再是热度分轨迹
@@ -1157,7 +1164,7 @@ def test_sector_rank_uses_official_easy_tdx_board_grouping(tmp_path, monkeypatch
 
 def test_stock_types_are_dynamic_and_follow_priority(tmp_path):
     service = make_service(tmp_path, themes=[{"name": "测试板块", "core_codes": ["000002"]}])
-    sector_snapshot = make_sector(5, leader_code="000001")
+    sector_snapshot = make_sector(10, leader_code="000001")
 
     leader = make_quote("000001", 4.0)
     core = make_quote("000002", 3.0)
@@ -1170,6 +1177,47 @@ def test_stock_types_are_dynamic_and_follow_priority(tmp_path):
     assert service._classify_stock(limit, sector_snapshot, set())[0] == "涨停/回封"
     assert service._classify_stock(attack, sector_snapshot, set())[0] == "大单进攻"
     assert service._classify_stock(pressure, sector_snapshot, set())[0] == "掉队/抛压"
+
+
+def test_sector_structure_tags_follow_market_convention(tmp_path):
+    """板块龙头=板块领涨股（涨幅第一且为正）；核心容量=板块中军（流通市值第一）或显式 core。"""
+    service = make_service(tmp_path)
+    sector = make_sector(10, leader_code="000001").model_copy(
+        update={"capacity_leader_code": "000009", "capacity_leader_name": "测试000009"}
+    )
+
+    # 涨幅第一名为负：领跌不算龙头
+    falling_top = make_quote("000001", -0.5)
+    assert service._classify_stock(falling_top, sector, set())[0] != "板块龙头"
+
+    # 板块中军（流通市值第一）：市值口径，不看涨跌与成交额
+    capacity_stock = make_quote("000009", 0.5, amount=50_000_000)
+    assert service._classify_stock(capacity_stock, sector, set())[0] == "核心容量"
+
+    # 非中军、无显式 core：成交额再大也不挂核心容量
+    member = make_quote("000010", 1.0, amount=800_000_000)
+    assert "核心容量" not in service._classify_stock(member, sector, set())[1]
+
+    # 手工主题/自选显式 core 不受板块口径影响
+    assert service._classify_stock(member, sector, {"000010"})[0] == "核心容量"
+
+
+def test_capacity_leader_prefers_float_mcap_and_falls_back_to_amount(tmp_path):
+    """中军判定：有流通市值数据取市值第一；无数据回退成交额第一。"""
+    service = make_service(tmp_path)
+    high_turnover_small_cap = make_quote("000001", 2.0, amount=900_000_000)
+    big_cap = make_quote("000002", 0.5, amount=100_000_000)
+
+    quotes = [high_turnover_small_cap, big_cap]
+    # 有市值数据：大市值但成交额小的票是中军（市场"容量核心"严格口径）
+    leader = service._capacity_leader(quotes, {"000001": 5e9, "000002": 5e10})
+    assert leader is not None and leader.code == "000002"
+    # 市值数据缺失：回退成交额第一（盘口代理）
+    leader = service._capacity_leader(quotes, {})
+    assert leader is not None and leader.code == "000001"
+    # 部分覆盖：只用有市值数据的成员比
+    leader = service._capacity_leader(quotes, {"000001": 5e9})
+    assert leader is not None and leader.code == "000001"
 
 
 def test_easy_tdx_order_flow_accepts_five_level_volume_aliases(tmp_path):

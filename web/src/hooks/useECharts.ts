@@ -10,6 +10,8 @@ import type { EChartsOption } from "echarts"
 export function useECharts(
   option: EChartsOption | null,
   events?: Record<string, (params: unknown) => void>,
+  /** 这些依赖变化时下一次 setOption 用 notMerge 整图重建（用于切换系列数量不同的视图，避免旧系列残留） */
+  resetDeps: unknown[] = [],
 ) {
   const chartRef = useRef<echarts.ECharts | null>(null)
   const [node, setNode] = useState<HTMLDivElement | null>(null)
@@ -18,8 +20,14 @@ export function useECharts(
   // 事件回调走 ref：option/榜单每次推送都会生成新闭包，不能让 chart.on 持有过期数据
   const eventsRef = useRef(events)
   eventsRef.current = events
+  const resetRef = useRef(false)
 
   const ref = useCallback((el: HTMLDivElement | null) => setNode(el), [])
+
+  useEffect(() => {
+    resetRef.current = true
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, resetDeps)
 
   useEffect(() => {
     if (!node) return
@@ -42,8 +50,14 @@ export function useECharts(
 
   useEffect(() => {
     if (option && chartRef.current) {
-      // 合并模式增量更新：数据刷新时 ECharts 就地过渡，不整图重绘、不闪烁
-      chartRef.current.setOption(option, { notMerge: false, lazyUpdate: true })
+      if (resetRef.current) {
+        // 视图切换：整图重建，清掉上一视图的多余系列
+        chartRef.current.setOption(option, { notMerge: true })
+        resetRef.current = false
+      } else {
+        // 合并模式增量更新：数据刷新时 ECharts 就地过渡，不整图重绘、不闪烁
+        chartRef.current.setOption(option, { notMerge: false, lazyUpdate: true })
+      }
     }
   }, [option])
 

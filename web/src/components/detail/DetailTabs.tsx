@@ -1,17 +1,23 @@
-import { useState } from "react"
-import type { AuctionSnapshot, DataTable, DetailExtrasResponse, ExtrasSection, MessageEvidence } from "@/types/api"
+import { useEffect, useMemo, useRef, useState } from "react"
+import type { AuctionSnapshot, ChipDaily, ChipIntraday, DetailExtrasResponse, MessageEvidence } from "@/types/api"
+import { getDetailExtras, type DetailExtrasOptions } from "@/lib/api"
 import { dateShort, fmtAmount, timeShort } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { messageBody, messageKeywords, messageMetaLabels } from "./messagePresentation"
+import { F10Pane } from "./F10Pane"
+import { CapitalFlowPane, ChanlunPane, IndicatorsPane } from "./ExtrasPanes"
+import { ChipDailyPane, ChipIntradayPane } from "./ChipPane"
 
-type TabKey = "messages" | "ai" | "auction" | "capital" | "fundamentals" | "chanlun"
+type TabKey = "chip" | "messages" | "ai" | "auction" | "capital" | "indicators" | "fundamentals" | "chanlun"
 type MessageScope = "stock" | "sector"
 
 const TABS: { key: TabKey; label: string }[] = [
+  { key: "chip", label: "筹码" },
   { key: "messages", label: "星球消息" },
   { key: "ai", label: "AI分析" },
   { key: "auction", label: "集合竞价" },
   { key: "capital", label: "资金流" },
+  { key: "indicators", label: "技术指标" },
   { key: "fundamentals", label: "F10/财务" },
   { key: "chanlun", label: "缠论" },
 ]
@@ -162,68 +168,128 @@ function AuctionPane({ history }: { history: AuctionSnapshot[] }) {
   )
 }
 
-function GenericSection({ section, emptyText }: { section: ExtrasSection | null | undefined; emptyText: string }) {
-  if (!section || !section.available) {
-    return (
-      <div className="p-8 text-center text-xs text-muted-foreground">
-        {section?.note || emptyText}
-      </div>
-    )
-  }
-  const summary = section.summary ?? {}
-  const tables = section.tables ?? []
-  return (
-    <div className="space-y-3 p-3">
-      {Object.keys(summary).length > 0 && (
-        <div className="flex flex-wrap gap-2">
-          {Object.entries(summary).map(([k, v]) => (
-            <div key={k} className="rounded border border-border/60 bg-background/40 px-2 py-1">
-              <div className="text-[9px] text-muted-foreground">{k}</div>
-              <div className="num text-[11px] font-semibold">
-                {typeof v === "number" ? fmtAmount(v) : String(v ?? "--")}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-      {tables.map((t: DataTable) => (
-        <div key={t.title}>
-          <div className="panel-title mb-1">{t.title}</div>
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-border text-[9px] text-muted-foreground">
-                  {t.columns.map((c) => <th key={c} className="py-1 pr-2 text-right font-normal first:text-left">{c}</th>)}
-                </tr>
-              </thead>
-              <tbody>
-                {(t.rows ?? []).slice(0, 30).map((row, i) => (
-                  <tr key={i} className="border-b border-border/40 text-[10px]">
-                    {t.columns.map((c) => {
-                      const v = row[c]
-                      return (
-                        <td key={c} className="num py-1 pr-2 text-right first:text-left">
-                          {typeof v === "number" ? (Math.abs(v) >= 1e6 ? fmtAmount(v) : v.toFixed(2)) : String(v ?? "--")}
-                        </td>
-                      )
-                    })}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      ))}
-      {tables.length === 0 && Object.keys(summary).length === 0 && (
-        <div className="p-4 text-center text-xs text-muted-foreground">{section.note || emptyText}</div>
-      )}
-    </div>
-  )
+interface DetailTabsProps {
+  /** 轻量核心 extras（仅 AI 分析），打开详情即加载；星球消息切到对应 tab 才查 CloudBase */
+  coreExtras: DetailExtrasResponse | null
+  error?: string | null
+  code: string
+  watchlistCodes: string[]
+  chipDaily?: ChipDaily | null
+  chipIntraday?: ChipIntraday | null
+  /** 主图当前视图：分时→当日量价分布；日K→历史筹码峰 */
+  chartView?: "minute" | "daily"
 }
 
-export function DetailTabs({ extras, error }: { extras: DetailExtrasResponse | null; error?: string | null }) {
-  const [tab, setTab] = useState<TabKey>("messages")
-  const msgCount = (extras?.message_evidence?.stock?.length ?? 0) + (extras?.message_evidence?.sector?.length ?? 0)
+/** 懒加载 tab：切换到对应 tab 时才请求后端对应 include 分片。
+ *  auction/capital/indicators/chanlun 为日频数据，每次打开详情只拉一次；
+ *  messages 盘中会更新，每次激活都刷新（服务端有 60s 读缓存，成本低）。 */
+type HeavyTab = "auction" | "capital" | "indicators" | "chanlun"
+type LazyTab = HeavyTab | "messages"
+const LAZY_TABS: ReadonlySet<TabKey> = new Set<TabKey>(["auction", "capital", "indicators", "chanlun", "messages"])
+
+function sliceOptions(tab: LazyTab): DetailExtrasOptions {
+  return {
+    includeAuctionHistory: tab === "auction",
+    includeCapitalFlow: tab === "capital",
+    includeFundamentals: false, // 前端无消费者，F10/财务 tab 走独立 F10 接口
+    includeIndicators: tab === "indicators",
+    includeChanlun: tab === "chanlun",
+    includeMessages: tab === "messages",
+  }
+}
+
+/** 只取该 tab 对应字段，避免分片响应里的空默认字段覆盖已加载的其他分片 */
+function pickSlice(tab: LazyTab, payload: DetailExtrasResponse): Partial<DetailExtrasResponse> {
+  switch (tab) {
+    case "auction":
+      return { auction_history: payload.auction_history }
+    case "capital":
+      return { capital_flow: payload.capital_flow }
+    case "indicators":
+      return { technical_indicators: payload.technical_indicators }
+    case "chanlun":
+      return { chanlun: payload.chanlun }
+    case "messages":
+      return { message_evidence: payload.message_evidence }
+  }
+}
+
+export function DetailTabs({ coreExtras, error, code, watchlistCodes, chipDaily, chipIntraday, chartView = "minute" }: DetailTabsProps) {
+  const [tab, setTab] = useState<TabKey>("chip")
+  // 筹码 tab 跟随主图视图，但允许在 tab 内手动切换；主图切换时重新跟随
+  const [chipModeOverride, setChipModeOverride] = useState<"intraday" | "daily" | null>(null)
+  useEffect(() => setChipModeOverride(null), [chartView])
+  const followMode = chartView === "daily" ? ("daily" as const) : ("intraday" as const)
+  const chipMode = chipModeOverride ?? followMode
+
+  // ---- 懒加载 tab：按 tab 缓存已加载分片，换股票时清空 ----
+  // 拉取状态用 ref 跟踪，effect 只响应 tab/code/重试 变化，自身 setState 不会重复触发请求
+  const watchlistKey = watchlistCodes.join(",")
+  const [slices, setSlices] = useState<Partial<DetailExtrasResponse>>({})
+  const fetchedRef = useRef<Set<HeavyTab>>(new Set())
+  const inflightRef = useRef<LazyTab | null>(null)
+  const [loadingTab, setLoadingTab] = useState<LazyTab | null>(null)
+  // 失败按 tab 记录：只挡住失败的那个 tab 自动重试，不影响切去其他 tab
+  const [sliceError, setSliceError] = useState<{ tab: LazyTab; message: string } | null>(null)
+  const [retryNonce, setRetryNonce] = useState(0)
+
+  useEffect(() => {
+    fetchedRef.current = new Set()
+    inflightRef.current = null
+    setSlices({})
+    setLoadingTab(null)
+    setSliceError(null)
+    setTab("chip")
+  }, [code])
+
+  useEffect(() => {
+    if (!LAZY_TABS.has(tab)) return
+    const lazyTab = tab as LazyTab
+    // 日频分片拉过一次就不再拉；messages 盘中会更新，每次激活都刷新
+    if (lazyTab !== "messages" && fetchedRef.current.has(lazyTab as HeavyTab)) return
+    if (inflightRef.current === lazyTab || sliceError?.tab === lazyTab) return
+    let cancelled = false
+    inflightRef.current = lazyTab
+    setLoadingTab(lazyTab)
+    getDetailExtras(code, watchlistCodes, sliceOptions(lazyTab))
+      .then((payload) => {
+        if (inflightRef.current === lazyTab) inflightRef.current = null
+        if (cancelled) return
+        if (lazyTab !== "messages") fetchedRef.current.add(lazyTab as HeavyTab)
+        setSlices((prev) => ({ ...prev, ...pickSlice(lazyTab, payload) }))
+        setLoadingTab(null)
+      })
+      .catch((err) => {
+        if (inflightRef.current === lazyTab) inflightRef.current = null
+        if (cancelled) return
+        setSliceError({ tab: lazyTab, message: err instanceof Error ? err.message : String(err) })
+        setLoadingTab(null)
+      })
+    return () => {
+      cancelled = true
+      // 切走时若本 tab 的请求还在飞，释放 in-flight 锁，避免挡住后续 tab 的加载
+      if (inflightRef.current === lazyTab) inflightRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, code, watchlistKey, retryNonce])
+
+  // 核心 extras + 已加载分片的合并视图（分片只含各自字段，合并安全）
+  const extras = useMemo(() => {
+    if (!coreExtras && !Object.keys(slices).length) return null
+    return { ...(coreExtras ?? {}), ...slices } as DetailExtrasResponse
+  }, [coreExtras, slices])
+
+  // 消息数角标来自已加载的消息分片：未访问过星球消息 tab 时不显示
+  const msgCount = (slices.message_evidence?.stock?.length ?? 0) + (slices.message_evidence?.sector?.length ?? 0)
+  const isLazy = LAZY_TABS.has(tab)
+  const corePending = tab === "ai" && !coreExtras && !error
+  // messages 已有数据时后台刷新不闪 loading；日频分片未加载时显示 loading
+  const messagesFirstLoad = tab === "messages" && slices.message_evidence == null
+  const slicePending =
+    isLazy &&
+    (loadingTab === tab
+      ? tab !== "messages" || messagesFirstLoad
+      : tab !== "messages" && !fetchedRef.current.has(tab as HeavyTab) && sliceError?.tab !== tab)
   return (
     <div className="terminal-panel flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 gap-1 border-b border-border px-2 pt-1.5">
@@ -243,22 +309,73 @@ export function DetailTabs({ extras, error }: { extras: DetailExtrasResponse | n
             )}
           </button>
         ))}
-        {!extras && !error && <span className="ml-2 self-center text-[10px] text-muted-foreground">加载中…</span>}
-        {error && <span className="ml-2 self-center text-[10px] text-destructive">扩展数据加载失败：{error}</span>}
+        {(corePending || slicePending) && <span className="ml-2 self-center text-[10px] text-muted-foreground">加载中…</span>}
+        {error && tab === "ai" && (
+          <span className="ml-2 self-center text-[10px] text-destructive">扩展数据加载失败：{error}</span>
+        )}
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {!extras ? (
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+        {tab === "chip" ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex shrink-0 items-center justify-between border-b border-border/60 px-3 py-1.5">
+              <div className="inline-flex rounded-md border border-border bg-muted/40 p-0.5">
+                {([
+                  { key: "intraday", label: "分时分布" },
+                  { key: "daily", label: "历史筹码峰" },
+                ] as const).map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setChipModeOverride(item.key === followMode ? null : item.key)}
+                    className={cn(
+                      "rounded px-2.5 py-0.5 text-[10px] font-semibold transition-colors",
+                      chipMode === item.key ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-background/70",
+                    )}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <span className="text-[9px] text-muted-foreground">
+                {chipModeOverride ? "手动查看" : "跟随主图"}
+              </span>
+            </div>
+            <div className="min-h-0 flex-1">
+              {chipMode === "daily" ? (
+                <ChipDailyPane chip={chipDaily} />
+              ) : (
+                <ChipIntradayPane chip={chipIntraday} />
+              )}
+            </div>
+          </div>
+        ) : tab === "fundamentals" ? (
+          <F10Pane code={code} />
+        ) : sliceError && sliceError.tab === tab ? (
           <div className="p-8 text-center text-xs text-muted-foreground">
-            {error ? "扩展数据暂不可用，可关闭后重试" : "加载扩展数据…"}
+            <div>该模块数据加载失败：{sliceError.message}</div>
+            <button
+              type="button"
+              className="mt-2 rounded border border-border px-3 py-1 text-[11px] text-foreground hover:bg-muted"
+              onClick={() => {
+                setSliceError(null)
+                setRetryNonce((n) => n + 1)
+              }}
+            >
+              重试
+            </button>
+          </div>
+        ) : !extras || corePending || slicePending ? (
+          <div className="p-8 text-center text-xs text-muted-foreground">
+            {error && tab === "ai" ? "扩展数据暂不可用，可关闭后重试" : "加载扩展数据…"}
           </div>
         ) : (
           <>
             {tab === "messages" && <MessagesPane extras={extras} />}
-            {tab === "ai" && <AiPane extras={extras} />}
+            {tab === "ai" && (coreExtras ? <AiPane extras={coreExtras} /> : null)}
             {tab === "auction" && <AuctionPane history={extras.auction_history ?? []} />}
-            {tab === "capital" && <GenericSection section={extras.capital_flow} emptyText="暂无资金流数据" />}
-            {tab === "fundamentals" && <GenericSection section={extras.fundamentals} emptyText="暂无 F10/财务数据" />}
-            {tab === "chanlun" && <GenericSection section={extras.chanlun} emptyText="暂无缠论数据" />}
+            {tab === "capital" && <CapitalFlowPane section={extras.capital_flow} />}
+            {tab === "indicators" && <IndicatorsPane section={extras.technical_indicators} />}
+            {tab === "chanlun" && <ChanlunPane section={extras.chanlun} />}
           </>
         )}
       </div>

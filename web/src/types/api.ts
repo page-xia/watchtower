@@ -143,12 +143,23 @@ export interface BoardItem {
   minute_amount_ratio: number
   rebound_from_low_pct: number
   pullback_from_high_pct: number
+  /** 做T当日常量：阻力/支撑（0 或缺省 = 不可用） */
+  resistance?: number
+  support?: number
   limit_up: boolean
   limit_down: boolean
   opened_limit: boolean
   signal: string
   signal_score: number
   signal_time?: string
+  /** 当天最近一次买T/卖T信号方向（买T / 减T/卖T），空 = 当天尚无买卖信号 */
+  last_action?: string
+  /** 最近一次买/卖信号的触发价（距买卖点 ±% 展示用） */
+  last_action_price?: number
+  /** 最近一次买/卖信号的触发时间（HH:MM） */
+  last_action_time?: string
+  /** 现价是否落在低吸区间（底线-1% ~ 顶线+3%） */
+  near_zone?: boolean
   signal_grade?: string
   stock_type: string
   stock_tags: string[]
@@ -185,6 +196,14 @@ export interface StockBoard {
   frozen: boolean
   items: BoardItem[]
   available_sorts: string[]
+  /** 低吸机会过滤：短期/长期线低者为底（-1%）、高者为顶（+3%），现价落区间内 */
+  near_trend?: boolean
+  /** 已有当天线值的代码数 */
+  near_trend_ready?: number
+  /** 线值后台补算中的代码数 */
+  near_trend_pending?: number
+  /** 置顶买点：最近买点 ±1% 内的票稳定排到最前 */
+  pin_buy?: boolean
 }
 
 export interface WatchlistEntry {
@@ -245,45 +264,6 @@ export interface TerminalPayload {
   board_level: number
   board_source: string
   watchlist_codes: string[]
-  opening_markers: OpeningMarkerEvent[]
-}
-
-// ---- 开盘窗口菱形买卖点（机会队列） ----
-
-export interface OpeningMarkerEvent {
-  id: string
-  trade_date: string
-  code: string
-  name: string
-  sector: string
-  time: string
-  first_seen: string
-  side: "buy" | "sell"
-  rule: string
-  label: string
-  price: number
-  change_pct: number
-  /** 实时行情回填（队列行显示用）；price/change_pct 保持信号时刻快照语义 */
-  live_price?: number
-  live_change_pct?: number
-  live_amount?: number
-  regime?: string
-  reasons: string[]
-  tape_net_ratio?: number | null
-  /** warn=空心预警（确认中）；confirmed=实心确认 */
-  state: "warn" | "confirmed"
-  confirmed_at?: string
-  source_quality: string
-  validation_status: string
-  executable: boolean
-}
-
-export interface OpeningMarkersPage {
-  trade_date: string
-  total: number
-  offset: number
-  limit: number
-  items: OpeningMarkerEvent[]
 }
 
 // ---- 个股详情 ----
@@ -306,22 +286,55 @@ export interface MinuteChartData {
 }
 
 export interface FormulaState {
-  duo_strength: number
-  kong_strength: number
-  main_absorption: number
-  fast_trigger: boolean
-  protection_price: number
-  white_line: number
-  yellow_line: number
-  white_distance_pct: number
-  yellow_distance_pct: number
-  trend_distance_pct: number
-  near_trend_line: boolean
-  near_trend_line_name: string
-  gold_resonance: boolean
-  resonance_reasons: string[]
+  // 均线系统
+  ma30: number
+  qs: number
+  vwap: number
+  price: number
+  // 阻力/支撑/中轴（当日常量）
+  resistance: number
+  support: number
+  mid: number
+  // 机构资金统计（万元）
+  big_buy_amount: number
+  big_sell_amount: number
+  fund_flow: number
+  // 买卖净（万元，按内外盘拆分当日总额）
+  buy_amount_wan: number
+  sell_amount_wan: number
+  net_amount_wan: number
+  buy_pct: number
+  sell_pct: number
+  // 个股基础数据
+  change_pct: number
+  volume_ratio: number
+  turnover_rate?: number | null
+  // 分析文字
+  trend_text: string
+  volume_text: string
+  fund_text: string
+  fund_attitude: string
+  position_text: string
+  vwap_relation: string
+  line_a: string
+  line_b: string
+  // 综合评分与建议
+  score: number
+  advice: string
+  advice_detail: string
+  // 最新分钟买卖信号
+  buy_signal: boolean
+  sell_signal: boolean
   source_quality: string
-  trigger_note?: string
+  point_count: number
+}
+
+export interface FormulaOverlay {
+  available: boolean
+  resistance_pct?: number | null
+  support_pct?: number | null
+  resistance: number
+  support: number
 }
 
 export interface ConfluenceFactor {
@@ -384,11 +397,10 @@ export interface SignalChartResponse {
   chart: MinuteChartData
   order_flow: OrderFlow
   formula_state: FormulaState
+  formula_overlay: FormulaOverlay
   confluence_snapshot: ConfluenceSnapshot
   watchlisted: boolean
   watchlist_tags: string[]
-  research_status?: string
-  research_note?: string
 }
 
 export interface OverlayMarker {
@@ -450,10 +462,11 @@ export interface SignalOverlayResponse {
   code: string
   name: string
   markers: OverlayMarker[]
-  opening_markers: OverlayMarker[]
   transaction_flow: TransactionFlow
   formula_state: FormulaState
   confluence_snapshot: ConfluenceSnapshot
+  /** 盘后/休市冻结标记：true 时前端停止轮询 */
+  frozen?: boolean
 }
 
 export interface MessageEvidence {
@@ -535,6 +548,47 @@ export interface DetailExtrasResponse {
   technical_indicators: ExtrasSection
   chanlun: ExtrasSection
   auction_history: AuctionSnapshot[]
+}
+
+// ---- 聚合 F10（tushare_pro + easy_tdx） ----
+
+export interface F10Field {
+  label: string
+  value: unknown
+  raw_key: string
+}
+
+export interface F10Section {
+  key: string
+  title: string
+  available: boolean
+  status?: string
+  field_count: number
+  row_count: number
+  fields: F10Field[]
+  tables: DataTable[]
+}
+
+export interface F10Category {
+  key: string
+  title: string
+  available: boolean
+  error?: string
+  source: string
+  sections: F10Section[]
+}
+
+export interface F10Response {
+  available: boolean
+  source: string
+  code: string
+  ts_code: string
+  name: string
+  fetched_at: string
+  category_count: number
+  expected_category_count: number
+  categories: F10Category[]
+  note?: string
 }
 
 export interface StockSearchResult {
@@ -636,4 +690,187 @@ export interface DarkPoolPayload {
     sector_rollup?: DarkPoolSectorBucket[]
     sector_rollup_by_level?: { l1?: DarkPoolSectorBucket[]; l2?: DarkPoolSectorBucket[]; l3?: DarkPoolSectorBucket[] }
   }
+}
+
+// ---- 日K详情（AI主力狙击公式 + 筹码峰 + 题材概念） ----
+
+export interface DailyBar {
+  date: string
+  open: number
+  high: number
+  low: number
+  close: number
+  vol: number
+  amount: number
+}
+
+export interface DailyFormulaTip {
+  text: string
+  tone: "up" | "down" | "flat"
+}
+
+export interface DailyMainFormula {
+  available: boolean
+  swl?: (number | null)[]
+  sws?: (number | null)[]
+  ljx?: (number | null)[]
+  cost_line?: (number | null)[]
+  /** 趋势公式.md：知行短期趋势线 / 知行多空线 + 简单均线（日线级别） */
+  zx_trend?: (number | null)[]
+  zx_duokong?: (number | null)[]
+  ma5?: (number | null)[]
+  ma10?: (number | null)[]
+  ma20?: (number | null)[]
+  trend_latest?: {
+    ma5?: number | null
+    ma10?: number | null
+    ma20?: number | null
+    zx_trend?: number | null
+    zx_duokong?: number | null
+  }
+  candle_state?: string[] // "hold" | "watch" | "normal"
+  markers?: {
+    short_buy: number[]
+    white_exit: number[]
+    crash: number[]
+    limit_up: number[]
+    limit_up20: number[]
+    lianban: { index: number; count: number }[]
+    broken: number[]
+    baotuan: number[]
+    gaowei: number[]
+  }
+  strong_support?: number | null
+  tomorrow?: { resistance: number; support: number; breakthrough: number; reverse: number }
+  score_h?: number
+  score_h_max?: number
+  tips?: {
+    stock?: DailyFormulaTip | null
+    market?: DailyFormulaTip | null
+    volume?: DailyFormulaTip | null
+    yunvx?: number
+  }
+  quality?: { float_shares: boolean; index_close: boolean; winner: boolean }
+}
+
+export interface DailySubResonance {
+  available: boolean
+  z7?: (number | null)[]
+  z8?: (number | null)[]
+  www?: (number | null)[]
+  tdxlfxj?: (number | null)[]
+  kongqi?: (number | null)[]
+  strip_weak?: number[]
+  strip_mid?: number[]
+  strip_top?: number[]
+  markers?: { reversal: number[]; start: number[]; kongqi_cross: number[]; red_light: number[] }
+  latest?: { red_light: boolean; www: number; tdxlfxj: number }
+}
+
+export interface DailySubTrend {
+  available: boolean
+  trend_line?: (number | null)[]
+  trend_accum?: (number | null)[]
+  main_accum?: (number | null)[]
+  rich_accum?: (number | null)[]
+  chongding?: (number | null)[]
+  markers?: {
+    niu: number[]
+    shao: number[]
+    yellow_pin: number[]
+    pink_pin: number[]
+    jigou_chu: number[]
+    zhuli_chu: number[]
+    red_hat: number[]
+    red_triangle: number[]
+  }
+  latest?: { jigou_chu: boolean; zhuli_chu: boolean; niu: boolean }
+}
+
+export interface DailyMainTrend {
+  available: boolean
+  zx_trend?: (number | null)[]
+  zx_duokong?: (number | null)[]
+  deviation?: (number | null)[]
+  candle_state?: string[]
+  markers?: { atr_high: { index: number; price: number }[]; atr_low: { index: number; price: number }[] }
+  latest?: { deviation: number; zx_trend: number; zx_duokong: number | null }
+}
+
+export interface DailySubBrick {
+  available: boolean
+  brick?: (number | null)[]
+  markers?: { short_buy: number[]; exit: number[] }
+  latest?: { brick: number; short_buy: boolean; exit: boolean }
+}
+
+export interface DailyFormulas {
+  main: DailyMainFormula
+  sub_resonance: DailySubResonance
+  sub_trend: DailySubTrend
+  main_trend?: DailyMainTrend
+  sub_brick?: DailySubBrick
+}
+
+export interface ChipBin {
+  price: number
+  weight?: number
+  vol?: number
+}
+
+export interface ChipDaily {
+  available: boolean
+  note?: string
+  price_low?: number
+  price_high?: number
+  current_price?: number
+  as_of?: string
+  bars_used?: number
+  bins?: ChipBin[]
+  winner_pct?: number
+  avg_cost?: number
+  cost90?: [number, number]
+  cost70?: [number, number]
+  concentration90?: number
+  concentration70?: number
+  peaks?: { price: number; share: number }[]
+  quality?: string
+}
+
+export interface ChipIntraday {
+  available: boolean
+  note?: string
+  current_price?: number
+  prev_close?: number | null
+  vwap?: number
+  total_vol?: number
+  bins?: ChipBin[]
+  peak_price?: number | null
+  as_of?: string
+}
+
+export interface StockTags {
+  available: boolean
+  industry_official?: string
+  industry?: string
+  concepts?: string[]
+  styles?: string[]
+  regions?: string[]
+  source?: string
+  stale?: boolean
+}
+
+export interface DailyDetailResponse {
+  code: string
+  name: string
+  sector: string
+  trade_date: string
+  prev_close: number
+  count: number
+  bars: DailyBar[]
+  formulas: DailyFormulas
+  chip: ChipDaily
+  chip_intraday: ChipIntraday
+  tags: StockTags
+  generated_at: string
 }

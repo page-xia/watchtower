@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 import zlib
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,14 @@ class IntradayWatchtowerStore:
         self.enabled = bool(enabled)
         self.state_store = state_store
         self._lock = threading.RLock()
+        # stock_features 内存镜像：采集写入时同步维护（写穿透），全市场刷新/详情页
+        # 的公式行读取不再走 SQLite+zlib+JSON 回环。条目只能由 SQL 权威回填创建
+        # （保证从当日开盘起完整），采集追加负责保鲜；SQLite 仍是持久层，用于
+        # 进程重启恢复、回放与研究。
+        self._feature_mem_lock = threading.Lock()
+        self._feature_mem: dict[str, dict[str, dict[str, Any]]] = {}
+        self._feature_mem_max_rows = 288
+        self._feature_mem_max_dates = 2
         if self.enabled and initialize:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._initialize()
@@ -100,6 +109,8 @@ class IntradayWatchtowerStore:
                     price REAL NOT NULL DEFAULT 0,
                     change_pct REAL NOT NULL DEFAULT 0,
                     amount REAL NOT NULL DEFAULT 0,
+                    minute_amount REAL,
+                    vol REAL,
                     minute_amount_ratio REAL NOT NULL DEFAULT 1,
                     payload_json TEXT NOT NULL,
                     UNIQUE(trade_date, captured_at, code)
@@ -235,6 +246,16 @@ class IntradayWatchtowerStore:
                     connection.execute(
                         f"ALTER TABLE data_manifests ADD COLUMN {column} {declaration}"
                     )
+            # stock_features 列化迁移：vol/minute_amount 提为独立列后，
+            # 热路径读取直接拿原生数值，不再 zlib+JSON 解码 payload。
+            # 老数据的这两列为 NULL，读取端回退 payload 解码一次后入内存镜像。
+            feature_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(stock_features)").fetchall()
+            }
+            for column in ("vol", "minute_amount"):
+                if column not in feature_columns:
+                    connection.execute(f"ALTER TABLE stock_features ADD COLUMN {column} REAL")
             schema_version = connection.execute(
                 "SELECT value FROM schema_meta WHERE key = ?",
                 ("schema_version",),
@@ -349,6 +370,64 @@ class IntradayWatchtowerStore:
                 return payload
         return None
 
+    # -- stock_features 内存镜像（写穿透） -------------------------------------
+
+    def _feature_mem_day(self, trade_date: str) -> dict[str, dict[str, Any]]:
+        day = self._feature_mem.get(trade_date)
+        if day is None:
+            # 只保留最近几个交易日，防止跨天运行内存膨胀
+            while len(self._feature_mem) >= self._feature_mem_max_dates:
+                oldest = next(iter(self._feature_mem))
+                self._feature_mem.pop(oldest, None)
+            day = self._feature_mem[trade_date] = {}
+        return day
+
+    def _mirror_stock_feature_row(
+        self,
+        trade_date: str,
+        captured_at: str,
+        code: str,
+        row: dict[str, Any],
+    ) -> None:
+        """采集写入时同步内存镜像（与列化读取端的瘦行结构完全一致）。
+
+        只追加到已由 SQL 回填创建的条目：进程盘中启动时尚未回填的票不建半成品
+        条目（只有开盘后部分行），首次读取走 SQL 拿到当日完整序列后再保鲜。
+        """
+        with self._feature_mem_lock:
+            entry = self._feature_mem.get(trade_date, {}).get(code)
+            if entry is None:
+                return
+            rows: deque[dict[str, Any]] = entry["rows"]
+            if rows and str(rows[-1].get("captured_at") or "") == str(captured_at or ""):
+                # ON CONFLICT 同刻重写的镜像：覆盖最后一行而不是追加
+                rows[-1] = row
+            else:
+                rows.append(row)
+
+    def _feature_mem_get(self, trade_date: str, code: str, limit: int) -> list[dict[str, Any]] | None:
+        """内存镜像命中且覆盖深度足够时返回与 SQL 路径完全一致的结果。"""
+        with self._feature_mem_lock:
+            entry = self._feature_mem.get(trade_date, {}).get(code)
+            if entry is None or int(entry["covered_limit"]) < limit:
+                return None
+            return list(entry["rows"])[-limit:]
+
+    def _feature_mem_backfill(
+        self,
+        trade_date: str,
+        code: str,
+        series: list[dict[str, Any]],
+        limit: int,
+    ) -> None:
+        """SQL 读取后回填内存镜像；空序列也回填（停牌票当日无行是合法结果）。"""
+        with self._feature_mem_lock:
+            day = self._feature_mem_day(trade_date)
+            day[code] = {
+                "rows": deque(series, maxlen=self._feature_mem_max_rows),
+                "covered_limit": min(max(1, int(limit)), self._feature_mem_max_rows),
+            }
+
     def record_context(
         self,
         *,
@@ -391,6 +470,7 @@ class IntradayWatchtowerStore:
             sectors=sector_rows,
             quotes=quote_rows,
         )
+        mirrored_features: list[tuple[str, str, str, dict[str, Any]]] = []
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
@@ -432,15 +512,20 @@ class IntradayWatchtowerStore:
                 if not code:
                     continue
                 if stock_codes is None or code in stock_codes:
+                    payload = {key: value for key, value in quote.items() if key != "order_flow"}
+                    volume_value = float(quote.get("vol") or quote.get("volume") or 0)
+                    minute_amount_value = float(quote.get("minute_amount") or 0)
                     connection.execute(
                         """
                         INSERT INTO stock_features
-                            (trade_date, captured_at, code, price, change_pct, amount, minute_amount_ratio, payload_json)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (trade_date, captured_at, code, price, change_pct, amount, minute_amount, vol, minute_amount_ratio, payload_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(trade_date, captured_at, code) DO UPDATE SET
                             price=excluded.price,
                             change_pct=excluded.change_pct,
                             amount=excluded.amount,
+                            minute_amount=excluded.minute_amount,
+                            vol=excluded.vol,
                             minute_amount_ratio=excluded.minute_amount_ratio,
                             payload_json=excluded.payload_json
                         """,
@@ -451,9 +536,30 @@ class IntradayWatchtowerStore:
                             float(quote.get("price") or 0),
                             float(quote.get("change_pct") or 0),
                             float(quote.get("amount") or 0),
+                            minute_amount_value,
+                            volume_value,
                             float(quote.get("minute_amount_ratio") or 1),
-                            self._json({key: value for key, value in quote.items() if key != "order_flow"}),
+                            self._json(payload),
                         ),
+                    )
+                    # 写穿透内存镜像：读路径（刷新/详情）与采集共享同一份数据；
+                    # 先暂存，事务提交成功后才应用，避免回滚导致内存与库分叉
+                    mirrored_features.append(
+                        (
+                            trade_date,
+                            captured_at,
+                            code,
+                            {
+                                "captured_at": str(captured_at or ""),
+                                "price": float(quote.get("price") or 0),
+                                "change_pct": float(quote.get("change_pct") or 0),
+                                "amount": float(quote.get("amount") or 0),
+                                "minute_amount": minute_amount_value,
+                                "minute_amount_ratio": float(quote.get("minute_amount_ratio") or 1),
+                                "vol": volume_value,
+                                "volume": volume_value,
+                            },
+                        )
                     )
                 if code in high_frequency_codes:
                     flow = quote.get("order_flow") if isinstance(quote.get("order_flow"), dict) else {}
@@ -500,6 +606,9 @@ class IntradayWatchtowerStore:
                 "ON CONFLICT(trade_date, captured_at, source) DO UPDATE SET quality=excluded.quality, note=excluded.note",
                 (trade_date, captured_at, "dashboard", source_quality, "仅保存公开特征，不保存密钥或原始 source_json"),
             )
+        # 事务提交成功后应用内存镜像（读路径与采集共享同一份数据，零 SQL 零解压）
+        for m_date, m_captured, m_code, m_row in mirrored_features:
+            self._mirror_stock_feature_row(m_date, m_captured, m_code, m_row)
 
     def record_signal_transition(
         self,
@@ -1114,6 +1223,32 @@ class IntradayWatchtowerStore:
     # 内部沿用旧名
     _loads = decode_payload
 
+    def _stock_feature_row_from_record(self, row: Any) -> dict[str, Any]:
+        """把 stock_features 记录还原成读取端瘦行。
+
+        新数据走列化快路径：vol/minute_amount 是独立列，sqlite3 直接返回原生
+        数值，完全不用碰 payload_json（零 zlib/JSON decode）。老数据这两列为
+        NULL，回退 payload 解码一次（结果随后进内存镜像，每进程只付一次）。
+        """
+        captured_at = str(row["captured_at"] or "")
+        base = {
+            "captured_at": captured_at,
+            "price": float(row["price"] or 0),
+            "change_pct": float(row["change_pct"] or 0),
+            "amount": float(row["amount"] or 0),
+            "minute_amount_ratio": float(row["minute_amount_ratio"] or 1),
+        }
+        vol = row["vol"] if "vol" in row.keys() else None
+        if vol is not None:
+            volume_value = float(vol)
+            base["minute_amount"] = float(row["minute_amount"] or 0)
+            base["vol"] = volume_value
+            base["volume"] = volume_value
+            return base
+        payload = self._loads(row["payload_json"])
+        payload.update(base)
+        return payload
+
     def stock_feature_series(
         self,
         trade_date: str,
@@ -1128,12 +1263,16 @@ class IntradayWatchtowerStore:
         if not self.enabled or not self.path.exists() or not normalized_date or not normalized_code:
             return []
         limit = max(1, min(int(max_rows or 720), 2880))
+        # 内存镜像优先：与采集写穿透共享同一份数据，命中时零 SQL 零解压
+        mem = self._feature_mem_get(normalized_date, normalized_code, limit)
+        if mem is not None:
+            return mem
         # 纯读取走独立连接且不持有 _lock：WAL 模式允许读写、读读并发，
         # 否则详情页的单票查询会被后台 120 票批量读/全量写入卡住数秒。
         with self._read_connect() as connection:
             rows = connection.execute(
                 """
-                SELECT captured_at, price, change_pct, amount, minute_amount_ratio, payload_json
+                SELECT captured_at, price, change_pct, amount, minute_amount, vol, minute_amount_ratio, payload_json
                 FROM stock_features
                 WHERE trade_date = ? AND code = ?
                 ORDER BY captured_at DESC
@@ -1143,17 +1282,8 @@ class IntradayWatchtowerStore:
             ).fetchall()
         output: list[dict[str, Any]] = []
         for row in reversed(rows):
-            payload = self._loads(row["payload_json"])
-            payload.update(
-                {
-                    "captured_at": str(row["captured_at"] or ""),
-                    "price": float(row["price"] or 0),
-                    "change_pct": float(row["change_pct"] or 0),
-                    "amount": float(row["amount"] or 0),
-                    "minute_amount_ratio": float(row["minute_amount_ratio"] or 1),
-                }
-            )
-            output.append(payload)
+            output.append(self._stock_feature_row_from_record(row))
+        self._feature_mem_backfill(normalized_date, normalized_code, output, limit)
         return output
 
     def stock_feature_series_by_code(
@@ -1171,16 +1301,26 @@ class IntradayWatchtowerStore:
             return {}
         limit = max(1, min(int(max_rows or 1200), 2880))
         output: dict[str, list[dict[str, Any]]] = {}
+        # 内存镜像命中部分直接返回（零 SQL 零解压）；未命中的才走批量 SQL 并回填
+        sql_codes: list[str] = []
+        for code in normalized_codes:
+            mem = self._feature_mem_get(normalized_date, code, limit)
+            if mem is None:
+                sql_codes.append(code)
+            elif mem:
+                output[code] = mem
+        if not sql_codes:
+            return output
         # 同上：纯读取不持有 _lock，避免后台批量读/写挡住详情页查询。
         with self._read_connect() as connection:
-            for index, code in enumerate(normalized_codes):
+            for index, code in enumerate(sql_codes):
                 # 大批量读取（后台全量刷新 120 票 × 180 行，含 zlib 解压）是
                 # CPU 密集循环；周期性出让 GIL，避免前台请求被车队效应饿死。
                 if index and index % 16 == 0:
                     time.sleep(0)
                 rows = connection.execute(
                     """
-                    SELECT captured_at, code, price, change_pct, amount, minute_amount_ratio, payload_json
+                    SELECT captured_at, code, price, change_pct, amount, minute_amount, vol, minute_amount_ratio, payload_json
                     FROM stock_features
                     WHERE trade_date = ? AND code = ?
                     ORDER BY captured_at DESC
@@ -1188,22 +1328,13 @@ class IntradayWatchtowerStore:
                     """,
                     (normalized_date, code, limit),
                 ).fetchall()
-                if not rows:
-                    continue
                 series: list[dict[str, Any]] = []
                 for row in reversed(rows):
-                    payload = self._loads(row["payload_json"])
-                    payload.update(
-                        {
-                            "captured_at": str(row["captured_at"] or ""),
-                            "price": float(row["price"] or 0),
-                            "change_pct": float(row["change_pct"] or 0),
-                            "amount": float(row["amount"] or 0),
-                            "minute_amount_ratio": float(row["minute_amount_ratio"] or 1),
-                        }
-                    )
-                    series.append(payload)
-                output[code] = series
+                    series.append(self._stock_feature_row_from_record(row))
+                # 空序列也回填：停牌票当日无行是合法结果，避免每轮重复空查
+                self._feature_mem_backfill(normalized_date, code, series, limit)
+                if series:
+                    output[code] = series
         return output
 
     def stock_feature_mini_series(

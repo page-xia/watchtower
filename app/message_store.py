@@ -31,6 +31,11 @@ from app.models import (
 MESSAGE_OPENID = "watchtower"
 MESSAGE_STORE_GET_RETRIES = 3
 MESSAGE_STORE_MUTATION_RETRIES = 3
+# CloudBase MySQL REST 网关对单请求行数/耗时敏感：大批量 upsert 容易超时或 500。
+# upsert 按键幂等，按 100 行分块串行写入可稳定通过。
+MESSAGE_STORE_UPSERT_CHUNK_SIZE = 100
+# 写请求单独放宽超时（默认读超时只有几秒，批量 upsert 不够用）。
+MESSAGE_STORE_MUTATION_MIN_TIMEOUT = 30.0
 MESSAGE_EVIDENCE_STOCK_CANDIDATE_LIMIT = 120
 MESSAGE_EVIDENCE_SECTOR_CANDIDATE_LIMIT = 80
 MESSAGE_EVIDENCE_SECTOR_FUZZY_LIMIT = 40
@@ -263,6 +268,8 @@ class MessageStore:
             ],
         )
         self._clear_cache()
+        # 写入后异步预热状态缓存，避免下一次 /api/messages/status 冷启动空壳。
+        self._refresh_status_async(("status", True), True)
         self._schedule_refresh(
             stock_codes=sorted(
                 {
@@ -291,12 +298,50 @@ class MessageStore:
             link_count=int(link_count or 0),
         )
 
-    def status(self, ingest_enabled: bool = False) -> MessageStoreStatus:
-        return self._cached(
-            ("status", bool(ingest_enabled)),
-            lambda: self._status_uncached(ingest_enabled=ingest_enabled),
-            ttl=max(self.cache_seconds, MESSAGE_STATUS_CACHE_MIN_SECONDS),
-        )
+    def status(self, ingest_enabled: bool = False, *, wait: bool = False) -> MessageStoreStatus:
+        """Stale-while-revalidate status.
+
+        count=exact on 38 万行的 links 表经 REST 网关要 ~19s，而域名网关
+        ~10s 就断连，同步计算会把 /api/messages/status 打成 000/全 0。
+        默认后台线程刷新缓存：请求永远立即返回（冷启动先给空壳），
+        网关超时不再影响接口可用性。传 wait=True 强制同步计算（测试/脚本用）。
+        """
+        key = ("status", bool(ingest_enabled))
+        ttl = max(self.cache_seconds, MESSAGE_STATUS_CACHE_MIN_SECONDS)
+        if wait:
+            return self._cached(
+                key,
+                lambda: self._status_uncached(ingest_enabled=ingest_enabled),
+                ttl=ttl,
+            )
+        now = monotonic()
+        with self._cache_lock:
+            cached = self._cache.get(key)
+        if cached is not None and now - cached[0] <= ttl:
+            return self._clone(cached[1])
+        self._refresh_status_async(key, ingest_enabled)
+        if cached is not None:
+            return self._clone(cached[1])
+        return MessageStoreStatus(db_file=self.db_file, ingest_enabled=ingest_enabled)
+
+    def _refresh_status_async(self, key: tuple[Any, ...], ingest_enabled: bool) -> None:
+        with self._cache_lock:
+            build_lock = self._cache_build_locks.setdefault(key, threading.Lock())
+        if not build_lock.acquire(blocking=False):
+            return
+
+        def work() -> None:
+            try:
+                value = self._status_uncached(ingest_enabled=ingest_enabled)
+                snapshot = self._clone(value)
+                with self._cache_lock:
+                    self._cache[key] = (monotonic(), snapshot)
+            except Exception as exc:
+                logger.warning("message status background refresh failed: %r", exc)
+            finally:
+                build_lock.release()
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _status_uncached(self, ingest_enabled: bool = False) -> MessageStoreStatus:
         if not self.available:
@@ -964,14 +1009,19 @@ class MessageStore:
     def _upsert_many(self, table: str, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
-        response = self._request(
-            "POST",
-            self._table_url(table),
-            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-            json=rows,
-        )
-        if response.status_code >= 400:
-            raise MessageStoreError(self._error_message(response))
+        mutation_timeout = max(float(self.timeout), MESSAGE_STORE_MUTATION_MIN_TIMEOUT)
+        chunk_size = max(1, MESSAGE_STORE_UPSERT_CHUNK_SIZE)
+        for offset in range(0, len(rows), chunk_size):
+            chunk = rows[offset : offset + chunk_size]
+            response = self._request(
+                "POST",
+                self._table_url(table),
+                headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+                json=chunk,
+                timeout=mutation_timeout,
+            )
+            if response.status_code >= 400:
+                raise MessageStoreError(self._error_message(response))
 
     def _query_rows(
         self,

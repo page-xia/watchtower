@@ -1,4 +1,4 @@
-"""End-to-end API tests: delta WS protocol, opening markers endpoint, gzip."""
+"""End-to-end API tests: delta WS protocol, gzip."""
 
 from __future__ import annotations
 
@@ -7,16 +7,7 @@ from starlette.testclient import TestClient
 from app.main import app
 
 
-def test_opening_markers_endpoint_shape() -> None:
-    with TestClient(app) as client:
-        resp = client.get("/api/opening/markers?offset=0&limit=20")
-    assert resp.status_code == 200
-    payload = resp.json()
-    assert {"trade_date", "total", "offset", "limit", "items"} <= set(payload)
-    assert isinstance(payload["items"], list)
-
-
-def test_websocket_delta_snapshot_contains_opening_markers() -> None:
+def test_websocket_delta_snapshot_contains_stock_board() -> None:
     with TestClient(app) as client:
         with client.websocket_connect("/ws/stream?view=terminal&format=delta&page_size=5") as ws:
             message = ws.receive_json()
@@ -24,7 +15,6 @@ def test_websocket_delta_snapshot_contains_opening_markers() -> None:
     assert message["seq"] == 1
     data = message["data"]
     assert "stock_board" in data
-    assert "opening_markers" in data  # 菱形流分区挂载在终端 payload 上
 
 
 def test_websocket_legacy_format_still_full_payload() -> None:

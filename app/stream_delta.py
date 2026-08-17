@@ -25,7 +25,6 @@ _REPLACE_SECTIONS = (
     "watchlist",
     "watchlist_preview",
     "positions_preview",
-    "opening_markers",
 )
 
 # Rarely-changing top-level scalar fields, grouped into one meta section.
@@ -52,6 +51,10 @@ _BOARD_META_FIELDS = (
     "data_mode",
     "frozen",
     "available_sorts",
+    "near_trend",
+    "near_trend_ready",
+    "near_trend_pending",
+    "pin_buy",
 )
 
 

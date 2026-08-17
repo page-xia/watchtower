@@ -213,7 +213,7 @@ def test_message_store_uses_cloudbase_mysql_rest_and_preserves_media_logic() -> 
 
     first = store.upsert_messages(ingest_payload())
     second = store.upsert_messages(ingest_payload(summary="更新后的PCB订单摘要。"))
-    status = store.status(ingest_enabled=True)
+    status = store.status(ingest_enabled=True, wait=True)
     evidence = store.evidence_for("300476", ["PCB"])
     detail = store.message_detail("event-1", ingest_enabled=True)
 
@@ -383,7 +383,7 @@ def test_message_store_records_reported_counts_for_summary_run() -> None:
     )
 
     response = store.upsert_messages(payload)
-    status = store.status(ingest_enabled=True)
+    status = store.status(ingest_enabled=True, wait=True)
 
     assert response.topic_count == 667
     assert response.event_count == 68
@@ -401,7 +401,7 @@ def test_message_store_records_reported_counts_for_summary_run() -> None:
 def test_message_store_is_empty_and_non_sqlite_when_cloudbase_mysql_is_not_configured() -> None:
     store = MessageStore(env_id="", token="", instance="default", schema="server-d2g7x597t019f5cb0")
 
-    status = store.status(ingest_enabled=True)
+    status = store.status(ingest_enabled=True, wait=True)
 
     assert status.db_file == "cloudbase_mysql://unconfigured"
     assert status.topic_count == 0
@@ -418,8 +418,8 @@ def test_message_store_reuses_recent_status_and_evidence_results() -> None:
     store.upsert_messages(ingest_payload())
     fake.requests.clear()
 
-    first_status = store.status(ingest_enabled=True)
-    second_status = store.status(ingest_enabled=True)
+    first_status = store.status(ingest_enabled=True, wait=True)
+    second_status = store.status(ingest_enabled=True, wait=True)
     first_evidence = store.evidence_for("300476", ["PCB"])
     second_evidence = store.evidence_for("300476", ["PCB"])
 

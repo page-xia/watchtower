@@ -1,306 +1,221 @@
-from __future__ import annotations
+"""做T分时公式（做T公式.md / zuot_tdx_levels_v1）的单元测试。"""
 
-import pytest
+import time
 
 from app.formula_engine import (
-    CROSS,
-    DEFAULT_TREND_NEAR_THRESHOLD_PCT,
-    EMA,
-    FILTER,
-    HHV,
-    LLV,
-    MA,
-    REF,
-    SAR,
-    SMA,
-    FormulaSeriesResult,
-    TrendLineSeriesResult,
-    compute_formula_series,
-    compute_formula_state,
-    compute_trend_line_series,
-    evaluate_gold_resonance,
-    summarize_l1_transactions,
-    trend_line_proximity,
+    BIG_MINUTE_AMOUNT_YUAN,
+    SIGNAL_VERSION,
+    ZuoTDayContext,
+    compute_zuot_series,
+    compute_zuot_state,
+    cross,
+    ema,
+    latest_zuot_event,
+    longcross,
 )
 
 
-def _bars(prices: list[float]) -> list[dict[str, float | str]]:
+def _rows(closes, vol=1000.0):
+    """构造分钟行：vol 单位手，amount 由 vol*close*100 推导（元）。"""
     return [
-        {
-            "time": f"09:{31 + index:02d}",
-            "open": price * 0.998,
-            "high": price * 1.01,
-            "low": price * 0.99,
-            "close": price,
-            "price": price,
-        }
-        for index, price in enumerate(prices)
+        {"time": f"09:{31 + i:02d}", "close": c, "vol": vol}
+        for i, c in enumerate(closes)
     ]
 
 
-def _tight_bars(prices: list[float]) -> list[dict[str, float | str]]:
-    return [
-        {
-            "time": f"09:{31 + index:02d}",
-            "open": price,
-            "high": price * 1.001,
-            "low": price * 0.999,
-            "close": price,
-            "price": price,
-        }
-        for index, price in enumerate(prices)
-    ]
+# 标准日上下文：l1=100, h1=116, p1=16 → 支撑=101, 阻力=114, 中轴=107.5
+DAY = ZuoTDayContext(
+    prev_close=100.0,
+    day_high=116.0,
+    day_low=100.0,
+    change_pct=2.0,
+    volume_ratio=1.2,
+    turnover_rate=3.5,
+    total_amount=100_000_000.0,  # 1亿 → 10000万
+    outer_volume=6000.0,
+    inner_volume=4000.0,
+)
 
 
-def test_tdx_moving_window_functions_use_visible_prefix() -> None:
-    values = [1.0, 2.0, 3.0, 2.0, 5.0]
-
-    assert MA(values, 3) == pytest.approx([1.0, 1.5, 2.0, 7 / 3, 10 / 3])
-    assert EMA([1.0, 2.0, 3.0], 3) == pytest.approx([1.0, 1.5, 2.25])
-    assert SMA([1.0, 2.0, 3.0], 3, 1) == pytest.approx([1.0, 4 / 3, 17 / 9])
-    assert HHV(values, 3) == [1.0, 2.0, 3.0, 3.0, 5.0]
-    assert LLV(values, 3) == [1.0, 1.0, 1.0, 2.0, 2.0]
-    assert REF(values, 2) == [None, None, 1.0, 2.0, 3.0]
-
-
-def test_cross_filter_and_sar_are_point_in_time() -> None:
-    assert CROSS([1, 2, 1, 4], [1.5, 1.5, 1.5, 1.5]) == [False, True, False, True]
-    assert FILTER([True, True, False, True, True, False], 2) == [True, False, False, True, False, False]
-
-    highs = [10, 10.2, 10.4, 10.3, 10.1, 9.9, 10.0]
-    lows = [9.8, 9.9, 10.0, 9.9, 9.7, 9.5, 9.6]
-    closes = [9.9, 10.1, 10.3, 10.0, 9.8, 9.6, 9.9]
-    short = SAR(highs, lows, closes, 10, 2, 20)
-    extended = SAR(highs + [99, 1], lows + [98, 0.8], closes + [98.5, 1.0], 10, 2, 20)
-
-    assert len(short) == len(highs)
-    assert all(value is not None for value in short)
-    assert short == pytest.approx(extended[: len(short)])
+def test_ema_matches_tdx_recursion():
+    values = [10.0, 11.0, 12.0, 13.0]
+    result = ema(values, 3)
+    alpha = 2.0 / 4.0
+    assert result[0] == 10.0
+    for i in range(1, len(values)):
+        expected = alpha * values[i] + (1 - alpha) * result[i - 1]
+        assert abs(result[i] - expected) < 1e-9
 
 
-def test_formula_series_exports_chinese_and_snake_case_state_keys() -> None:
-    prices = [
-        10.0,
-        9.94,
-        9.88,
-        9.82,
-        9.76,
-        9.72,
-        9.70,
-        9.84,
-        10.02,
-        10.18,
-        10.25,
-    ]
-    rows = _tight_bars(prices)
-    trend = compute_trend_line_series(rows, trend_near_threshold_pct=1.0)
-    result = compute_formula_series(rows, trend_near_threshold_pct=1.0, trend_states=trend.states)
-    latest = result.latest
-
-    assert isinstance(result, FormulaSeriesResult)
-    assert isinstance(trend, TrendLineSeriesResult)
-    assert len(result.states) == len(rows)
-    assert latest["多方力度"] == latest["duo_strength"]
-    assert latest["空方力度"] == latest["kong_strength"]
-    assert latest["白线"] == latest["white_line"]
-    assert latest["黄线"] == latest["yellow_line"]
-    assert latest["赶快出手原始值"] == 0
-    assert "CROSS(多方力度,6.78)" in latest["赶快出手说明"]
-    assert latest["validation_status"] == "research_only"
-    assert latest["near_trend_threshold_pct"] == 1.0
-    assert latest["source_quality"] == "tdx_formula_minute+daily_trend"
-
-    expected_white = EMA(EMA(prices, 10), 10)[-1]
-    ma14, ma28, ma57, ma114 = (MA(prices, period)[-1] for period in (14, 28, 57, 114))
-    expected_yellow = (ma14 + ma28 + ma57 + ma114) / 4
-    assert latest["white_line"] == pytest.approx(expected_white)
-    assert latest["yellow_line"] == pytest.approx(expected_yellow)
-    assert result.states[2]["protection_price"] == pytest.approx((prices[0] + prices[1] + rows[2]["open"]) / 3)
+def test_cross_scalar_and_series():
+    # 上穿常量
+    assert cross([1.0, 2.0, 3.0], 2.0) == [False, False, True]
+    # 下穿不算（CROSS 只认上穿）
+    assert cross([3.0, 2.0, 1.0], 2.0) == [False, False, False]
+    # 序列对序列
+    assert cross([1.0, 3.0], [2.0, 2.0]) == [False, True]
+    # 首根永远 False
+    assert cross([5.0], 1.0) == [False]
 
 
-def test_formula_state_and_sar_do_not_change_when_future_bars_are_appended() -> None:
-    base = _bars([10.0, 9.94, 9.88, 9.82, 9.76, 9.72, 9.70, 9.84, 10.02])
-    future = _bars([88.0, 1.0, 99.0])
-
-    short = compute_formula_series(base).states
-    extended = compute_formula_series(base + future).states
-
-    assert short == extended[: len(short)]
-
-
-def test_quick_entry_uses_cross_of_bullish_power_not_original_zero_field() -> None:
-    prices = [10.0, 9.5, 9.1, 8.8, 8.6, 8.5, 8.7, 9.3, 10.0, 10.8, 11.2]
-    result = compute_formula_series(_bars(prices))
-
-    quick_states = [state for state in result.states if state["quick_entry"]]
-
-    assert quick_states
-    assert all(state["赶快出手原始值"] == 0 for state in quick_states)
-    assert quick_states[0]["多方力度"] > 6.78
+def test_longcross_requires_sustained_below():
+    # left 在前 2 根一直低于 right，本根上穿 → True
+    assert longcross([1.0, 1.0, 2.0], [1.5, 1.5, 1.5], 2) == [False, False, True]
+    # 只有 1 根低于 → False（不满足 N=2 持续低于）
+    assert longcross([2.0, 1.0, 2.0], [1.5, 1.5, 1.5], 2) == [False, False, False]
+    # 未上穿 → False
+    assert longcross([1.0, 1.0, 1.2], [1.5, 1.5, 1.5], 2) == [False, False, False]
 
 
-def test_today_protection_price_uses_two_prior_closes_and_current_open() -> None:
-    rows = _bars([10.0, 10.2, 10.4, 10.6])
-    result = compute_formula_series(rows)
-
-    assert result.states[0]["protection_price"] is None
-    assert result.states[1]["protection_price"] is None
-    assert result.states[2]["今日保护价"] == pytest.approx((10.0 + 10.2 + rows[2]["open"]) / 3)
-    assert result.states[3]["protection_price"] == pytest.approx((10.2 + 10.4 + rows[3]["open"]) / 3)
-
-
-def test_gold_resonance_requires_buy_candidate_near_trend_and_vetoes_l1_pressure() -> None:
-    formula_hit = {
-        "赶快出手": True,
-        "主力吸筹": 1.2,
-        "near_trend_line": False,
-    }
-    near_formula_hit = {
-        **formula_hit,
-        "near_trend_line": True,
-        "near_trend_line_name": "白线",
-    }
-
-    rejected, rejected_reasons = evaluate_gold_resonance(formula_hit, buy_candidate=False)
-    far_gold, far_reasons = evaluate_gold_resonance(formula_hit, buy_candidate=True, l1_buy_support=True)
-    gold, reasons = evaluate_gold_resonance(near_formula_hit, buy_candidate=True, l1_buy_support=True)
-    vetoed, veto_reasons = evaluate_gold_resonance(near_formula_hit, buy_candidate=True, l1_sell_pressure=True)
-
-    assert rejected is False
-    assert rejected_reasons == ["非买T候选"]
-    assert far_gold is False
-    assert far_reasons == []
-    assert gold is True
-    assert "赶快出手+主力吸筹" in reasons
-    assert "接近白线" in reasons
-    assert "L1逐笔买盘支持" in reasons
-    assert vetoed is False
-    assert "L1明显抛压否决" in veto_reasons
+def test_day_context_levels():
+    assert DAY.h1 == 116.0
+    assert DAY.l1 == 100.0
+    assert abs(DAY.resistance - 114.0) < 1e-9  # 100 + 16*7/8
+    assert abs(DAY.support - 101.0) < 1e-9  # 100 + 16*0.5/8
+    assert abs(DAY.mid - 107.5) < 1e-9
+    assert DAY.levels_available
 
 
-def test_gold_resonance_can_use_near_white_or_yellow_trend_line() -> None:
-    state = {
-        "buy_candidate": True,
-        "quick_entry": False,
-        "main_accumulation": 0.0,
-        "near_trend_line": True,
-        "near_trend_line_name": "黄线",
-    }
-
-    gold, reasons = evaluate_gold_resonance(state, buy_candidate=True)
-
-    assert gold is True
-    assert "接近黄线" in reasons
+def test_day_context_unavailable_levels_are_zero():
+    empty = ZuoTDayContext()
+    assert not empty.levels_available
+    assert empty.resistance == 0.0
+    assert empty.support == 0.0
+    assert empty.mid == 0.0
 
 
-def test_near_trend_line_alone_does_not_create_formula_buy_or_gold() -> None:
-    rows = _bars([10.0] * 10)
-    trend = compute_trend_line_series(rows, trend_near_threshold_pct=1.0)
-    result = compute_formula_series(rows, trend_near_threshold_pct=1.0, trend_states=trend.states)
-
-    assert all(state["near_trend_line"] for state in result.states)
-    assert not any(state["buy_candidate"] for state in result.states)
-    assert not any(state["gold_resonance"] for state in result.states)
+def test_empty_rows_return_empty():
+    result = compute_zuot_series([], DAY)
+    assert result.states == []
+    assert result.latest == {}
 
 
-def test_minute_formula_without_external_trend_does_not_invent_near_line() -> None:
-    result = compute_formula_series(_bars([10.0] * 10), trend_near_threshold_pct=1.0)
-
-    assert all(state["white_line"] == 0 for state in result.states)
-    assert all(state["yellow_line"] == 0 for state in result.states)
-    assert not any(state["near_trend_line"] for state in result.states)
-    assert all(state["trend_source_quality"] == "trend_unavailable" for state in result.states)
-
-
-def test_default_near_trend_line_threshold_is_three_percent() -> None:
-    rows = _bars([10.0] * 120 + [10.3])
-    trend = compute_trend_line_series(rows)
-    strict_trend = compute_trend_line_series(rows, trend_near_threshold_pct=2.8)
-    result = compute_formula_series(rows, trend_states=trend.states)
-    strict = compute_formula_series(rows, trend_near_threshold_pct=2.8, trend_states=strict_trend.states)
-
-    assert result.latest["near_trend_threshold_pct"] == DEFAULT_TREND_NEAR_THRESHOLD_PCT
-    assert result.latest["trend_distance_pct"] == pytest.approx(2.815443, abs=0.0001)
-    assert result.latest["near_trend_line"] is True
-    assert strict.latest["near_trend_line"] is False
-
-
-def test_trend_line_proximity_uses_three_percent_of_current_price_boundary() -> None:
-    near_white = trend_line_proximity(100.0, 97.0, 103.2)
-    near_yellow = trend_line_proximity(100.0, 96.8, 102.99)
-    outside = trend_line_proximity(100.0, 96.99, 103.01)
-
-    assert near_white["near_trend_threshold_pct"] == DEFAULT_TREND_NEAR_THRESHOLD_PCT
-    assert near_white["white_distance_pct"] == pytest.approx(3.0)
-    assert near_white["yellow_distance_pct"] == pytest.approx(3.2)
-    assert near_white["trend_distance_pct"] == pytest.approx(3.0)
-    assert near_white["near_trend_line"] is True
-    assert near_white["near_trend_line_name"] == "白线"
-    assert near_yellow["near_trend_line"] is True
-    assert near_yellow["near_trend_line_name"] == "黄线"
-    assert outside["trend_distance_pct"] == pytest.approx(3.01)
-    assert outside["near_trend_line"] is False
-
-
-def test_trend_line_proximity_rejects_far_600206_example() -> None:
-    result = trend_line_proximity(52.63, 42.59, 41.06)
-
-    assert result["white_distance_pct"] == pytest.approx(19.0766, abs=0.0001)
-    assert result["yellow_distance_pct"] == pytest.approx(21.9837, abs=0.0001)
-    assert result["near_trend_line"] is False
-    assert result["trend_distance_pct"] > DEFAULT_TREND_NEAR_THRESHOLD_PCT
-
-
-def test_sell_candidate_uses_drawicon_rsi_cross_primitive() -> None:
-    result = compute_formula_series(_bars([10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 12.0]))
-    sell_states = [state for state in result.states if state["sell_candidate"]]
-
-    assert sell_states
-    assert sell_states[0]["sell_trigger"] is True
-    assert sell_states[0]["sell_signal_reasons"] == ["DRAWICON(CROSS(88.8,RSI),90,15)"]
-
-
-def test_l1_transaction_summary_treats_special_buyorsell_as_neutral() -> None:
+def test_vwap_is_cumulative():
     rows = [
-        {"time": "09:31:01", "price": 10.0, "vol": 100, "buyorsell": 0},
-        {"time": "09:31:02", "price": 10.1, "vol": 60, "buyorsell": 1},
-        {"time": "09:31:03", "price": 10.2, "vol": 50, "buyorsell": 7},
-        {"time": "09:31:04", "price": 10.3, "vol": 40},
-        {"time": "09:31:05", "price": 10.2, "vol": 30},
+        {"time": "09:31", "close": 10.0, "vol": 100.0},
+        {"time": "09:32", "close": 20.0, "vol": 300.0},
     ]
-
-    summary = summarize_l1_transactions(rows)
-
-    assert summary.count == 5
-    assert summary.buy_amount == pytest.approx(100_000 + 41_200)
-    assert summary.sell_amount == pytest.approx(60_600 + 30_600)
-    assert summary.neutral_amount == pytest.approx(51_000)
-    assert summary.available is True
+    result = compute_zuot_series(rows, DAY)
+    # 第一根 vwap = close（等量兜底）；第二根 = (10*100 + 20*300) / (100+300) = 17.5
+    assert abs(result.states[0]["vwap"] - 10.0) < 1e-6
+    assert abs(result.states[1]["vwap"] - 17.5) < 1e-6
 
 
-def test_compute_formula_state_can_attach_l1_gold_fields_without_changing_series_api() -> None:
-    prices = [10.0 - 0.01 * index for index in range(20)]
-    prices.extend([prices[-1] + 0.01 * step for step in range(1, 3)])
-    rows = _tight_bars(prices)
-    trend_states = compute_trend_line_series(rows).states
-    state = compute_formula_state(
-        rows,
-        l1_flow={"available": True, "rolling_score": 32, "rolling_imbalance_pct": 24, "rolling_count": 20},
-        trend_states=trend_states,
-    ).to_dict()
+def test_big_minute_amount_classification():
+    big = BIG_MINUTE_AMOUNT_YUAN + 1.0  # 160万+1元
+    rows = [
+        {"time": "09:31", "close": 100.0, "vol": 10.0, "amount": 1000.0},
+        {"time": "09:32", "close": 101.0, "vol": 10.0, "amount": big},  # 上涨大单 → A2
+        {"time": "09:33", "close": 100.5, "vol": 10.0, "amount": big},  # 下跌大单 → A3
+        {"time": "09:34", "close": 100.6, "vol": 10.0, "amount": 1000.0},  # 小单不计
+    ]
+    result = compute_zuot_series(rows, DAY)
+    last = result.states[-1]
+    wan = big / 10_000.0
+    # states 层 big_buy/big_sell 保留两位小数（万元）
+    assert abs(last["big_buy_amount"] - wan) < 0.01
+    assert abs(last["big_sell_amount"] - wan) < 0.01
+    assert abs(last["fund_flow"]) < 0.02  # 买卖抵消
+    # 首根（index=0）即使金额达标也不累计（无上一根可比方向）
+    first = result.states[0]
+    assert first["big_buy_amount"] == 0
+    assert first["big_sell_amount"] == 0
 
-    assert state["l1_buy_support"] is True
-    assert state["l1_sell_pressure"] is False
-    assert state["quick_entry"] is True
-    assert state["gold_resonance"] is True
-    assert "L1逐笔买盘支持" in state["resonance_reasons"]
 
-    pressured = compute_formula_state(
-        rows,
-        l1_flow={"available": True, "rolling_score": -35, "rolling_imbalance_pct": -32, "rolling_count": 20},
-        trend_states=trend_states,
-    ).to_dict()
-    assert pressured["l1_sell_pressure"] is True
-    assert pressured["quick_entry"] is True
-    assert pressured["gold_resonance"] is False
-    assert "L1明显抛压否决" in pressured["resonance_reasons"]
+def test_buy_signal_on_support_reclaim_break():
+    # 支撑=101：前 3 根现价在支撑上方，第 4 根跌破支撑 → LONGCROSS(支撑,现价,2) 触发买
+    closes = [102.0, 102.5, 102.2, 100.5]
+    result = compute_zuot_series(_rows(closes), DAY)
+    signals = [s["buy_signal"] for s in result.states]
+    assert signals == [False, False, False, True]
+
+
+def test_sell_signal_on_resistance_breakout():
+    # 阻力=114：前 3 根现价在阻力下方，第 4 根突破阻力 → LONGCROSS(现价,阻力,2) 触发卖
+    closes = [112.0, 113.0, 113.5, 114.5]
+    result = compute_zuot_series(_rows(closes), DAY)
+    signals = [s["sell_signal"] for s in result.states]
+    assert signals == [False, False, False, True]
+
+
+def test_no_signals_without_levels():
+    result = compute_zuot_series(_rows([100.0, 99.0, 98.0]))
+    assert all(not s["buy_signal"] and not s["sell_signal"] for s in result.states)
+
+
+def test_score_and_advice_full_marks():
+    # 单边上行：ma30>qs、现价>vwap、现价>支撑；再加一根上涨大单让 A2>A3 → 满分 100
+    closes = [100.0 + i * 0.5 for i in range(40)]
+    rows = _rows(closes)
+    rows[-1]["amount"] = BIG_MINUTE_AMOUNT_YUAN * 2  # 尾盘上涨大单
+    latest = compute_zuot_state(rows, DAY)
+    assert latest["score"] == 100
+    assert latest["advice"].startswith("★强推")
+    assert latest["trend_text"] == "多头强势"
+    assert latest["position_text"] in {"强势区", "突破阻力"}
+    assert latest["vwap_relation"] == "↑均价"
+    assert latest["source_quality"] == SIGNAL_VERSION
+
+
+def test_score_zero_in_downtrend_below_support():
+    # 单边下行且现价跌破支撑 → 0 分规避
+    closes = [115.0 - i * 0.5 for i in range(40)]
+    latest = compute_zuot_state(_rows(closes), DAY)
+    assert latest["score"] == 0
+    assert latest["advice"].startswith("X规避")
+    assert latest["position_text"] == "跌破支撑"
+
+
+def test_outer_inner_amount_split():
+    # 总额 1亿=10000万，外盘 6000 / 内盘 4000 → 买 6000万 卖 4000万 净 +2000万
+    latest = compute_zuot_state(_rows([102.0, 102.5, 102.8]), DAY)
+    assert abs(latest["buy_amount_wan"] - 6000.0) < 1e-6
+    assert abs(latest["sell_amount_wan"] - 4000.0) < 1e-6
+    assert abs(latest["net_amount_wan"] - 2000.0) < 1e-6
+    assert abs(latest["buy_pct"] - 60.0) < 1e-6
+    assert abs(latest["sell_pct"] - 40.0) < 1e-6
+
+
+def test_latest_texts_and_lines():
+    latest = compute_zuot_state(_rows([102.0, 102.5, 102.8]), DAY)
+    assert latest["volume_text"] == "平量"  # volume_ratio=1.2
+    assert latest["line_a"].startswith("个股 ")
+    assert "|" in latest["line_a"]
+    assert latest["line_b"].startswith("资金")
+    assert latest["change_pct"] == 2.0
+    assert latest["turnover_rate"] == 3.5
+    assert latest["volume_ratio"] == 1.2
+
+
+def test_latest_zuot_event_window():
+    closes = [102.0, 102.5, 102.2, 100.5]  # 第 4 根触发买信号
+    states = compute_zuot_series(_rows(closes), DAY).states
+    event = latest_zuot_event(states, recent_bars=3)
+    assert event is not None
+    assert event["signal"] == "buy"
+    assert event["index"] == 3
+    assert event["invalidation_price"] == states[3]["support"]
+    # 窗口只盖最近 1 根时事件仍可见；空序列返回 None
+    assert latest_zuot_event([], recent_bars=3) is None
+    # 信号在窗口之外（recent_bars=0 视为 1，只看最后一根）
+    earlier = compute_zuot_series(_rows([102.0, 102.5, 102.2, 100.5, 101.5, 101.8]), DAY).states
+    event2 = latest_zuot_event(earlier, recent_bars=2)
+    assert event2 is None
+
+
+def test_point_in_time_and_performance():
+    # 240 根分钟线：全量递推必须秒级内完成（回归：旧公式此处 O(n²) 级 CPU）
+    closes = [100.0 + (i % 17) * 0.3 for i in range(240)]
+    rows = _rows(closes)
+    start = time.perf_counter()
+    result = compute_zuot_series(rows, DAY)
+    elapsed = time.perf_counter() - start
+    assert len(result.states) == 240
+    assert elapsed < 0.5
+    # point-in-time：前 i 根的最新状态与全量第 i 个状态的买卖信号一致
+    for cut in (30, 120, 239):
+        prefix = compute_zuot_series(rows[: cut + 1], DAY).states[-1]
+        full = result.states[cut]
+        assert prefix["buy_signal"] == full["buy_signal"]
+        assert prefix["sell_signal"] == full["sell_signal"]
+        assert abs(prefix["vwap"] - full["vwap"]) < 1e-6

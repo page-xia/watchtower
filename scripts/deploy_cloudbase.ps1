@@ -123,13 +123,17 @@ function Get-PropertyValue {
 
 function Convert-ToArray {
     param([object]$Value)
+    # PowerShell 管道会展开单元素数组；用 , 前缀阻止展开，
+    # 保证调用方拿到的始终是数组（夜间/开盘前指数分钟线只有 1 个点时
+    # 单元素 JSON 数组会被 Invoke-RestMethod 标量化，否则 $points.Count
+    # 在 StrictMode 下抛“找不到属性 Count”）。
     if ($null -eq $Value) {
-        return @()
+        return , @()
     }
     if ($Value -is [array]) {
-        return $Value
+        return , $Value
     }
-    return @($Value)
+    return , @($Value)
 }
 
 function Get-ChinaNow {
@@ -250,6 +254,13 @@ function Show-SmokeSummary {
         $points = Convert-ToArray (Get-PropertyValue -Object $series -Name "points")
         if ($points.Count -eq 0) {
             Write-Host ("index {0} {1}: 0 points" -f $code, $name)
+            continue
+        }
+        # 夜间/开盘前指数分钟线只有 15:00 收盘快照一个点，属于正常状态，
+        # 不参与“开盘点位过晚/尾部过期”检查，否则夜间部署永远无法通过冒烟。
+        if ($points.Count -eq 1 -and ([string](Get-PropertyValue -Object $points[0] -Name "time")) -eq "15:00") {
+            Write-Host ("index {0} {1}: after-hours close snapshot, freshness checks skipped" -f $code, $name)
+            $indexSeriesWithPoints += 1
             continue
         }
         $firstTime = Get-PropertyValue -Object $points[0] -Name "time"

@@ -14,3 +14,5 @@ logs/*
 做T公式.md
 intraday_watchtower.egg-info/*
 ts2db_config.yaml
+*.json
+公式/*

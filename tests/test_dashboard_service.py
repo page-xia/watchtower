@@ -381,8 +381,8 @@ def test_mini_chart_adds_lightweight_current_signal_marker(tmp_path) -> None:
         price=21.2,
         change_pct=10.02,
         signal_time="09:45",
-        signal_grade="金色共振买T",
-        factor_flags=["公式买入原语", "金色共振"],
+        signal_grade="做T公式买T",
+        factor_flags=["公式买入原语"],
     )
     chart = MiniIntradaySeries(
         times=["09:30", "09:45"],
@@ -397,7 +397,7 @@ def test_mini_chart_adds_lightweight_current_signal_marker(tmp_path) -> None:
     assert marked.markers
     assert marked.markers[0].time == "09:45"
     assert marked.markers[0].signal == SignalType.BUY_T
-    assert marked.markers[0].gold_resonance is True
+    assert "公式买入原语" in marked.markers[0].reasons
 
 
 def test_formula_rows_for_context_prefers_watchlist_and_positions(tmp_path, monkeypatch) -> None:
@@ -898,6 +898,7 @@ def test_dashboard_sector_filter_keeps_only_selected_sector(tmp_path, monkeypatc
 
 
 def test_signal_detail_overlay_uses_formula_replay_markers(tmp_path, monkeypatch) -> None:
+    """详情叠加层买卖标记唯一来源：做T公式 LONGCROSS 信号（chart/overlay 共享 bundle）。"""
     service = make_service(tmp_path)
     context = SimpleNamespace(
         context=DashboardContext(
@@ -927,61 +928,6 @@ def test_signal_detail_overlay_uses_formula_replay_markers(tmp_path, monkeypatch
         live_mode=False,
     )
     monkeypatch.setattr(service, "_signal_detail_context", lambda *args, **kwargs: context)
-
-    captured = {}
-
-    def capture_replay(*args, **kwargs):  # noqa: ANN002, ANN003
-        captured["bars"] = args[1]
-        captured["transaction_flow"] = kwargs["transaction_flow"]
-        return (
-            [
-                {"time": "09:44", "price": 10.4, "change_pct": 4.0},
-                {"time": "09:45", "price": 10.45, "change_pct": 4.2},
-                {"time": "09:46", "price": 10.5, "change_pct": 4.5},
-            ],
-            [
-                ReplayMarker(
-                    time="09:44",
-                    signal=SignalType.BUY_T,
-                    price=10.4,
-                    change_pct=4.0,
-                    phase=SignalPhase.CONFIRM.value,
-                    action="buy_t",
-                    direction="positive_t",
-                ),
-                ReplayMarker(
-                    time="09:45",
-                    signal=SignalType.BUY_T,
-                    price=10.45,
-                    change_pct=4.2,
-                    phase=SignalPhase.CONFIRM.value,
-                    action="buy_t",
-                    direction="positive_t",
-                ),
-                ReplayMarker(
-                    time="09:46",
-                    signal=SignalType.BUY_T,
-                    price=10.5,
-                    change_pct=4.5,
-                    phase=SignalPhase.CONFIRM.value,
-                    action="buy_t",
-                    direction="positive_t",
-                ),
-                ReplayMarker(
-                    time="09:46",
-                    signal=SignalType.SELL_T,
-                    price=10.5,
-                    change_pct=4.5,
-                    phase=SignalPhase.SELL_CONFIRM.value,
-                    action="sell_base",
-                    direction="reverse_t",
-                ),
-            ],
-            [],
-            ["公式引擎：做T买卖点唯一来源"],
-        )
-
-    monkeypatch.setattr(service.engine, "build_replay_detail", capture_replay)
     monkeypatch.setattr(
         service,
         "_fetch_transaction_flow",
@@ -994,26 +940,37 @@ def test_signal_detail_overlay_uses_formula_replay_markers(tmp_path, monkeypatch
             evidence=["买盘增强"],
         ),
     )
+    # quote(): prev_close=10, day_high=10.8, day_low=9.8 → 支撑=9.8625, 阻力=10.675
+    closes = [10.0, 10.05, 10.02, 9.80, 10.0, 10.3, 10.5, 10.70]
     monkeypatch.setattr(
         service.data_source,
         "fetch_minute_series",
         lambda *args, **kwargs: [
-            {"time": "09:44", "price": 10.4, "change_pct": 4.0, "vol": 100},
-            {"time": "09:45", "price": 10.45, "change_pct": 4.2, "vol": 120},
-            {"time": "09:46", "price": 10.5, "change_pct": 4.5, "vol": 130},
+            {"time": f"09:{44 + i:02d}", "price": c, "vol": 100 + i * 10}
+            for i, c in enumerate(closes)
         ],
     )
 
     payload = service.signal_detail_overlay("300476", sector="PCB", trade_date="20260807")
 
     assert payload.code == "300476"
-    assert payload.markers
+    # 买：LONGCROSS(支撑,现价,2) —— 第 4 根跌破支撑 9.8625
+    # 卖：LONGCROSS(现价,阻力,2) —— 第 8 根突破阻力 10.675
     assert [(marker.time, marker.signal) for marker in payload.markers] == [
-        ("09:44", SignalType.BUY_T),
-        ("09:45", SignalType.BUY_T),
+        ("09:47", SignalType.BUY_T),
+        ("09:51", SignalType.SELL_T),
     ]
-    assert captured["bars"][0]["time"] == "09:44"
-    assert captured["transaction_flow"].available is True
+    buy_marker, sell_marker = payload.markers
+    assert buy_marker.setup == "zuot_support_rebound"
+    assert "LONGCROSS(支撑,现价,2)" in buy_marker.reasons[0]
+    assert abs(buy_marker.invalidation_price - 9.8625) < 0.01
+    assert sell_marker.setup == "zuot_resistance_fade"
+    assert "LONGCROSS(现价,阻力,2)" in sell_marker.reasons[0]
+    assert abs(sell_marker.invalidation_price - 10.675) < 0.01
+    assert buy_marker.source_quality == "zuot_tdx_levels_v1"
+    # 公式状态来自同一批分钟行
+    assert payload.formula_state.point_count == len(closes)
+    assert payload.formula_state.support > 0
     dumped = payload.model_dump(mode="json")
     assert "replay_points" not in dumped
     assert "sector_focus" not in dumped
@@ -1079,22 +1036,27 @@ def test_live_detail_chart_and_overlay_share_tail_merged_minute_rows(tmp_path, m
             count=1,
         ),
     )
-    captured: dict[str, list[dict]] = {}
 
-    def capture_replay(*args, **kwargs):  # noqa: ANN002, ANN003, ARG001
-        captured["bars"] = args[1]
-        return [], [], [], []
+    calls = {"count": 0}
+    original = DashboardService._shared_stock_chart_rows
 
-    monkeypatch.setattr(service.engine, "build_replay_detail", capture_replay)
+    def counting(self, info):  # noqa: ANN001, ANN202
+        calls["count"] += 1
+        return original(self, info)
+
+    monkeypatch.setattr(DashboardService, "_shared_stock_chart_rows", counting)
 
     chart = service.signal_detail_chart("300476", sector="PCB", trade_date="20260810")
-    service.signal_detail_overlay("300476", sector="PCB", trade_date="20260810")
+    overlay = service.signal_detail_overlay("300476", sector="PCB", trade_date="20260810")
 
+    # chart 与 overlay 共用同一份尾盘合并分钟行（bundle 级缓存，只建一次）
+    assert calls["count"] == 1
     assert chart.chart.times == ["10:08", "10:09", "10:10"]
     assert chart.chart.prices[-1] == 10.86
     assert chart.chart.latest_price == 10.86
-    assert captured["bars"][-1]["time"] == "10:10"
-    assert captured["bars"][-1]["price"] == 10.86
+    # overlay 的公式状态也来自含实时尾行（10.86）的同一批数据
+    assert overlay.formula_state.price == 10.86
+    assert overlay.formula_state.point_count == 3
 
 
 def test_pinned_signals_sort_before_unpinned_within_bucket(tmp_path) -> None:
@@ -1671,7 +1633,7 @@ def test_signal_detail_extras_does_not_load_chart_or_transaction_data(tmp_path, 
 
     monkeypatch.setattr(service.data_source, "fetch_minute_series", forbidden)
     monkeypatch.setattr(service, "_fetch_transaction_flow", forbidden)
-    monkeypatch.setattr(service.engine, "build_replay_detail", forbidden)
+    monkeypatch.setattr(service, "_stock_detail_bundle", forbidden)
 
     payload = service.signal_detail_extras("300476", sector="PCB", trade_date="20260806")
     dumped = payload.model_dump(mode="json")
@@ -1770,6 +1732,63 @@ def test_signal_detail_extras_keeps_response_when_message_evidence_fails(tmp_pat
     # 详情 extras 不再加载 message_status（大表 count=exact，前端不消费），
     # 同步状态走 /api/messages/status。
     assert payload.message_status is None
+
+
+def test_signal_detail_extras_skips_message_evidence_when_not_requested(tmp_path, monkeypatch) -> None:
+    """include_messages=False 时不查 CloudBase 消息证据（详情页默认不加载星球消息）。"""
+    service = make_service(tmp_path)
+    quote_item = quote("300476", "胜宏科技", ["PCB"])
+    current_signal = signal("300476", "胜宏科技", "PCB", SignalType.BUY_T, 88)
+    context = DashboardContext(
+        watchlist=[],
+        themes=[],
+        snapshot=MarketSnapshot(
+            quotes=[quote_item],
+            indices=[],
+            data_mode="closed_static",
+            source_status={"active_source": "test", "trade_date": "20260806"},
+        ),
+        market=market(),
+        sectors=[sector("PCB", "300476")],
+        sector_flow=[],
+        signals_all=[current_signal],
+        core_watch=[current_signal],
+        events=[],
+        source_status={
+            "signal_scope": "full_market",
+            "quote_count": 1,
+            "signal_count_total": 1,
+            "trade_date": "20260806",
+        },
+    )
+    monkeypatch.setattr(service, "_get_context", lambda: context)
+
+    calls: list[str] = []
+
+    def spy_evidence(**kwargs):  # noqa: ARG001
+        calls.append("300476")
+        return MessageEvidenceBundle()
+
+    monkeypatch.setattr(service.message_store, "evidence_for", spy_evidence)
+
+    no_messages = service.signal_detail_extras(
+        "300476",
+        sector="PCB",
+        trade_date="20260806",
+        include_auction_history=False,
+        include_messages=False,
+    )
+    assert calls == []
+    assert no_messages.message_evidence == MessageEvidenceBundle()
+
+    with_messages = service.signal_detail_extras(
+        "300476",
+        sector="PCB",
+        trade_date="20260806",
+        include_auction_history=False,
+    )
+    assert calls == ["300476"]
+    assert with_messages.message_evidence == MessageEvidenceBundle()
 
 
 def test_signal_detail_extras_keeps_response_when_message_status_fails(tmp_path, monkeypatch) -> None:
@@ -2560,7 +2579,14 @@ def test_anchor_series_to_truth_skips_conflict_and_missing_truth(tmp_path) -> No
     missing = service._anchor_series_to_truth(series, None)
     assert missing.final_value == 70.11
 
-    out_of_range = service._anchor_series_to_truth(series, 70.11 * 5)
+    # 真值远超形态（震荡日成交额口径正负对冲、低估真值）必须定标：
+    # 2026-08-17 种子 ratio≈6.3、消费电子组件 ratio≈3.1 都是真实情形。
+    underestimated = service._anchor_series_to_truth(series, 70.11 * 6.3)
+    assert underestimated.final_value == round(70.11 * 6.3, 2)
+    assert underestimated.flow_basis == "每分钟净流入(分钟形态×L1主动量定标)"
+
+    # 仅挡垃圾形态：比值 >20 说明形态与真值完全不像同一个板块，保留原曲线。
+    out_of_range = service._anchor_series_to_truth(series, 70.11 * 30)
     assert out_of_range.final_value == 70.11
 
 
@@ -3081,247 +3107,3 @@ def test_ai_analysis_is_saved_for_later_loading(tmp_path, monkeypatch) -> None:
     assert loaded.result["ai_role"] == "解释结构化证据；不生成或修改买卖点"
     assert loaded.source["selected_sector"] == "PCB"
     assert loaded.source["source_version"] == "analysis_context_v2"
-
-
-def test_research_status_prefers_protocol_quality_and_exposes_walk_forward(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    service = make_service(tmp_path)
-    report = {
-        "data_quality": {
-            "flow_mode": "easy_tdx_history_transaction",
-            "minute_coverage_mean": 0.25,
-            "note": "legacy source label",
-        },
-        "research_protocol": {
-            "protocol_version": "research_protocol_v1",
-            "run_id": "run-test",
-            "generated_at": "2026-08-09T21:00:00",
-            "sample": {
-                "sample_count": 200,
-                "stock_day_count": 200,
-                "date_count": 2,
-                "dates": ["20260806", "20260807"],
-                "transaction_sample_count": 200,
-                "selection": {
-                    "method": "逐日事前选样",
-                    "date_count": 2,
-                    "stock_day_count": 200,
-                    "distinct_code_count": 120,
-                    "future_filter_used": False,
-                    "per_date": [
-                        {
-                            "target_date": "20260806",
-                            "selection_date": "20260805",
-                            "count": 100,
-                            "codes": ["300476"],
-                        },
-                        {
-                            "target_date": "20260807",
-                            "selection_date": "20260806",
-                            "count": 100,
-                            "codes": ["300308"],
-                        },
-                    ],
-                },
-            },
-            "data_quality": {
-                "minute_coverage_mean": 1.0,
-                "transaction_minute_coverage_mean": 0.98,
-                "transaction_metadata_coverage_mean": 1.0,
-                "transaction_source": "get_history_transaction_data",
-                "level2_available": False,
-                "status": "usable_with_limitations",
-            },
-            "validation": {
-                "status": "sample_insufficient",
-                "raw_label_count": 300,
-                "independent_event_count": 100,
-                "filled_event_count": 95,
-                "reasons": ["样本不足"],
-                "base_oos_metrics": {"mean_net_r": 0.12, "private_raw": "drop"},
-                "pessimistic_oos_metrics": {"mean_net_r": 0.03},
-                "direction": {
-                    "positive_t": {
-                        "status": "sample_insufficient",
-                        "independent_event_count": 44,
-                        "base_oos_metrics": {"mean_net_r": 0.2},
-                        "pessimistic_oos_metrics": {"mean_net_r": 0.08},
-                    },
-                    "reverse_t": {
-                        "status": "sample_insufficient",
-                        "independent_event_count": 56,
-                    },
-                },
-            },
-            "execution_model": {
-                "base_round_trip_cost_pct": 0.18,
-                "extra_pessimistic_round_trip_cost_pct": 0.08,
-            },
-            "walk_forward": {
-                "method": "expanding_window_one_day_ahead",
-                "minimum_training_days": 20,
-                "required_total_days": 60,
-                "date_count": 2,
-                "fold_count": 0,
-                "oos_dates": [],
-                "available": False,
-                "complete": False,
-                "base": {"mean_net_r": None},
-                "pessimistic": {"mean_net_r": None},
-                "folds": [{"raw": "must not be returned"}],
-            },
-            "limitations": ["样本不足"],
-        },
-    }
-    monkeypatch.setattr(service, "_latest_research_report", lambda: (report, "latest.json"))
-    monkeypatch.setattr(service.trajectory_store, "status", lambda: {"research_runs": 1})
-
-    payload = service.research_status()
-
-    assert payload["data_quality"]["flow_mode"] == "easy_tdx_history_transaction"
-    assert payload["data_quality"]["minute_coverage_mean"] == 1.0
-    assert payload["data_quality"]["transaction_source"] == "get_history_transaction_data"
-    assert payload["data_quality"]["level2_available"] is False
-    assert payload["validation"]["raw_label_count"] == 300
-    assert payload["validation"]["independent_event_count"] == 100
-    positive = payload["validation"]["direction"]["positive_t"]
-    assert positive["base_oos_metrics"]["mean_net_r"] == 0.2
-    assert "private_raw" not in payload["validation"]["base_oos_metrics"]
-    assert payload["walk_forward"]["fold_count"] == 0
-    assert "folds" not in payload["walk_forward"]
-    assert payload["sample"]["selection"]["per_date"] == [
-        {"target_date": "20260806", "selection_date": "20260805", "count": 100},
-        {"target_date": "20260807", "selection_date": "20260806", "count": 100},
-    ]
-
-
-def test_research_protocol_keeps_both_counterfactual_estimands_compact(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    service = make_service(tmp_path)
-    report = {
-        "research_protocol": {
-            "validation": {"status": "sample_insufficient"},
-            "counterfactuals": {
-                "direction_only": {
-                    "note": "成交方向不单独作为买点",
-                    "comparison_basis": "same_observed_event_times",
-                    "available_estimands": [
-                        "same_observed_event_times",
-                        "regenerated_candidate_set",
-                    ],
-                    "same_event": {
-                        "outcomes": 30,
-                        "independent_outcomes": 10,
-                        "metrics": {"mean_net_r": 0.1, "raw_rows": [1, 2, 3]},
-                        "estimand": "固定观察事件时点",
-                    },
-                    "regenerated": {
-                        "outcomes": 12,
-                        "independent_outcomes": 4,
-                        "metrics": {"mean_net_r": -0.2},
-                        "estimand": "删除因子后重建候选集",
-                    },
-                    "candidate_comparison": {
-                        "same_event_count": 10,
-                        "regenerated_event_count": 4,
-                        "raw_candidates": [{"code": "300476"}],
-                    },
-                }
-            },
-            "parameter_discovery": {
-                "status": "exploratory_only",
-                "feature_performance": {
-                    "feature_count": 17,
-                    "features": {
-                        "price_efficiency": {
-                            "bins": [
-                                {
-                                    "bin": 1,
-                                    "independent_event_count": 10,
-                                    "base": {"mean_net_r": 0.1},
-                                }
-                            ],
-                            "adjacent_pairs": [],
-                        }
-                    },
-                },
-            },
-            "matched_control": {
-                "matched_record_count": 1,
-                "records": [{"code": "300476", "time": "09:45"}],
-            },
-        }
-    }
-    monkeypatch.setattr(service, "_latest_research_report", lambda: (report, "latest.json"))
-    monkeypatch.setattr(service.trajectory_store, "status", lambda: {})
-
-    payload = service.research_protocol()
-    control = payload["counterfactuals"]["direction_only"]
-
-    assert control["same_event"]["independent_outcomes"] == 10
-    assert control["regenerated"]["independent_outcomes"] == 4
-    assert control["same_event"]["metrics"]["mean_net_r"] == 0.1
-    assert "raw_rows" not in control["same_event"]["metrics"]
-    assert control["candidate_comparison"] == {
-        "same_event_count": 10,
-        "regenerated_event_count": 4,
-    }
-    assert payload["parameter_discovery"]["status"] == "exploratory_only"
-    assert "features" not in payload["parameter_discovery"]["feature_performance"]
-    assert payload["parameter_discovery"]["feature_performance"]["feature_summaries"] == {
-        "price_efficiency": {
-            "bin_count": 1,
-            "adjacent_pair_count": 0,
-            "stable_positive_pair_count": 0,
-            "independent_event_count": 10,
-        }
-    }
-    assert "records" not in payload["matched_control"]
-    assert payload["matched_control"]["records_omitted"] is True
-
-
-
-
-def test_opening_markers_sector_code_mapped_to_board_name(tmp_path, monkeypatch) -> None:
-    """机会队列里 X410302 这类内部行业代码显示为官方板块名；中文主题名不动。"""
-    service = make_service(tmp_path)
-    monkeypatch.setattr(service, "_stock_board_display_map", lambda: {"300058": "互联网广告"})
-    items = [
-        {"code": "300058", "sector": "X430201"},
-        {"code": "300476", "sector": "PCB"},
-        {"code": "000001", "sector": "X9999"},
-    ]
-    out = service._opening_markers_with_sector_names(items)
-    assert out[0]["sector"] == "互联网广告"
-    assert out[1]["sector"] == "PCB"  # 手动主题名原样保留
-    assert out[2]["sector"] == "X9999"  # 映射不到保留原代码，便于发现未覆盖板块
-
-
-def test_opening_markers_live_quote_overlay(tmp_path) -> None:
-    """队列标记回填实时行情：live_* 挂上、信号时刻 price/change_pct 不动；
-    无快照的票和历史日原样保留，前端自行退回信号时刻快照。"""
-    service = make_service(tmp_path)
-
-    class _Quote:
-        price = 26.0123
-        change_pct = 5.078
-        amount = 123456789.0
-
-    items = [
-        {"code": "300058", "trade_date": "20260813", "price": 16.54, "change_pct": 4.09},
-        {"code": "300476", "trade_date": "20260813", "price": 100.0, "change_pct": 2.0},
-        {"code": "301052", "trade_date": "20260812", "price": 25.55, "change_pct": 3.19},
-    ]
-    quotes = {"300058": _Quote()}
-    out = service._opening_markers_with_live_quotes(items, quotes, requested_date="20260813")
-    assert out[0]["live_price"] == 26.012
-    assert out[0]["live_change_pct"] == 5.08
-    assert out[0]["live_amount"] == 123456789.0
-    assert out[0]["price"] == 16.54  # 信号时刻快照语义不动
-    assert "live_price" not in out[1]  # 快照里没有的票原样
-    assert "live_price" not in out[2]  # 历史日不回填实时行情
-    assert service._opening_markers_with_live_quotes(items, None, requested_date="20260813") is items

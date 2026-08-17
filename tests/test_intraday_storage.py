@@ -627,3 +627,121 @@ def test_payload_json_is_zlib_compressed_and_readable(tmp_path) -> None:
     ctx = store.latest_context_payload("20260806")
     assert ctx is not None and ctx["quotes"][0]["code"] == "300476"
     assert ctx["quotes"][0]["name"] == "胜宏科技"
+
+
+def _quote_row(code: str, price: float, change_pct: float = 1.0) -> dict:
+    return {
+        "code": code,
+        "price": price,
+        "change_pct": change_pct,
+        "amount": 1_000_000,
+        "minute_amount_ratio": 1.5,
+        "vol": 1234,
+    }
+
+
+def _record_batch(store: IntradayWatchtowerStore, captured_at: str, quotes: list[dict]) -> None:
+    store.record_context(
+        trade_date="20260811",
+        captured_at=captured_at,
+        updated_at=captured_at,
+        frozen=False,
+        source_quality="test",
+        market={"trend": "test", "updated_at": captured_at},
+        sectors=[],
+        quotes=quotes,
+        signals=[],
+    )
+
+
+def test_feature_mem_mirror_serves_reads_without_sql_after_backfill(tmp_path) -> None:
+    store = IntradayWatchtowerStore(tmp_path / "intraday.sqlite")
+    _record_batch(store, "09:31:00", [_quote_row("600667", 10.0)])
+    _record_batch(store, "09:32:00", [_quote_row("600667", 10.1)])
+
+    # 首次读取：SQL 权威回填
+    first = store.stock_feature_series("20260811", "600667", max_rows=180)
+    assert [row["captured_at"] for row in first] == ["09:31:00", "09:32:00"]
+    assert first[0]["vol"] == 1234  # payload 字段保留
+
+    # 采集继续写入：镜像追加保鲜
+    _record_batch(store, "09:33:00", [_quote_row("600667", 10.2)])
+
+    # 直接清空 SQLite，证明后续读取完全由内存镜像服务
+    with sqlite3.connect(str(store.path)) as conn:
+        conn.execute("DELETE FROM stock_features")
+    served = store.stock_feature_series("20260811", "600667", max_rows=180)
+    assert [row["captured_at"] for row in served] == ["09:31:00", "09:32:00", "09:33:00"]
+    assert served[-1]["price"] == 10.2
+
+
+def test_feature_mem_mirror_rewrites_same_captured_at(tmp_path) -> None:
+    store = IntradayWatchtowerStore(tmp_path / "intraday.sqlite")
+    _record_batch(store, "09:31:00", [_quote_row("600667", 10.0)])
+    assert store.stock_feature_series("20260811", "600667", max_rows=180)[-1]["price"] == 10.0
+
+    # 同一 captured_at 重写（ON CONFLICT 语义的镜像）：覆盖而不是追加
+    _record_batch(store, "09:31:00", [_quote_row("600667", 10.5)])
+    served = store.stock_feature_series("20260811", "600667", max_rows=180)
+    assert len(served) == 1
+    assert served[-1]["price"] == 10.5
+
+
+def test_feature_mem_falls_back_to_sql_when_limit_exceeds_coverage(tmp_path) -> None:
+    store = IntradayWatchtowerStore(tmp_path / "intraday.sqlite")
+    for minute in range(31, 36):  # 5 行
+        _record_batch(store, f"09:{minute:02d}:00", [_quote_row("600667", 10.0 + minute * 0.01)])
+
+    shallow = store.stock_feature_series("20260811", "600667", max_rows=2)
+    assert len(shallow) == 2
+    # 覆盖深度只有 2，请求 5 行必须回退 SQL 拿到完整序列
+    deep = store.stock_feature_series("20260811", "600667", max_rows=5)
+    assert len(deep) == 5
+    assert deep[0]["captured_at"] == "09:31:00"
+
+
+def test_feature_mem_empty_backfill_then_mirror_append(tmp_path) -> None:
+    store = IntradayWatchtowerStore(tmp_path / "intraday.sqlite")
+    # 停牌票：首次读取空结果也回填，之后恢复交易时镜像能正确追加
+    assert store.stock_feature_series("20260811", "600667", max_rows=180) == []
+    assert "600667" not in store.stock_feature_series_by_code("20260811", ["600667"], max_rows=180)
+
+    _record_batch(store, "13:00:00", [_quote_row("600667", 10.0)])
+    served = store.stock_feature_series("20260811", "600667", max_rows=180)
+    assert [row["captured_at"] for row in served] == ["13:00:00"]
+
+
+def test_stock_features_columnar_read_skips_payload_decode(tmp_path, monkeypatch) -> None:
+    """列化快路径：vol/minute_amount 是独立列时，读取完全不解码 payload。"""
+    store = IntradayWatchtowerStore(tmp_path / "intraday.sqlite")
+    _record_batch(store, "09:31:00", [_quote_row("600667", 10.0)])
+    _record_batch(store, "09:32:00", [_quote_row("600667", 10.1)])
+
+    def forbidden_decode(value):  # noqa: ANN001
+        raise AssertionError("列化数据不应触发 payload 解码")
+
+    monkeypatch.setattr(store, "_loads", forbidden_decode)
+    rows = store.stock_feature_series("20260811", "600667", max_rows=180)
+    assert [row["captured_at"] for row in rows] == ["09:31:00", "09:32:00"]
+    assert rows[0]["vol"] == 1234
+    assert rows[0]["minute_amount"] == 0  # _quote_row 未提供 minute_amount，列为 0
+
+
+def test_stock_features_legacy_rows_fall_back_to_payload_decode(tmp_path) -> None:
+    """老数据（vol 列为 NULL）仍走 payload 解码，字段与列覆盖语义不变。"""
+    store = IntradayWatchtowerStore(tmp_path / "intraday.sqlite")
+    # 直接手写一条老格式行：vol/minute_amount 为 NULL，payload 完整
+    with sqlite3.connect(str(store.path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO stock_features
+                (trade_date, captured_at, code, price, change_pct, amount, minute_amount, vol, minute_amount_ratio, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+            """,
+            ("20260811", "09:31:00", "600667", 10.0, 1.0, 1_000_000, 1.5, store._json({"vol": 77, "minute_amount": 555, "extra": "keep"})),
+        )
+    rows = store.stock_feature_series("20260811", "600667", max_rows=180)
+    assert rows[0]["vol"] == 77
+    assert rows[0]["minute_amount"] == 555
+    assert rows[0]["extra"] == "keep"
+    assert rows[0]["price"] == 10.0

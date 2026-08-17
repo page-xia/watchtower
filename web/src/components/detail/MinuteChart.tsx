@@ -1,17 +1,21 @@
 import { useMemo } from "react"
 import type { EChartsOption } from "echarts"
 import { useECharts } from "@/hooks/useECharts"
-import type { MinuteChartData, OverlayMarker } from "@/types/api"
+import type { FormulaOverlay, MinuteChartData, OverlayMarker } from "@/types/api"
 import { signalTone } from "@/lib/format"
 import { chartPalette, useTheme } from "@/lib/theme"
 
 interface MinuteChartProps {
   chart: MinuteChartData | null
   markers: OverlayMarker[]
-  openingMarkers: OverlayMarker[]
+  overlay?: FormulaOverlay | null
+  /** 现价落在低吸区间（底线-1% ~ 顶线+3%）时，买点改用金色圆点突出 */
+  nearLine?: boolean
+  /** 短期/长期趋势线（价格口径）：只有现价贴近 ±3% 的那条才会画出来 */
+  trendLines?: { short?: number | null; long?: number | null } | null
 }
 
-export function MinuteChart({ chart, markers, openingMarkers }: MinuteChartProps) {
+export function MinuteChart({ chart, markers, overlay, nearLine = false, trendLines = null }: MinuteChartProps) {
   const theme = useTheme()
   const pal = useMemo(() => chartPalette(theme), [theme])
 
@@ -20,33 +24,78 @@ export function MinuteChart({ chart, markers, openingMarkers }: MinuteChartProps
     const { times, change_pcts, vwaps, volumes, prev_close, prices } = chart
     const vwapPcts = vwaps.map((v) => (prev_close > 0 ? (v / prev_close - 1) * 100 : 0))
 
+    // 做T公式叠层只画可交易价位：阻力/支撑两条水平线。
+    // MA30/强弱线数值在右侧公式卡片呈现，不上图，避免曲线过多干扰读价。
+    const levelLines: Record<string, unknown>[] = []
+    if (overlay?.available) {
+      if (overlay.resistance_pct != null) {
+        levelLines.push({
+          yAxis: overlay.resistance_pct,
+          lineStyle: { color: pal.down, type: "dashed", width: 1 },
+          label: { show: true, formatter: `阻力 ${overlay.resistance.toFixed(2)}`, color: pal.down, fontSize: 9, position: "insideStartTop" },
+        })
+      }
+      if (overlay.support_pct != null) {
+        levelLines.push({
+          yAxis: overlay.support_pct,
+          lineStyle: { color: pal.up, type: "dashed", width: 1 },
+          label: { show: true, formatter: `支撑 ${overlay.support.toFixed(2)}`, color: pal.up, fontSize: 9, position: "insideStartBottom" },
+        })
+      }
+    }
+
     const buySellPoints = markers.map((m) => {
       const tone = signalTone(m.signal)
+      // 现价落在低吸区间（底线-1% ~ 顶线+3%）时，买点用金色圆点替代红色图钉，提示低吸机会
+      const goldBuy = nearLine && tone === "buy"
       return {
         name: m.signal,
         coord: [m.time, m.change_pct],
         value: m.signal,
-        symbol: tone === "sell" ? "triangle" : tone === "buy" ? "pin" : "circle",
-        symbolRotate: tone === "sell" ? 180 : 0,
-        symbolSize: tone === "watch" ? 7 : 13,
-        itemStyle: { color: tone === "sell" ? pal.down : tone === "buy" ? pal.up : pal.gold, borderColor: pal.symbolBorder, borderWidth: 1 },
+        symbol: goldBuy ? "circle" : tone === "sell" ? "triangle" : tone === "buy" ? "pin" : "circle",
+        symbolRotate: tone === "sell" && !goldBuy ? 180 : 0,
+        symbolSize: goldBuy ? 11 : tone === "watch" ? 7 : 13,
+        itemStyle: {
+          color: goldBuy ? pal.gold : tone === "sell" ? pal.down : tone === "buy" ? pal.up : pal.gold,
+          borderColor: pal.symbolBorder,
+          borderWidth: 1,
+        },
         label: { show: false },
         marker: m,
       }
     })
-    const openingPoints = openingMarkers.map((m) => {
-      const tone = signalTone(m.signal)
-      return {
-        name: m.phase || m.signal,
-        coord: [m.time, m.change_pct],
-        value: m.phase || m.signal,
-        symbol: "diamond",
-        symbolSize: 15,
-        itemStyle: { color: tone === "sell" ? pal.dimSell : pal.dimBuy, borderColor: tone === "sell" ? pal.down : pal.up, borderWidth: 1.5 },
-        label: { show: false },
-        marker: m,
+    // 短期/长期趋势线：辅助线逻辑——只有现价贴近（±3%）的线才显示，
+    // 且只有显示出来的线参与 Y 轴范围，不贴近时完全不影响主分时图空间。
+    // 现价高于两线 → 最多显示下方 3% 内的那条；夹在两线中间 → 贴近哪条显示哪条。
+    const currentPrice = prices[prices.length - 1] ?? 0
+    const currentPct = change_pcts[change_pcts.length - 1] ?? 0
+    const zoneLines: Record<string, unknown>[] = []
+    const visibleLinePcts: number[] = []
+    if (trendLines && prev_close > 0 && currentPrice > 0) {
+      for (const [label, value] of [
+        ["短期", trendLines.short],
+        ["长期", trendLines.long],
+      ] as const) {
+        if (value == null || value <= 0) continue
+        if (Math.abs(currentPrice - value) / value > 0.03) continue
+        const pct = (value / prev_close - 1) * 100
+        visibleLinePcts.push(pct)
+        zoneLines.push({
+          yAxis: pct,
+          lineStyle: { color: pal.gold, type: "dashed", width: 1, opacity: 0.7 },
+          label: {
+            show: true,
+            formatter: `${label} ${value.toFixed(2)}`,
+            color: pal.gold,
+            fontSize: 9,
+            position: pct >= currentPct ? "insideEndTop" : "insideEndBottom",
+          },
+        })
       }
-    })
+    }
+    // 两条线都贴近（现价夹在中间）时才给阴影带
+    const zoneBandPcts =
+      visibleLinePcts.length === 2 ? ([Math.max(...visibleLinePcts), Math.min(...visibleLinePcts)] as const) : null
 
     const volColors = volumes.map((_, i) => {
       if (i === 0) return pal.flatA(0.5)
@@ -54,7 +103,13 @@ export function MinuteChart({ chart, markers, openingMarkers }: MinuteChartProps
     })
     const latest = change_pcts[change_pcts.length - 1] ?? 0
     const priceColor = latest >= 0 ? pal.up : pal.down
-    const allPcts = [...change_pcts, ...vwapPcts, 0]
+    const allPcts = [
+      ...change_pcts,
+      ...vwapPcts,
+      ...levelLines.map((l) => Number((l as { yAxis?: number }).yAxis ?? 0)),
+      ...visibleLinePcts,
+      0,
+    ]
     const yMin = Math.min(...allPcts)
     const yMax = Math.max(...allPcts)
     const pad = Math.max((yMax - yMin) * 0.12, 0.3)
@@ -86,7 +141,7 @@ export function MinuteChart({ chart, markers, openingMarkers }: MinuteChartProps
             `<div>价格 <b>${prices[idx]?.toFixed(2) ?? "--"}</b> · 涨幅 <b style="color:${(change_pcts[idx] ?? 0) >= 0 ? pal.up : pal.down}">${(change_pcts[idx] ?? 0).toFixed(2)}%</b></div>`,
             `<div style="color:${pal.axis}">VWAP ${vwaps[idx]?.toFixed(2) ?? "--"} · 量 ${(volumes[idx] ?? 0).toFixed(0)}手 · 量比 ${(chart.amount_ratios[idx] ?? 0).toFixed(1)}</div>`,
           ]
-          const hit = [...markers, ...openingMarkers].filter((m) => m.time === t)
+          const hit = markers.filter((m) => m.time === t)
           for (const m of hit) {
             lines.push(
               `<div style="margin-top:3px;border-top:1px solid ${pal.grid};padding-top:3px"><b style="color:${signalTone(m.signal) === "sell" ? pal.down : pal.up}">${m.signal} · ${m.phase}</b></div>`,
@@ -153,13 +208,21 @@ export function MinuteChart({ chart, markers, openingMarkers }: MinuteChartProps
           markLine: {
             silent: true,
             symbol: "none",
-            data: [{ yAxis: 0 }],
+            data: [{ yAxis: 0 }, ...levelLines, ...zoneLines],
             lineStyle: { color: pal.markLine, type: "dashed", width: 1 },
             label: { show: true, formatter: "昨收", color: pal.axis, fontSize: 9, position: "insideEndTop" },
           },
+          // 低吸阴影带：仅当短期/长期两条线都贴近（现价夹在中间）时绘制
+          markArea: zoneBandPcts
+            ? {
+                silent: true,
+                itemStyle: { color: pal.goldA(0.07) },
+                data: [[{ yAxis: zoneBandPcts[0] }, { yAxis: zoneBandPcts[1] }]],
+              }
+            : undefined,
           markPoint: {
             silent: false,
-            data: [...buySellPoints, ...openingPoints],
+            data: buySellPoints,
             tooltip: { show: false },
           },
           z: 3,
@@ -186,7 +249,7 @@ export function MinuteChart({ chart, markers, openingMarkers }: MinuteChartProps
         },
       ],
     }
-  }, [chart, markers, openingMarkers, pal])
+  }, [chart, markers, overlay, nearLine, trendLines, pal])
 
   const ref = useECharts(option)
   if (!chart) {

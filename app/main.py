@@ -14,10 +14,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from app.data_sources import china_now, is_trading_window, market_session, normalize_board_level
 from app.config import ROOT_DIR, settings
 from app.market_schedule import market_refresh_policy
+from app.message_store import MessageStoreError
 from app.models import (
     PositionRecord,
     ReplayMarker,
@@ -30,6 +32,7 @@ from app.services import DashboardService
 from app.stream_delta import TerminalDeltaTracker
 from app.stream_hub import RESYNC, ChannelLimitExceeded, ChannelSpec, StreamHub
 from app.trajectory_store import IntradayCollector
+from app.webhook_push import WebhookSubscription
 
 
 WEB_DIST_DIR = ROOT_DIR / "web" / "dist"
@@ -47,7 +50,8 @@ async def lifespan(_: FastAPI):
     collector_thread: threading.Thread | None = None
     warmup_thread: threading.Thread | None = None
     service.start_trajectory_cleanup_thread(reason="startup")
-    service.start_opening_window_engine()
+    # 若进程恰在盘前窗口内重启（如 08:45 发版），补触发一轮 F10 增量预热。
+    service.maybe_run_f10_preopen_refresh(reason="startup")
     # 暗盘资金监控随后端启动拉起：线程自行休眠至 09:30 交易窗口开始首轮磁带周期，
     # 盘中数据积累不依赖「有人打开页面触发接口」。
     service.dark_pool_payload()
@@ -164,8 +168,6 @@ _COMPACT_MARKER_FIELDS = {
     "executable",
     "validation_status",
     "risk_reward",
-    "gold_resonance",
-    "resonance_reasons",
 }
 _COMPACT_MARKER_EXCLUDE = {
     field: True for field in set(ReplayMarker.model_fields) - _COMPACT_MARKER_FIELDS
@@ -218,7 +220,7 @@ def _mini_marker_signature(item: dict) -> str:
             [
                 str(marker.get("time") or "")[:5],
                 str(marker.get("signal") or ""),
-                "1" if marker.get("gold_resonance") else "0",
+                str(marker.get("price") or ""),
             ]
         )
         for marker in markers[:4]
@@ -386,7 +388,11 @@ def ingest_zsxq_messages(
     payload: ZsxqMessageIngestRequest,
     _: None = Depends(require_ingest_token),
 ) -> dict:
-    return service.ingest_zsxq_messages(payload).model_dump(mode="json")
+    try:
+        return service.ingest_zsxq_messages(payload).model_dump(mode="json")
+    except MessageStoreError as exc:
+        # 透出 CloudBase MySQL 的真实错误，而不是裸 500 "Internal Server Error"。
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/messages/evidence/prebuild")
@@ -404,6 +410,8 @@ def dashboard(
     page: int = 1,
     page_size: int = 80,
     fast: bool = False,
+    near_trend: bool = False,
+    pin_buy: bool = False,
     watchlist_codes: str | None = None,
 ) -> dict:
     client_watchlist_kwargs = _client_watchlist_kwargs(watchlist_codes)
@@ -415,6 +423,8 @@ def dashboard(
             page=page,
             page_size=page_size,
             fast=fast,
+            near_trend=near_trend,
+            pin_buy=pin_buy,
             **client_watchlist_kwargs,
         ).model_dump(mode="json")
     return service.dashboard(sector=sector, **client_watchlist_kwargs).model_dump(mode="json")
@@ -427,6 +437,8 @@ def stocks_board(
     sort: str = "activity",
     page: int = 1,
     page_size: int = 80,
+    near_trend: bool = False,
+    pin_buy: bool = False,
     watchlist_codes: str | None = None,
 ) -> dict:
     return service.stock_board(
@@ -435,6 +447,8 @@ def stocks_board(
         sort=sort,
         page=page,
         page_size=page_size,
+        near_trend=near_trend,
+        pin_buy=pin_buy,
         **_client_watchlist_kwargs(watchlist_codes),
     ).model_dump(mode="json")
 
@@ -461,54 +475,6 @@ def market_state() -> dict:
 def opening_decision(sector: str | None = None) -> dict:
     """Return the 09:33/09:35/09:37 opening-window decision snapshot."""
     return service.opening_decision(sector=sector).model_dump(mode="json")
-
-
-@app.get("/api/opening/markers")
-def opening_markers(
-    trade_date: str | None = None,
-    offset: int = 0,
-    limit: int = 20,
-    side: str | None = None,
-) -> dict:
-    """开盘窗口菱形买卖点（机会队列流）：最新在前，游标分页加载更多，可按买/卖侧过滤。"""
-    return service.opening_markers_page(trade_date=trade_date, offset=offset, limit=limit, side=side)
-
-
-@app.get("/api/opening/research")
-def opening_research() -> dict:
-    """Expose the latest local research summary without returning credentials."""
-    path = settings.data_dir / "runtime" / "strategy-research" / "latest_l1.json"
-    if not path.exists():
-        path = settings.data_dir / "runtime" / "strategy-research" / "latest.json"
-    if not path.exists():
-        return {"available": False, "note": "暂无开盘窗口研究报告"}
-    try:
-        import json
-
-        report = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"available": False, "note": f"研究报告读取失败：{exc}"}
-    return {
-        "available": True,
-        "generated_at": report.get("generated_at", ""),
-        "sample": report.get("sample", {}),
-        "dates": report.get("date_summaries", []),
-        "opening": report.get("opening", {}),
-        "data_quality": report.get("data_quality", {}),
-        "limitations": report.get("methodology", {}).get("limitations", []),
-    }
-
-
-@app.get("/api/research/status")
-def research_status() -> dict:
-    """Return aggregate research validation state without raw labels or secrets."""
-    return service.research_status()
-
-
-@app.get("/api/research/protocol")
-def research_protocol() -> dict:
-    """Return registered hypotheses, controls and aggregate protocol results."""
-    return service.research_protocol()
 
 
 @app.get("/api/sectors/rank")
@@ -605,6 +571,7 @@ def signal_detail_extras(
     include_indicators: bool = False,
     include_chanlun: bool = False,
     include_auction_history: bool = True,
+    include_messages: bool = True,
     watchlist_codes: str | None = None,
 ) -> dict:
     try:
@@ -617,8 +584,35 @@ def signal_detail_extras(
             include_indicators=include_indicators,
             include_chanlun=include_chanlun,
             include_auction_history=include_auction_history,
+            include_messages=include_messages,
             **_client_watchlist_kwargs(watchlist_codes),
         ).model_dump(mode="json")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/signals/{code}/detail/f10")
+def signal_detail_f10(code: str, refresh: bool = False) -> dict:
+    return service.signal_detail_f10(code, refresh=refresh).model_dump(mode="json")
+
+
+@app.get("/api/signals/{code}/detail/daily")
+def signal_detail_daily(
+    code: str,
+    sector: str | None = None,
+    trade_date: str | None = None,
+    count: int = 240,
+    watchlist_codes: str | None = None,
+) -> dict:
+    """日K详情：日K线 + AI主力狙击公式（主图/双共振/主力动向）+ 筹码分布 + 题材概念标签。"""
+    try:
+        return service.signal_detail_daily(
+            code,
+            sector=sector,
+            trade_date=trade_date,
+            count=count,
+            **_client_watchlist_kwargs(watchlist_codes),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -682,6 +676,42 @@ def delete_watchlist_item(code: str) -> dict:
     if not deleted:
         raise HTTPException(status_code=404, detail="自选股不存在")
     return {"deleted": True, "code": code}
+
+
+# ---------------------------------------------------------------- 飞书推送订阅
+
+
+@app.get("/api/push/subscription")
+def get_push_subscription(client_id: str) -> dict:
+    item = service.push_pool.store.get(client_id)
+    if item is None:
+        return {"client_id": client_id, "webhook_url": "", "enabled": False, "codes": [], "updated_at": ""}
+    return item.model_dump(mode="json")
+
+
+@app.put("/api/push/subscription")
+def upsert_push_subscription(item: WebhookSubscription) -> dict:
+    try:
+        saved = service.push_pool.store.upsert(item)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return saved.model_dump(mode="json")
+
+
+class PushTestRequest(BaseModel):
+    webhook_url: str
+
+
+@app.post("/api/push/test")
+def test_push_subscription(payload: PushTestRequest) -> dict:
+    try:
+        ok, detail = service.push_pool.send_test(payload.webhook_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not ok:
+        raise HTTPException(status_code=502, detail=f"推送测试失败：{detail}")
+    return {"ok": True, "detail": detail}
+
 
 
 @app.get("/api/positions")
@@ -773,6 +803,8 @@ class StreamParams(NamedTuple):
     board_level: int
     page: int
     page_size: int
+    near_trend: bool
+    pin_buy: bool
     watchlist_codes: tuple[str, ...]
     watchlist_codes_provided: bool
 
@@ -785,6 +817,8 @@ def _stream_params(websocket: WebSocket) -> StreamParams:
     # format=delta opts into the snapshot/delta protocol; the legacy static
     # page keeps receiving full terminal payloads without it.
     delta_format = websocket.query_params.get("format", "") == "delta"
+    near_trend = websocket.query_params.get("near_trend", "0").lower() in {"1", "true", "yes"}
+    pin_buy = websocket.query_params.get("pin_buy", "0").lower() in {"1", "true", "yes"}
     try:
         board_level = int(websocket.query_params.get("board_level", "3"))
     except ValueError:
@@ -808,6 +842,8 @@ def _stream_params(websocket: WebSocket) -> StreamParams:
         board_level=board_level,
         page=page,
         page_size=page_size,
+        near_trend=near_trend,
+        pin_buy=pin_buy,
         watchlist_codes=watchlist_codes,
         watchlist_codes_provided=watchlist_codes_provided,
     )
@@ -830,6 +866,8 @@ def _stream_channel_key(params: StreamParams) -> tuple:
         max(1, int(params.page or 1)),
         normalized_page_size,
         bool(params.fast),
+        bool(params.near_trend),
+        bool(params.pin_buy),
         bool(params.watchlist_codes_provided),
         params.watchlist_codes,
     )
@@ -869,6 +907,8 @@ async def _stream_send_once_and_close(websocket: WebSocket, params: StreamParams
                 page=params.page,
                 page_size=params.page_size,
                 fast=params.fast,
+                near_trend=params.near_trend,
+                pin_buy=params.pin_buy,
                 **_stream_client_watchlist_kwargs(params),
             )
         ).model_dump(mode="json")
@@ -904,6 +944,10 @@ def _terminal_payload_key(payload: dict) -> str:
                 str(item.get("updated_at") or ""),
                 str(item.get("phase") or ""),
                 str(item.get("signal_score") or ""),
+                str(item.get("last_action") or ""),
+                str(item.get("last_action_price") or ""),
+                str(item.get("last_action_time") or ""),
+                str(item.get("near_zone") or ""),
                 _mini_chart_signature(item),
             ]
         )
@@ -951,6 +995,8 @@ def _stream_channel_spec(params: StreamParams) -> ChannelSpec:
                     page=params.page,
                     page_size=params.page_size,
                     fast=params.fast,
+                    near_trend=params.near_trend,
+                    pin_buy=params.pin_buy,
                     **_stream_client_watchlist_kwargs(params),
                 )
             ).model_dump(mode="json")
@@ -1014,6 +1060,8 @@ async def _stream_legacy(websocket: WebSocket, params: StreamParams) -> None:
                     page=params.page,
                     page_size=params.page_size,
                     fast=params.fast,
+                    near_trend=params.near_trend,
+                    pin_buy=params.pin_buy,
                     **_stream_client_watchlist_kwargs(params),
                 )
                 payload = payload_model.model_dump(mode="json")

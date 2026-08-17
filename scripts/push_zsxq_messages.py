@@ -102,7 +102,7 @@ def main() -> int:
                 )
                 for target_url in target_urls:
                     totals["requests"] += 1
-                    error = post_payload_to_target(
+                    error = post_payload_with_autosplit(
                         client,
                         target_url,
                         payload,
@@ -362,6 +362,76 @@ def post_payload_to_target(
             )
             return error
     return last_error
+
+
+def post_payload_with_autosplit(
+    client: httpx.Client,
+    target_url: str,
+    payload: dict[str, Any],
+    token: str,
+    *,
+    run_started: str,
+    start: str,
+    end: str,
+    upstream_latest_at: str,
+    depth: int = 0,
+) -> str:
+    """Post a batch payload; on persistent failure split it in half and retry.
+
+    The CloudBase MySQL REST gateway behind the ingest endpoint rejects or
+    times out on oversized upserts (notably since easy_tdx board enrichment
+    inflated link rows per batch). Upserts are idempotent, so re-posting a
+    subset of rows is safe.
+    """
+    error = post_payload_to_target(
+        client,
+        target_url,
+        payload,
+        token,
+        run_started=run_started,
+        start=start,
+        end=end,
+        upstream_latest_at=upstream_latest_at,
+    )
+    if not error:
+        return ""
+    topics = list(payload.get("topics") or [])
+    events = list(payload.get("events") or [])
+    links = list(payload.get("links") or [])
+    largest = max(len(topics), len(events), len(links))
+    if largest <= 25 or depth >= 5:
+        return error
+    halves = [
+        (topics[: len(topics) // 2], events[: len(events) // 2], links[: len(links) // 2], "a"),
+        (topics[len(topics) // 2 :], events[len(events) // 2 :], links[len(links) // 2 :], "b"),
+    ]
+    sub_errors: list[str] = []
+    for sub_topics, sub_events, sub_links, suffix in halves:
+        if not sub_topics and not sub_events and not sub_links:
+            continue
+        sub_payload = dict(
+            payload,
+            topics=sub_topics,
+            events=sub_events,
+            links=sub_links,
+            run_id=f"{payload.get('run_id') or 'batch'}{suffix}",
+        )
+        sub_error = post_payload_with_autosplit(
+            client,
+            target_url,
+            sub_payload,
+            token,
+            run_started=run_started,
+            start=start,
+            end=end,
+            upstream_latest_at=upstream_latest_at,
+            depth=depth + 1,
+        )
+        if sub_error:
+            sub_errors.append(sub_error)
+    if sub_errors:
+        return "; ".join(dict.fromkeys(sub_errors))
+    return ""
 
 
 def is_retryable_ingest_error(exc: Exception) -> bool:
