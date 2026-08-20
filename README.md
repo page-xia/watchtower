@@ -222,6 +222,8 @@ RDS 连接信息放在服务器 `/root/watchtower/watchtower.env`（环境变量
 .\.venv\Scripts\python.exe scripts/probe_user_isolation.py --base-url https://omnisource.xin
 ```
 
+本机 2026-08-20 实测：上述集成命令输出 `3 passed in 3.49s`（重复运行一次为 `3 passed in 3.33s`）；其中 50 主体用例断言 `public_context=1`、`upstream_snapshot=1`、每个主体均按自己的存储键读取，且代码内 p95 保护断言为叠层 `<50 ms`、热状态读取 `<20 ms`。部署验收探针仍以两个随机主体执行写入、读取、删除闭环；扩展到 50 主体时使用同一集成用例记录公共计算复用结果。
+
 星球消息证据读取走物化缓存：详情页按 `(scope=stock/sector, cache_key=代码/板块词)` 直接读 `message_evidence_cache`（1~2 次索引查询，亚秒）；未命中的键走动态查询兜底并回写（read-through，空结果也缓存）；每次消息同步后后台自动重建受影响实体的物化值（含板块查询词与链接名的子串别名桥接）。全新部署或物化表被清空后，下一次同步会自动触发一次全量预建，也可手动触发 `POST /api/messages/evidence/prebuild`（需 ingest token）；`scripts/materialize_message_evidence.py` 可从本地一次性全量重建（语义与服务端一致）。
 
 ### 知识星球消息同步

@@ -11,6 +11,7 @@ from uuid import uuid4
 from app.models import WatchlistItem
 from app.principal import Principal
 from app.services import DashboardService
+from app.stream_delta import TerminalDeltaTracker
 from app.user_state import RevisionConflict
 from app.user_state_json import JsonPrincipalStateRepository
 from test_dashboard_service import make_principal_service
@@ -73,6 +74,17 @@ def test_two_random_principals_get_private_overlay_without_changing_market_facts
     assert alice_row_after_delete.watchlisted is False
     assert alice_after_delete.watchlist_codes == []
     assert bob_after_delete.model_dump() == bob_payload.model_dump()
+
+    # Exercise the exact per-connection delta contract used by /ws/live: the
+    # delete must be visible as an unpin/upsert plus a personalization revision
+    # update on Alice's next tick.
+    tracker = TerminalDeltaTracker()
+    tracker.next_message(alice_payload.model_dump(mode="json"))
+    delta = tracker.next_message(alice_after_delete.model_dump(mode="json"))
+    assert delta is not None
+    assert delta["sections"]["meta"]["personalization_revision"] == alice_after_delete.personalization_revision
+    upserts = delta["sections"]["board"].get("upsert", [])
+    assert any(row["code"] == "300476" and row.get("watchlisted") is False for row in upserts)
     assert set(store.looked_up_principals) == {alice.storage_key, bob.storage_key}
 
 
@@ -95,13 +107,24 @@ def test_fifty_principals_share_one_public_context_per_cache_window(tmp_path, mo
 
     def build_public_context():
         counters["public_context"] += 1
-        counters["upstream_snapshot"] += 1
+        # Keep the upstream boundary separately observable from the context
+        # builder.  The real implementation performs this fetch inside the
+        # public refresh; this probe calls the same source seam once and then
+        # returns the deterministic fixture context.
+        service.data_source.fetch([], [])
         service._context_cache = context
         service._context_cache_at = __import__("time").time()
         service._context_cache_bucket = service._context_bucket()
         return context
 
     monkeypatch.setattr(service, "_refresh_context", build_public_context)
+    original_fetch = service.data_source.fetch
+
+    def counted_fetch(*args, **kwargs):  # type: ignore[no-untyped-def]
+        counters["upstream_snapshot"] += 1
+        return original_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(service.data_source, "fetch", counted_fetch)
     overlay_durations: list[float] = []
     original_overlay = service._apply_principal_overlay
 
@@ -113,17 +136,24 @@ def test_fifty_principals_share_one_public_context_per_cache_window(tmp_path, mo
 
     monkeypatch.setattr(service, "_apply_principal_overlay", timed_overlay)
     terminal_durations: list[float] = []
+    state_lookup_durations: list[float] = []
     principals = [_principal() for _ in range(50)]
     for principal in principals:
         started = perf_counter()
         payload = service.terminal(principal=principal, page_size=20, fast=True)
         terminal_durations.append(perf_counter() - started)
+        state_started = perf_counter()
+        store.get_state(principal)
+        state_lookup_durations.append(perf_counter() - state_started)
         assert payload.personalization_revision == 0
 
     assert counters == {"public_context": 1, "upstream_snapshot": 1}
     assert set(store.looked_up_principals) == {principal.storage_key for principal in principals}
-    assert len(store.looked_up_principals) == 50
+    # One lookup happens in the terminal path and one explicit hot-read sample
+    # below; both must still be keyed to the requesting principal.
+    assert len(store.looked_up_principals) == 100
     assert _p95(overlay_durations) < 0.05
+    assert _p95(state_lookup_durations) < 0.02
     # This is deliberately looser than the documented production target: it
     # protects the shared-cache contract without depending on CI scheduler load.
     assert _p95(terminal_durations) < 0.5
@@ -150,6 +180,20 @@ def test_stale_write_and_one_time_legacy_import_preserve_canonical_server_state(
     assert sorted(outcomes) == ["conflict", "success"]
     assert store.get_state(principal).revision == 1
 
+    empty_principal = _principal()
+    first_import = store.import_legacy_watchlist_once(
+        empty_principal,
+        [WatchlistItem(code="300476", name="胜宏科技")],
+    )
+    second_import = store.import_legacy_watchlist_once(
+        empty_principal,
+        [WatchlistItem(code="300308", name="中际旭创")],
+    )
+    assert first_import.applied is True
+    assert first_import.revision == 1
+    assert second_import.applied is False
+    assert [item.code for item in store.list_watchlist(empty_principal)] == ["300476"]
+
     # A different principal models the browser's first legacy import when
     # canonical state already exists on the server.
     principal = _principal()
@@ -157,16 +201,16 @@ def test_stale_write_and_one_time_legacy_import_preserve_canonical_server_state(
     first = store.upsert_watchlist(principal, canonical, expected_revision=0)
 
     conflicting_legacy = [WatchlistItem(code="300476", name="胜宏科技")]
-    first_import = store.import_legacy_watchlist_once(principal, conflicting_legacy)
-    second_import = store.import_legacy_watchlist_once(
+    canonical_import = store.import_legacy_watchlist_once(principal, conflicting_legacy)
+    second_canonical_import = store.import_legacy_watchlist_once(
         principal,
         [WatchlistItem(code="300308", name="中际旭创")],
     )
 
     assert first.revision == 1
-    assert first_import.applied is False
-    assert first_import.reason == "existing_state"
-    assert second_import.applied is False
+    assert canonical_import.applied is False
+    assert canonical_import.reason == "existing_state"
+    assert second_canonical_import.applied is False
     assert [item.code for item in store.list_watchlist(principal)] == ["000001"]
 
 
