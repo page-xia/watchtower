@@ -8,6 +8,7 @@ import {
 import { useLiveChannel } from "@/hooks/useLiveChannel"
 import { useTerminalStream } from "@/hooks/useTerminalStream"
 import { refreshPolicyFromPayload } from "@/lib/marketRefresh"
+import { shouldRefreshPersonalizationRevision } from "@/lib/personalizationRevision"
 import type { BoardItem, IndexMinutesResponse, WatchlistEntry } from "@/types/api"
 import { TopBar } from "@/components/TopBar"
 import { MarketStrip } from "@/components/MarketStrip"
@@ -118,7 +119,7 @@ export default function App() {
       return
     }
     setPersonalizationError(null)
-    if (data.personalization_revision != null && data.personalization_revision !== personalizationRevision) {
+    if (shouldRefreshPersonalizationRevision(personalizationRevision, data.personalization_revision)) {
       setPersonalizationRevision(data.personalization_revision)
       void refreshCanonicalWatchlist().catch(() => undefined)
     }

@@ -43,6 +43,18 @@ try {
   assert.equal(module.getClientId(), module.getClientId())
   delete globalThis.window
 
+  const revisionOutfile = path.join(tempDir, "personalizationRevision.mjs")
+  await build({
+    entryPoints: [path.join(projectRoot, "src", "lib", "personalizationRevision.ts")],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    outfile: revisionOutfile,
+  })
+  const revision = await import(pathToFileURL(revisionOutfile).href)
+  assert.equal(revision.shouldRefreshPersonalizationRevision(11, 10), false)
+  assert.equal(revision.shouldRefreshPersonalizationRevision(11, 13), true)
+
   const apiOutfile = path.join(tempDir, "api.mjs")
   await build({
     entryPoints: [path.join(projectRoot, "src", "lib", "api.ts")],
