@@ -23,7 +23,10 @@ from app.models import (
     TransactionFlowPoint,
     TransactionFlowObservation,
     TrendState,
+    WatchlistItem,
 )
+from app.principal import Principal
+from app.user_state import LegacyImportResult, PrincipalState
 
 
 def test_health_endpoint() -> None:
@@ -494,7 +497,7 @@ def test_board_level_query_is_forwarded_to_terminal_endpoints(monkeypatch) -> No
     assert calls[1][1]["board_level"] == 1
 
 
-def test_client_watchlist_codes_are_forwarded_to_terminal_endpoints(monkeypatch) -> None:
+def test_watchlist_codes_query_does_not_override_principal_state(monkeypatch) -> None:
     client = TestClient(app)
 
     calls: list[tuple[str, dict]] = []
@@ -502,7 +505,6 @@ def test_client_watchlist_codes_are_forwarded_to_terminal_endpoints(monkeypatch)
     class FakeService:
         def terminal(self, **kwargs):
             calls.append(("terminal", kwargs))
-            watchlist = kwargs.get("client_watchlist") or []
             return SimpleNamespace(
                 model_dump=lambda mode="json": {
                     "market": {"frozen": True},
@@ -512,7 +514,7 @@ def test_client_watchlist_codes_are_forwarded_to_terminal_endpoints(monkeypatch)
                         "page": 1,
                         "page_size": kwargs.get("page_size", 80),
                     },
-                    "watchlist_codes": [item.code for item in watchlist],
+                    "watchlist_codes": [],
                     "data_mode": "closed_static",
                     "source_status": {"updated_at": "15:00:00"},
                 }
@@ -536,16 +538,19 @@ def test_client_watchlist_codes_are_forwarded_to_terminal_endpoints(monkeypatch)
 
     monkeypatch.setattr(main_module, "service", FakeService())
 
-    terminal_response = client.get("/api/dashboard?view=terminal&watchlist_codes=300476,1,abc,300476")
-    board_response = client.get("/api/stocks/board?watchlist_codes=300308,000001")
+    headers = {"X-Client-ID": "client-api-0001"}
+    terminal_response = client.get("/api/dashboard?view=terminal&watchlist_codes=300476,1,abc,300476", headers=headers)
+    board_response = client.get("/api/stocks/board?watchlist_codes=300308,000001", headers=headers)
 
     assert terminal_response.status_code == 200
-    assert terminal_response.json()["watchlist_codes"] == ["300476", "000001"]
+    assert terminal_response.json()["watchlist_codes"] == []
     assert board_response.status_code == 200
     assert calls[0][0] == "terminal"
-    assert [item.code for item in calls[0][1]["client_watchlist"]] == ["300476", "000001"]
+    assert calls[0][1]["principal"] == Principal("anonymous_client", "client-api-0001")
     assert calls[1][0] == "stock_board"
-    assert [item.code for item in calls[1][1]["client_watchlist"]] == ["300308", "000001"]
+    assert calls[1][1]["principal"] == Principal("anonymous_client", "client-api-0001")
+    assert "client_watchlist" not in calls[0][1]
+    assert "client_watchlist" not in calls[1][1]
 
 
 def test_sector_rank_endpoint_uses_official_board_rank(monkeypatch) -> None:
@@ -566,27 +571,27 @@ def test_sector_rank_endpoint_uses_official_board_rank(monkeypatch) -> None:
 
     monkeypatch.setattr(main_module, "service", FakeService())
 
-    response = client.get("/api/sectors/rank?board_level=2&watchlist_codes=300476")
+    response = client.get("/api/sectors/rank?board_level=2&watchlist_codes=300476", headers={"X-Client-ID": "client-api-0001"})
 
     assert response.status_code == 200
     assert response.json()[0]["name"] == "官方板块"
     assert calls[0]["board_level"] == 2
-    assert [item.code for item in calls[0]["client_watchlist"]] == ["300476"]
+    assert calls[0]["principal"] == Principal("anonymous_client", "client-api-0001")
+    assert "client_watchlist" not in calls[0]
 
 
-def test_explicit_empty_watchlist_codes_forwards_empty_client_watchlist(monkeypatch) -> None:
+def test_missing_client_id_keeps_empty_personalization(monkeypatch) -> None:
     client = TestClient(app)
     calls: list[dict] = []
 
     class FakeService:
         def terminal(self, **kwargs):
             calls.append(kwargs)
-            watchlist = kwargs.get("client_watchlist")
             return SimpleNamespace(
                 model_dump=lambda mode="json": {
                     "market": {"frozen": True},
                     "stock_board": {"items": [], "total": 0, "page": 1, "page_size": 40},
-                    "watchlist_codes": [item.code for item in (watchlist or [])],
+                    "watchlist_codes": [],
                     "data_mode": "closed_static",
                     "source_status": {"updated_at": "15:00:00"},
                 }
@@ -597,8 +602,8 @@ def test_explicit_empty_watchlist_codes_forwards_empty_client_watchlist(monkeypa
     response = client.get("/api/dashboard?view=terminal&watchlist_codes=")
 
     assert response.status_code == 200
-    assert "client_watchlist" in calls[0]
-    assert calls[0]["client_watchlist"] == []
+    assert "client_watchlist" not in calls[0]
+    assert "principal" not in calls[0]
     assert response.json()["watchlist_codes"] == []
 
 
@@ -729,20 +734,53 @@ def test_stock_search_endpoint_caps_limit_and_skips_empty_query(monkeypatch) -> 
     assert empty.json() == []
 
 
-def test_position_crud_endpoints_keep_personal_context_local(monkeypatch) -> None:
+def test_personal_state_endpoints_require_identity_for_writes_and_are_isolated(monkeypatch) -> None:
     class FakeService:
         def __init__(self) -> None:
-            self.items: dict[str, PositionRecord] = {}
+            self.positions: dict[str, dict[str, PositionRecord]] = {}
+            self.watchlists: dict[str, dict[str, WatchlistItem]] = {}
+            self.revisions: dict[str, int] = {}
 
-        def list_positions(self):
-            return list(self.items.values())
+        def _key(self, principal: Principal) -> str:
+            return principal.storage_key
 
-        def upsert_position(self, item):
-            self.items[item.code] = item
+        def principal_state(self, principal: Principal | None):
+            if principal is None:
+                return PrincipalState(0, [], [], "missing_identity")
+            key = self._key(principal)
+            return PrincipalState(
+                self.revisions.get(key, 0),
+                list(self.watchlists.get(key, {}).values()),
+                list(self.positions.get(key, {}).values()),
+                "ready",
+            )
+
+        def upsert_position(self, principal, item):
+            key = self._key(principal)
+            self.positions.setdefault(key, {})[item.code] = item
+            self.revisions[key] = self.revisions.get(key, 0) + 1
             return item
 
-        def delete_position(self, code):
-            return self.items.pop(code, None) is not None
+        def delete_position(self, principal, code):
+            key = self._key(principal)
+            deleted = self.positions.get(key, {}).pop(code, None) is not None
+            if deleted:
+                self.revisions[key] = self.revisions.get(key, 0) + 1
+            return deleted
+
+        def upsert_watchlist(self, principal, item):
+            key = self._key(principal)
+            self.watchlists.setdefault(key, {})[item.code] = item
+            self.revisions[key] = self.revisions.get(key, 0) + 1
+            return item
+
+        def import_legacy_watchlist_once(self, principal, items):
+            key = self._key(principal)
+            if self.watchlists.get(key):
+                return LegacyImportResult(False, "existing_state", self.revisions.get(key, 0), list(self.watchlists[key].values()))
+            self.watchlists[key] = {item.code: item for item in items}
+            self.revisions[key] = self.revisions.get(key, 0) + 1
+            return LegacyImportResult(True, "applied", self.revisions[key], list(self.watchlists[key].values()))
 
     fake = FakeService()
     monkeypatch.setattr(main_module, "service", fake)
@@ -756,18 +794,39 @@ def test_position_crud_endpoints_keep_personal_context_local(monkeypatch) -> Non
         "t_allocation_pct": 25,
     }
 
-    created = client.post("/api/positions", json=payload)
-    listed = client.get("/api/positions")
-    mismatch = client.put("/api/positions/300476", json=payload)
-    deleted = client.delete("/api/positions/300308")
+    first = {"X-Client-ID": "client-api-0001"}
+    second = {"X-Client-ID": "client-api-0002"}
+    missing = client.post("/api/positions", json=payload)
+    invalid = client.post("/api/positions", headers={"X-Client-ID": "bad"}, json=payload)
+    created = client.post("/api/positions", headers=first, json=payload)
+    listed = client.get("/api/positions", headers=first)
+    other = client.get("/api/positions", headers=second)
+    anonymous = client.get("/api/positions")
+    mismatch = client.put("/api/positions/300476", headers=first, json=payload)
+    deleted = client.delete("/api/positions/300308", headers=first)
 
+    assert missing.status_code == 422
+    assert invalid.status_code == 422
     assert created.status_code == 200
     assert created.json()["available_quantity"] == 800
     assert listed.status_code == 200
-    assert listed.json()[0]["code"] == "300308"
+    assert listed.json()["items"][0]["code"] == "300308"
+    assert listed.json()["revision"] == 1
+    assert listed.json()["personalization_status"] == "ready"
+    assert other.json() == {"items": [], "revision": 0, "personalization_status": "ready"}
+    assert anonymous.json() == {"items": [], "revision": 0, "personalization_status": "missing_identity"}
     assert mismatch.status_code == 400
     assert deleted.status_code == 200
-    assert client.get("/api/positions").json() == []
+    assert client.get("/api/positions", headers=first).json()["items"] == []
+
+    imported = client.post(
+        "/api/watchlist/import-legacy",
+        headers=second,
+        json={"items": [{"code": "300476", "name": "胜宏科技", "themes": ["PCB"]}]},
+    )
+    assert imported.status_code == 200
+    assert imported.json()["imported"] is True
+    assert imported.json()["items"][0]["code"] == "300476"
 
 
 def test_opening_decision_endpoint_returns_checkpoint_and_reasons(monkeypatch) -> None:

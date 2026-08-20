@@ -29,6 +29,7 @@ from app.models import (
     WatchlistItem,
     ZsxqMessageIngestRequest,
 )
+from app.principal import Principal, PrincipalValidationError, principal_from_client_id
 from app.services import DashboardService
 from app.stream_delta import TerminalDeltaTracker
 from app.stream_hub import RESYNC, ChannelLimitExceeded, ChannelSpec, StreamHub, Subscription
@@ -336,6 +337,52 @@ def _stream_client_watchlist_kwargs(params: StreamParams) -> dict[str, list[Watc
     return {"client_watchlist": _client_watchlist_from_codes(params.watchlist_codes)}
 
 
+def read_principal(
+    x_client_id: str | None = Header(default=None, alias="X-Client-ID"),
+) -> Principal | None:
+    """Resolve the optional anonymous browser identity at the HTTP boundary."""
+
+    if x_client_id is None:
+        return None
+    try:
+        return principal_from_client_id(x_client_id)
+    except PrincipalValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def require_principal(principal: Principal | None = Depends(read_principal)) -> Principal:
+    """Require a valid identity before accepting personal-state writes."""
+
+    if principal is None:
+        raise HTTPException(status_code=422, detail="X-Client-ID is required")
+    return principal
+
+
+def _principal_kwargs(principal: Principal | None) -> dict[str, Principal]:
+    """Avoid imposing a ``principal=None`` keyword on legacy test doubles."""
+
+    return {"principal": principal} if principal is not None else {}
+
+
+def _principal_state(principal: Principal | None) -> PrincipalState:
+    if principal is None:
+        return PrincipalState(0, [], [], "missing_identity")
+    try:
+        return service.principal_state(principal)
+    except UserStateUnavailable:
+        return PrincipalState(0, [], [], "unavailable")
+
+
+def _personal_state_envelope(principal: Principal | None, item_type: str) -> dict:
+    state = _principal_state(principal)
+    items = state.watchlist if item_type == "watchlist" else state.positions
+    return {
+        "items": [item.model_dump(mode="json") for item in items],
+        "revision": state.revision,
+        "personalization_status": state.personalization_status,
+    }
+
+
 @app.get("/")
 def index() -> FileResponse:
     index_file = WEB_DIST_DIR / "index.html"
@@ -414,8 +461,8 @@ def dashboard(
     near_trend: bool = False,
     pin_buy: bool = False,
     watchlist_codes: str | None = None,
+    principal: Principal | None = Depends(read_principal),
 ) -> dict:
-    client_watchlist_kwargs = _client_watchlist_kwargs(watchlist_codes)
     if view == "terminal":
         return service.terminal(
             sector=sector,
@@ -426,9 +473,9 @@ def dashboard(
             fast=fast,
             near_trend=near_trend,
             pin_buy=pin_buy,
-            **client_watchlist_kwargs,
+            **_principal_kwargs(principal),
         ).model_dump(mode="json")
-    return service.dashboard(sector=sector, **client_watchlist_kwargs).model_dump(mode="json")
+    return service.dashboard(sector=sector, **_principal_kwargs(principal)).model_dump(mode="json")
 
 
 @app.get("/api/stocks/board")
@@ -441,6 +488,7 @@ def stocks_board(
     near_trend: bool = False,
     pin_buy: bool = False,
     watchlist_codes: str | None = None,
+    principal: Principal | None = Depends(read_principal),
 ) -> dict:
     return service.stock_board(
         sector=sector,
@@ -450,12 +498,17 @@ def stocks_board(
         page_size=page_size,
         near_trend=near_trend,
         pin_buy=pin_buy,
-        **_client_watchlist_kwargs(watchlist_codes),
+        **_principal_kwargs(principal),
     ).model_dump(mode="json")
 
 
 @app.get("/api/stocks/search")
-def search_stocks(q: str = "", limit: int = 12, watchlist_codes: str | None = None) -> list[dict]:
+def search_stocks(
+    q: str = "",
+    limit: int = 12,
+    watchlist_codes: str | None = None,
+    principal: Principal | None = Depends(read_principal),
+) -> list[dict]:
     query = str(q or "").strip()
     if not query:
         return []
@@ -463,7 +516,7 @@ def search_stocks(q: str = "", limit: int = 12, watchlist_codes: str | None = No
     return service.search_stocks(
         query,
         limit=bounded_limit,
-        **_client_watchlist_kwargs(watchlist_codes),
+        **_principal_kwargs(principal),
     )
 
 
@@ -479,12 +532,16 @@ def opening_decision(sector: str | None = None) -> dict:
 
 
 @app.get("/api/sectors/rank")
-def sectors_rank(board_level: int = 3, watchlist_codes: str | None = None) -> list[dict]:
+def sectors_rank(
+    board_level: int = 3,
+    watchlist_codes: str | None = None,
+    principal: Principal | None = Depends(read_principal),
+) -> list[dict]:
     return [
         sector.model_dump(mode="json")
         for sector in service.sector_rank(
             board_level=board_level,
-            **_client_watchlist_kwargs(watchlist_codes),
+            **_principal_kwargs(principal),
         )
     ]
 
@@ -519,6 +576,7 @@ def signal_detail(
     fast: bool = False,
     compact: bool = False,
     watchlist_codes: str | None = None,
+    principal: Principal | None = Depends(read_principal),
 ) -> dict:
     try:
         detail = service.signal_detail(
@@ -526,7 +584,7 @@ def signal_detail(
             sector=sector,
             trade_date=trade_date,
             fast=fast,
-            **_client_watchlist_kwargs(watchlist_codes),
+            **_principal_kwargs(principal),
         )
         return _serialize_signal_detail(detail, compact=compact)
     except ValueError as exc:
@@ -539,13 +597,14 @@ def signal_detail_chart(
     sector: str | None = None,
     trade_date: str | None = None,
     watchlist_codes: str | None = None,
+    principal: Principal | None = Depends(read_principal),
 ) -> dict:
     try:
         return service.signal_detail_chart(
             code,
             sector=sector,
             trade_date=trade_date,
-            **_client_watchlist_kwargs(watchlist_codes),
+            **_principal_kwargs(principal),
         ).model_dump(mode="json")
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -557,13 +616,14 @@ def signal_detail_overlay(
     sector: str | None = None,
     trade_date: str | None = None,
     watchlist_codes: str | None = None,
+    principal: Principal | None = Depends(read_principal),
 ) -> dict:
     try:
         return service.signal_detail_overlay(
             code,
             sector=sector,
             trade_date=trade_date,
-            **_client_watchlist_kwargs(watchlist_codes),
+            **_principal_kwargs(principal),
         ).model_dump(mode="json")
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -581,6 +641,7 @@ def signal_detail_extras(
     include_auction_history: bool = True,
     include_messages: bool = True,
     watchlist_codes: str | None = None,
+    principal: Principal | None = Depends(read_principal),
 ) -> dict:
     try:
         return service.signal_detail_extras(
@@ -593,7 +654,7 @@ def signal_detail_extras(
             include_chanlun=include_chanlun,
             include_auction_history=include_auction_history,
             include_messages=include_messages,
-            **_client_watchlist_kwargs(watchlist_codes),
+            **_principal_kwargs(principal),
         ).model_dump(mode="json")
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -611,6 +672,7 @@ def signal_detail_daily(
     trade_date: str | None = None,
     count: int = 240,
     watchlist_codes: str | None = None,
+    principal: Principal | None = Depends(read_principal),
 ) -> dict:
     """日K详情：日K线 + AI主力狙击公式（主图/双共振/主力动向）+ 筹码分布 + 题材概念标签。"""
     try:
@@ -619,7 +681,7 @@ def signal_detail_daily(
             sector=sector,
             trade_date=trade_date,
             count=count,
-            **_client_watchlist_kwargs(watchlist_codes),
+            **_principal_kwargs(principal),
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -662,28 +724,53 @@ def transaction_flow(code: str, trade_date: str | None = None, count: int = 240)
 
 
 @app.get("/api/watchlist")
-def list_watchlist() -> list[dict]:
-    return [item.model_dump(mode="json") for item in service.list_watchlist()]
+def list_watchlist(principal: Principal | None = Depends(read_principal)) -> dict:
+    return _personal_state_envelope(principal, "watchlist")
 
 
 @app.post("/api/watchlist")
-def create_watchlist_item(item: WatchlistItem) -> dict:
-    return service.upsert_watchlist(item).model_dump(mode="json")
+def create_watchlist_item(item: WatchlistItem, principal: Principal = Depends(require_principal)) -> dict:
+    return service.upsert_watchlist(principal, item).model_dump(mode="json")
 
 
 @app.put("/api/watchlist/{code}")
-def update_watchlist_item(code: str, item: WatchlistItem) -> dict:
+def update_watchlist_item(
+    code: str,
+    item: WatchlistItem,
+    principal: Principal = Depends(require_principal),
+) -> dict:
     if code != item.code:
         raise HTTPException(status_code=400, detail="路径代码和请求体代码不一致")
-    return service.upsert_watchlist(item).model_dump(mode="json")
+    return service.upsert_watchlist(principal, item).model_dump(mode="json")
 
 
 @app.delete("/api/watchlist/{code}")
-def delete_watchlist_item(code: str) -> dict:
-    deleted = service.delete_watchlist(code)
+def delete_watchlist_item(code: str, principal: Principal = Depends(require_principal)) -> dict:
+    deleted = service.delete_watchlist(principal, code)
     if not deleted:
         raise HTTPException(status_code=404, detail="自选股不存在")
     return {"deleted": True, "code": code}
+
+
+class LegacyWatchlistImportRequest(BaseModel):
+    """Browser-provided one-time snapshot; its owner always comes from the header."""
+
+    items: list[WatchlistItem]
+
+
+@app.post("/api/watchlist/import-legacy")
+def import_legacy_watchlist(
+    payload: LegacyWatchlistImportRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    result = service.import_legacy_watchlist_once(principal, payload.items)
+    return {
+        "imported": result.applied,
+        "reason": result.reason,
+        "items": [item.model_dump(mode="json") for item in result.items],
+        "revision": result.revision,
+        "personalization_status": "ready",
+    }
 
 
 # ---------------------------------------------------------------- 飞书推送订阅
@@ -723,25 +810,29 @@ def test_push_subscription(payload: PushTestRequest) -> dict:
 
 
 @app.get("/api/positions")
-def list_positions() -> list[dict]:
-    return [item.model_dump(mode="json") for item in service.list_positions()]
+def list_positions(principal: Principal | None = Depends(read_principal)) -> dict:
+    return _personal_state_envelope(principal, "positions")
 
 
 @app.post("/api/positions")
-def create_position(item: PositionRecord) -> dict:
-    return service.upsert_position(item).model_dump(mode="json")
+def create_position(item: PositionRecord, principal: Principal = Depends(require_principal)) -> dict:
+    return service.upsert_position(principal, item).model_dump(mode="json")
 
 
 @app.put("/api/positions/{code}")
-def update_position(code: str, item: PositionRecord) -> dict:
+def update_position(
+    code: str,
+    item: PositionRecord,
+    principal: Principal = Depends(require_principal),
+) -> dict:
     if code != item.code:
         raise HTTPException(status_code=400, detail="路径代码和请求体代码不一致")
-    return service.upsert_position(item).model_dump(mode="json")
+    return service.upsert_position(principal, item).model_dump(mode="json")
 
 
 @app.delete("/api/positions/{code}")
-def delete_position(code: str) -> dict:
-    if not service.delete_position(code):
+def delete_position(code: str, principal: Principal = Depends(require_principal)) -> dict:
+    if not service.delete_position(principal, code):
         raise HTTPException(status_code=404, detail="持仓不存在")
     return {"deleted": True, "code": code}
 
