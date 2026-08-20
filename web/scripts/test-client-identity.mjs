@@ -54,6 +54,8 @@ try {
   const revision = await import(pathToFileURL(revisionOutfile).href)
   assert.equal(revision.shouldRefreshPersonalizationRevision(11, 10), false)
   assert.equal(revision.shouldRefreshPersonalizationRevision(11, 13), true)
+  assert.equal(revision.shouldInstallCanonicalRevision(11, 10), false)
+  assert.equal(revision.shouldInstallCanonicalRevision(11, 11), true)
 
   const apiOutfile = path.join(tempDir, "api.mjs")
   await build({

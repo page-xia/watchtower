@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { syncPushCodes } from "@/lib/pushSubscription"
 import { addWatchlist, importLegacyWatchlist, listWatchlist, removeWatchlist } from "@/lib/api"
 import {
@@ -8,7 +8,7 @@ import {
 import { useLiveChannel } from "@/hooks/useLiveChannel"
 import { useTerminalStream } from "@/hooks/useTerminalStream"
 import { refreshPolicyFromPayload } from "@/lib/marketRefresh"
-import { shouldRefreshPersonalizationRevision } from "@/lib/personalizationRevision"
+import { shouldInstallCanonicalRevision, shouldRefreshPersonalizationRevision } from "@/lib/personalizationRevision"
 import type { BoardItem, IndexMinutesResponse, WatchlistEntry } from "@/types/api"
 import { TopBar } from "@/components/TopBar"
 import { MarketStrip } from "@/components/MarketStrip"
@@ -33,6 +33,7 @@ export default function App() {
   const [detailCode, setDetailCode] = useState<string | null>(null)
   const [serverWatchlist, setServerWatchlist] = useState<WatchlistEntry[]>([])
   const [personalizationRevision, setPersonalizationRevision] = useState(0)
+  const canonicalRevisionRef = useRef(0)
   const [personalizationStatus, setPersonalizationStatus] = useState("loading")
   const [personalizationError, setPersonalizationError] = useState<string | null>(null)
   const [personalizationHydrated, setPersonalizationHydrated] = useState(false)
@@ -46,6 +47,8 @@ export default function App() {
   const indexMinutes = useLiveChannel<IndexMinutesResponse>("index_minutes", {})
 
   const installCanonicalWatchlist = useCallback((response: { items: WatchlistEntry[]; revision: number; personalization_status: string }) => {
+    if (!shouldInstallCanonicalRevision(canonicalRevisionRef.current, response.revision)) return
+    canonicalRevisionRef.current = response.revision
     setServerWatchlist(response.items)
     setPersonalizationRevision(response.revision)
     setPersonalizationStatus(response.personalization_status)

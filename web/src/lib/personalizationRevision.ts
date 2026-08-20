@@ -5,3 +5,7 @@ export function shouldRefreshPersonalizationRevision(
 ): streamRevision is number {
   return streamRevision != null && streamRevision > localRevision
 }
+
+export function shouldInstallCanonicalRevision(currentRevision: number, responseRevision: number): boolean {
+  return responseRevision >= currentRevision
+}
