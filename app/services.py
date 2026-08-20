@@ -183,13 +183,8 @@ class DashboardService:
     ) -> None:
         self.settings = settings
         self.data_update_buffer = data_update_buffer
-        # Legacy global stores remain available to old offline callers, but
-        # the production path always uses principal-scoped state.  Explicitly
-        # injected principal stores take precedence even when legacy stores
-        # are also supplied by a test or migration adapter.
-        self._legacy_user_state_enabled = user_state_store is None and (
-            watchlist_store is not None or position_store is not None
-        )
+        # Legacy stores are retained only for unrelated offline artifacts.
+        # They are never an authority for personal state or public snapshots.
         self.user_state_store = user_state_store or self._build_user_state_store(settings)
         self.state_store = state_store or self._build_state_store(settings)
         self.watchlist_store = watchlist_store or self._build_watchlist_store(settings)
@@ -368,10 +363,12 @@ class DashboardService:
         try:
             if backend == "mysql":
                 return MySqlPrincipalStateRepository.from_settings(settings)
-            path = getattr(settings, "user_state_file", None) or getattr(settings, "user_store_file", None)
-            if path is None:
-                path = settings.data_dir / "runtime" / "principal_state.json"
-            return JsonPrincipalStateRepository(path)
+            if backend == "json":
+                path = getattr(settings, "user_state_file", None) or getattr(settings, "user_store_file", None)
+                if path is None:
+                    path = settings.data_dir / "runtime" / "principal_state.json"
+                return JsonPrincipalStateRepository(path)
+            raise ValueError(f"unsupported WATCH_USER_STORE_BACKEND: {backend}")
         except Exception as exc:  # pragma: no cover - defensive startup path
             logger.warning("principal state store unavailable: %r", exc)
             return None
@@ -388,16 +385,6 @@ class DashboardService:
     ) -> PrincipalState:
         """Return cached principal state; never fall back to global JSON state."""
         if principal is None:
-            if self._legacy_user_state_enabled:
-                try:
-                    return PrincipalState(
-                        revision=0,
-                        watchlist=list(self.watchlist_store.list_items()),
-                        positions=list(self.position_store.list_items()),
-                        personalization_status="ready",
-                    )
-                except Exception:
-                    return self._empty_principal_state("unavailable")
             return self._empty_principal_state()
         store = getattr(self, "user_state_store", None)
         if store is None:
@@ -467,15 +454,6 @@ class DashboardService:
     ) -> PrincipalState:
         if principal is not None:
             return self._principal_state(principal)
-        if self._legacy_user_state_enabled:
-            watchlist = self._normalize_client_watchlist(client_watchlist)
-            if watchlist is None:
-                watchlist = list(self.watchlist_store.list_items())
-            try:
-                positions = list(self.position_store.list_items())
-            except Exception:
-                positions = []
-            return PrincipalState(0, watchlist, positions, "ready")
         return self._empty_principal_state()
 
     def _publish_data_update(
@@ -763,7 +741,7 @@ class DashboardService:
         watchlist = self._normalize_client_watchlist(client_watchlist)
         if watchlist is None:
             return context
-        position_by_code = {item.code: item for item in self.position_store.list_items()}
+        position_by_code: dict[str, PositionRecord] = {}
         signals_all = self._decorate_signals(context.signals_all, watchlist, position_by_code)
         return DashboardContext(
             watchlist=watchlist,
@@ -1399,13 +1377,6 @@ class DashboardService:
                 seen.add(code)
                 codes.append(code)
 
-        try:
-            for item in self.watchlist_store.list_items():
-                push(item.code)
-            for item in self.position_store.list_items():
-                push(item.code)
-        except Exception as exc:
-            logger.warning("f10 preopen candidates from stores failed: %r", exc)
         index = self.data_source.f10_cache_index()
         for code, _ in sorted(index.items(), key=lambda kv: kv[1], reverse=True):
             push(code)
@@ -1529,13 +1500,9 @@ class DashboardService:
     ) -> SignalReplayDetail:
         current_context = self._get_context()
         personal = self._resolved_personal_state(principal, client_watchlist)
-        if self._legacy_user_state_enabled and principal is None:
-            current_context = self._context_with_client_watchlist(current_context, client_watchlist)
         current_trade_date = str(current_context.source_status.get("trade_date") or "")
         actual_trade_date = trade_date or current_trade_date or china_now().strftime("%Y%m%d")
         context = self._context_for_trade_date(current_context, actual_trade_date)
-        if self._legacy_user_state_enabled and principal is None:
-            context = self._context_with_client_watchlist(context, client_watchlist)
         quote = self._quote_for_code(context.snapshot.quotes, code)
         if quote is None:
             raise ValueError(f"未找到 {code} 的行情数据")
@@ -1553,6 +1520,8 @@ class DashboardService:
             requested_sector=requested_sector,
         )
         selected_sector = sector_snapshot.name if sector_snapshot else requested_sector
+        if selected_sector and signal.sector != selected_sector:
+            signal = signal.model_copy(update={"sector": selected_sector})
         position = next((item for item in personal.positions if item.code == str(code).zfill(6)), None)
         transaction_flow = (
             TransactionFlowObservation(
@@ -1576,50 +1545,6 @@ class DashboardService:
                     )
                 }
             )
-        if sector_snapshot is not None and (self._legacy_user_state_enabled and principal is None):
-            scoped_quotes = [
-                detail_quote if item.code == detail_quote.code else item
-                for item in context.snapshot.quotes
-            ]
-            scoped_formula_rows = self._formula_rows_by_code_for_context(
-                trade_date=actual_trade_date,
-                quotes=[detail_quote],
-                watchlist=[
-                    WatchlistItem(
-                        code=quote.code,
-                        name=quote.name,
-                        themes=list(quote.themes),
-                        core=quote.core,
-                    )
-                ],
-                positions={quote.code: position} if position else {},
-            )
-            scoped_signals = self.engine.build_signals(
-                scoped_quotes,
-                [
-                    WatchlistItem(
-                        code=quote.code,
-                        name=quote.name,
-                        themes=list(quote.themes),
-                        core=quote.core,
-                    )
-                ],
-                context.sectors,
-                self._market_for_signals(context.snapshot, context.market),
-                clock_label=str(context.source_status.get("clock_label") or context.market.updated_at or ""),
-                preferred_sector_names={sector_snapshot.name},
-                positions={quote.code: position} if position else {},
-                formula_rows_by_code=scoped_formula_rows,
-                sector_name_mapper=self._display_sector_name,
-            )
-            if scoped_signals:
-                scoped_signal = scoped_signals[0]
-                signal = scoped_signal.model_copy(
-                    update={
-                        "pinned": signal.pinned,
-                        "watchlist_tags": list(signal.watchlist_tags),
-                    }
-                )
         live_mode = context.snapshot.data_mode == "live" or context.source_status.get("active_source") == "easy_tdx"
         detail_info = SignalDetailContext(
             context=context,
@@ -2096,8 +2021,6 @@ class DashboardService:
 
     def list_watchlist(self, principal: Principal | None = None) -> list[WatchlistItem]:
         if principal is None:
-            if self._legacy_user_state_enabled:
-                return self.watchlist_store.list_items()
             raise ValueError("principal is required")
         return list(self._principal_state(principal).watchlist)
 
@@ -2221,15 +2144,14 @@ class DashboardService:
         *,
         expected_revision: int | None = None,
     ) -> WatchlistItem:
-        # Compatibility form: upsert_watchlist(item) for explicitly injected
-        # legacy stores.  Principal-aware callers must use (principal, item).
         if isinstance(principal, WatchlistItem) and item is None:
-            if not self._legacy_user_state_enabled:
-                raise ValueError("principal is required")
+            # Deprecated explicit offline compatibility only.  This method is
+            # never consulted by public/personal dashboard reads or context
+            # construction, so it cannot become a cross-user fallback.
             saved = self.watchlist_store.upsert(principal)
-            self._patch_cached_watchlist(saved)
-            self._invalidate_context()
-            self._publish_data_update("watchlist", "terminal", "detail", reason="watchlist_upsert", metadata={"code": saved.code})
+            self._publish_data_update(
+                "watchlist", "terminal", "detail", reason="watchlist_upsert", metadata={"code": saved.code}
+            )
             return saved
         if not isinstance(principal, Principal) or item is None:
             raise ValueError("principal is required")
@@ -2262,21 +2184,14 @@ class DashboardService:
             self._principal_state(principal, refresh=True)
             self._publish_data_update("watchlist", "terminal", "detail", reason="watchlist_delete", metadata={"code": str(code).zfill(6), "principal": principal.log_digest})
             return any(row.code == str(code).zfill(6) for row in current.watchlist)
-        if not self._legacy_user_state_enabled:
-            raise ValueError("principal is required")
         deleted = self.watchlist_store.delete(principal)
         if deleted:
-            normalized = str(code or "").strip().zfill(6)
-            cache = self._context_cache
-            if cache is not None:
-                cache.watchlist = [entry for entry in cache.watchlist if entry.code != normalized]
-            self._invalidate_context()
             self._publish_data_update(
                 "watchlist",
                 "terminal",
                 "detail",
                 reason="watchlist_delete",
-                metadata={"code": normalized},
+                metadata={"code": str(principal).strip().zfill(6)},
             )
         return deleted
 
@@ -2298,8 +2213,6 @@ class DashboardService:
 
     def list_positions(self, principal: Principal | None = None) -> list[PositionRecord]:
         if principal is None:
-            if self._legacy_user_state_enabled:
-                return self.position_store.list_items()
             raise ValueError("principal is required")
         return list(self._principal_state(principal).positions)
 
@@ -2311,11 +2224,10 @@ class DashboardService:
         expected_revision: int | None = None,
     ) -> PositionRecord:
         if isinstance(principal, PositionRecord) and item is None:
-            if not self._legacy_user_state_enabled:
-                raise ValueError("principal is required")
             saved = self.position_store.upsert(principal)
-            self._invalidate_context()
-            self._publish_data_update("positions", "terminal", "detail", reason="position_upsert", metadata={"code": saved.code})
+            self._publish_data_update(
+                "positions", "terminal", "detail", reason="position_upsert", metadata={"code": saved.code}
+            )
             return saved
         if not isinstance(principal, Principal) or item is None:
             raise ValueError("principal is required")
@@ -2349,17 +2261,14 @@ class DashboardService:
             self._principal_state(principal, refresh=True)
             self._publish_data_update("positions", "terminal", "detail", reason="position_delete", metadata={"code": normalized, "principal": principal.log_digest})
             return any(row.code == normalized for row in current.positions)
-        if not self._legacy_user_state_enabled:
-            raise ValueError("principal is required")
         deleted = self.position_store.delete(principal)
         if deleted:
-            self._invalidate_context()
             self._publish_data_update(
                 "positions",
                 "terminal",
                 "detail",
                 reason="position_delete",
-                metadata={"code": str(code or "").strip().zfill(6)},
+                metadata={"code": str(principal).strip().zfill(6)},
             )
         return deleted
 
@@ -2380,7 +2289,7 @@ class DashboardService:
             return {**self.trajectory_store.status(), "skipped": "local_trajectory_bootstrap"}
         self._record_intraday_context(
             context,
-            self.position_store.list_items() if self._legacy_user_state_enabled else [],
+            [],
         )
         return {
             **self.trajectory_store.status(),
@@ -2712,12 +2621,8 @@ class DashboardService:
             pass
 
         try:
-            if self._legacy_user_state_enabled:
-                watchlist = self.watchlist_store.list_items()
-                positions = self.position_store.list_items()
-            else:
-                watchlist = []
-                positions = []
+            watchlist: list[WatchlistItem] = []
+            positions: list[PositionRecord] = []
             position_by_code = {item.code: item for item in positions}
             themes = self.theme_store.list_themes()
             mark_stage("local_config_ms")
@@ -2997,15 +2902,9 @@ class DashboardService:
 
         cache_bucket = self._context_bucket()
 
-        # Public market facts are independent of any browser principal.  Keep
-        # the old stores only for explicitly constructed legacy/offline
-        # adapters; production requests use an empty personal input here.
-        if self._legacy_user_state_enabled:
-            watchlist = self.watchlist_store.list_items()
-            positions = self.position_store.list_items()
-        else:
-            watchlist = []
-            positions = []
+        # Public market facts are independent of every browser principal.
+        watchlist: list[WatchlistItem] = []
+        positions: list[PositionRecord] = []
         position_by_code = {item.code: item for item in positions}
         themes = self.theme_store.list_themes()
         mark_stage("local_config_ms")
@@ -3284,14 +3183,14 @@ class DashboardService:
             frozen=True,
         ).model_copy(update={"frozen": True})
         sectors = self.engine.rank_sectors(snapshot.quotes, current_context.themes, market)
-        positions = self.position_store.list_items() if self._legacy_user_state_enabled else []
+        positions: list[PositionRecord] = []
         position_by_code = {item.code: item for item in positions}
         scan_items = self._scan_items_from_quotes(snapshot.quotes)
         formula_rows_started_at = time.perf_counter()
         formula_rows_by_code = self._formula_rows_by_code_for_context(
             trade_date=normalized_date,
             quotes=snapshot.quotes,
-            watchlist=current_context.watchlist if self._legacy_user_state_enabled else [],
+            watchlist=[],
             positions=position_by_code,
         )
         formula_rows_finished_at = time.perf_counter()
@@ -3624,8 +3523,6 @@ class DashboardService:
 
         level = normalize_board_level(board_level)
         personal = personal_state
-        if personal is None and self._legacy_user_state_enabled:
-            personal = PrincipalState(0, list(context.watchlist), list(self.position_store.list_items()), "ready")
         personal = personal or self._empty_principal_state()
         # 载荷级共享缓存/单飞在 terminal() 入口统一处理，这里只做构建。
         board_context = self.data_source.fetch_board_context(level)
@@ -4516,8 +4413,6 @@ class DashboardService:
         personal_state: PrincipalState | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         personal = personal_state
-        if personal is None and self._legacy_user_state_enabled:
-            personal = PrincipalState(0, list(context.watchlist), list(self.position_store.list_items()), "ready")
         personal = personal or self._empty_principal_state()
         watchlist = list(personal.watchlist)
         positions = list(personal.positions)
@@ -7459,11 +7354,7 @@ class DashboardService:
         normalized_watchlist = list(personal.watchlist)
         requested_sector = self._normalize_sector(sector)
         base_context = self._get_context()
-        current_context = (
-            self._context_with_client_watchlist(base_context, normalized_watchlist or None)
-            if self._legacy_user_state_enabled and principal is None
-            else base_context
-        )
+        current_context = base_context
         # 缓存键只用稳定维度：context.updated_at 每次全市场刷新都会变，
         # 绑进键里等于盘中每次轮询都冷启动（分钟行+公式全部重算）。
         # 新鲜度由短 TTL 保证，图表尾部的实时价由 _merge_live_quote_tail 合并。
@@ -7484,8 +7375,6 @@ class DashboardService:
             current_trade_date = str(current_context.source_status.get("trade_date") or "")
             actual_trade_date = trade_date or current_trade_date or china_now().strftime("%Y%m%d")
             context = self._context_for_trade_date(current_context, actual_trade_date)
-            if self._legacy_user_state_enabled and principal is None:
-                context = self._context_with_client_watchlist(context, normalized_watchlist or None)
             quote = self._quote_for_code(context.snapshot.quotes, normalized_code)
             if quote is None:
                 raise ValueError(f"未找到 {normalized_code} 的行情数据")
@@ -7505,51 +7394,6 @@ class DashboardService:
             position = next((item for item in personal.positions if item.code == normalized_code), None)
             watchlist_item = self._watchlist_item_for_code(normalized_watchlist, normalized_code)
             live_mode = context.snapshot.data_mode == "live" or context.source_status.get("active_source") == "easy_tdx"
-            if sector_snapshot is not None and (self._legacy_user_state_enabled and principal is None):
-                scoped_quotes = [
-                    quote if item.code == quote.code else item
-                    for item in context.snapshot.quotes
-                ]
-                scoped_formula_rows = self._formula_rows_by_code_for_context(
-                    trade_date=actual_trade_date,
-                    quotes=[quote],
-                    watchlist=[
-                        WatchlistItem(
-                            code=quote.code,
-                            name=quote.name,
-                            themes=list(quote.themes),
-                            core=quote.core,
-                        )
-                    ],
-                    positions={quote.code: position} if position else {},
-                )
-                scoped_signals = self.engine.build_signals(
-                    scoped_quotes,
-                    [
-                        WatchlistItem(
-                            code=quote.code,
-                            name=quote.name,
-                            themes=list(quote.themes),
-                            core=quote.core,
-                        )
-                    ],
-                    context.sectors,
-                    self._market_for_signals(context.snapshot, context.market),
-                    clock_label=str(context.source_status.get("clock_label") or context.market.updated_at or ""),
-                    preferred_sector_names={sector_snapshot.name},
-                    positions={quote.code: position} if position else {},
-                    formula_rows_by_code=scoped_formula_rows,
-                    sector_name_mapper=self._display_sector_name,
-                )
-                if scoped_signals:
-                    scoped_signal = scoped_signals[0]
-                    signal = scoped_signal.model_copy(
-                        update={
-                            "pinned": signal.pinned,
-                            "watchlist_tags": list(signal.watchlist_tags),
-                        }
-                    )
-
             return SignalDetailContext(
                 context=context,
                 actual_trade_date=actual_trade_date,

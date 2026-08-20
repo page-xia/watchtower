@@ -195,7 +195,21 @@ WATCH_USER_MYSQL_DB=watchtower_user
 WATCH_DARK_POOL=1
 ```
 
-RDS 连接信息放在服务器 `/root/watchtower/watchtower.env`（环境变量文件，不进镜像、不进仓库）；RDS 白名单只放行服务器 47.116.20.229 和本机出口 IP（本机宽带 IP 变了要去 RDS 控制台改白名单）。首次部署后先在已加载 `watchtower.env` 的环境中运行 `python scripts/init_user_store.py`，创建 `principal_states`、`principal_watchlist_items`、`principal_positions`、`principal_migrations` 四张表；该命令不会读取旧的全局 `data/watchlist.json` / `data/positions.json`。EOD 数据由本机收盘后跑 `scripts/ingest_eod_tushare.py` 直接落 RDS（`--days N` 回填，`--only` 选数据集）。网页通过 `watchtower.client-id.v1` 生成匿名主体，服务端按 `X-Client-ID` 在用户存储中隔离自选和持仓；MySQL 故障时显示个人数据不可用，绝不回退到旧全局文件或其他主体。暗盘资金面板只读 EOD 库与东财快照缓存（后台一次性线程补齐），不进入 5 秒全市场刷新链路，也不再轮询磁带。
+RDS 连接信息放在服务器 `/root/watchtower/watchtower.env`（环境变量文件，不进镜像、不进仓库）；RDS 白名单只放行服务器 47.116.20.229 和本机出口 IP（本机宽带 IP 变了要去 RDS 控制台改白名单）。生产环境必须显式设置 `WATCH_USER_STORE_BACKEND=mysql`，并填写全部 `WATCH_USER_MYSQL_*` 连接项。每次 `scripts/deploy_aliyun.ps1` 都会在重启前运行 `scripts/init_user_store.py`，创建/校验 `principal_states`、`principal_watchlist_items`、`principal_positions`、`principal_migrations` 四张表；该命令拒绝非 MySQL 后端，且不会读取旧的全局 `data/watchlist.json` / `data/positions.json`。这两个历史文件不会随镜像或部署包发送，也绝不是运行时回退源。EOD 数据由本机收盘后跑 `scripts/ingest_eod_tushare.py` 直接落 RDS（`--days N` 回填，`--only` 选数据集）。网页通过 `watchtower.client-id.v1` 生成匿名主体，服务端按 `X-Client-ID` 在用户存储中隔离自选和持仓；MySQL 故障时个人数据状态为 `unavailable`，写入返回 503，绝不返回旧全局文件或其他主体的数据。暗盘资金面板只读 EOD 库与东财快照缓存（后台一次性线程补齐），不进入 5 秒全市场刷新链路，也不再轮询磁带。
+
+浏览器旧版自选仅能通过 `POST /api/watchlist/import-legacy` 从该浏览器一次性导入，最多 200 条；服务端不会主动扫描或迁移任何历史全局文件。部署完成后脚本会调用 HTTPS 双客户端验收，也可手工执行：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\probe_user_isolation.py --base-url https://omnisource.xin
+```
+
+该探针为两个随机 `client_id` 创建临时自选、验证终端和列表隔离、再只删除它创建的那条记录；日志只显示主体摘要。非本机地址必须使用 HTTPS，证书校验默认开启。仅检查命令格式而不写数据：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\probe_user_isolation.py --base-url http://127.0.0.1:8788 --dry-run
+```
+
+紧急回滚规则：若用户存储异常，保持个人化为 `unavailable` 并暂停个人写入/修复 RDS；不得通过重新启用全局 `watchlist.json` 或 `positions.json` 来“回滚”，否则会重新引入跨用户数据泄漏。
 
 星球消息证据读取走物化缓存：详情页按 `(scope=stock/sector, cache_key=代码/板块词)` 直接读 `message_evidence_cache`（1~2 次索引查询，亚秒）；未命中的键走动态查询兜底并回写（read-through，空结果也缓存）；每次消息同步后后台自动重建受影响实体的物化值（含板块查询词与链接名的子串别名桥接）。全新部署或物化表被清空后，下一次同步会自动触发一次全量预建，也可手动触发 `POST /api/messages/evidence/prebuild`（需 ingest token）；`scripts/materialize_message_evidence.py` 可从本地一次性全量重建（语义与服务端一致）。
 
@@ -238,7 +252,7 @@ $env:WATCH_TARGET_URLS="https://omnisource.xin;http://127.0.0.1:8788"
 
 ## 关键文件
 
-- `web/src/lib/localWatchlist.ts`：网页自选股保存在浏览器 `localStorage`，默认不参与全市场股票板扫描。
+- `web/src/lib/clientIdentity.ts`：浏览器生成并保存匿名 `client_id`；自选和持仓以服务端响应为准，不由本地缓存授权。
 - `data/themes.yaml`：手工交易主题和核心票映射。
 - `data/trading_rules.yaml`：买 T、卖 T、板块强度等阈值。
 - 阿里云 RDS `watchtower_msg` 库 `message_*` 表：盯盘系统自己的星球消息库，由 ingest API 写入。

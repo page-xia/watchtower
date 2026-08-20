@@ -309,7 +309,10 @@ class AppSettings:
             "user_store_db": self.user_mysql_db,
             "user_store_configured": (
                 self.user_store_backend == "json"
-                or bool(self.user_mysql_host and self.user_mysql_user and self.user_mysql_db)
+                or (
+                    self.user_store_backend == "mysql"
+                    and bool(self.user_mysql_host and self.user_mysql_user and self.user_mysql_db)
+                )
             ),
             "message_store_configured": (
                 bool(self.msg_mysql_host and self.msg_mysql_user and self.msg_mysql_db)

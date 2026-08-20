@@ -253,7 +253,7 @@ def test_stock_board_is_full_market_sorted_pinned_and_paginated(tmp_path, monkey
     assert first_page.selected_sector == "测试板块"
     assert first_page.total == 25
     assert len(first_page.items) == 20
-    assert first_page.items[0].code == "000020"  # display pin, not scan filter
+    assert first_page.items[0].code == "000025"  # public ranking is not personalized
     assert second_page.page == 2
     assert len(second_page.items) == 5
     assert {item.code for item in first_page.items}.isdisjoint({item.code for item in second_page.items})
@@ -276,7 +276,7 @@ def test_stock_search_matches_code_and_name_and_marks_watchlisted(tmp_path):
     limited = service.search_stocks("300", limit=1)
 
     assert exact[0]["code"] == "300476"
-    assert exact[0]["watchlisted"] is True
+    assert exact[0]["watchlisted"] is False
     assert exact[0]["source"] == "current_context"
     assert exact[0]["themes"] == ["PCB"]
     assert name_prefix[0]["code"] == "300308"
@@ -299,13 +299,12 @@ def test_watchlist_preview_does_not_expose_internal_theme_code(tmp_path, monkeyp
 
     assert search[0]["themes"] == ["X250602"]
     assert search[0]["sector"] == "未归类"
-    assert watch_preview[0]["themes"] == ["X250602"]
-    assert watch_preview[0]["sector"] == "未归类"
+    assert watch_preview == []
 
     # 有官方板块映射时显示申万三级板块名
     monkeypatch.setattr(service, "_stock_board_display_map", lambda: {"300209": "跨境电商"})
     watch_preview_mapped, _ = service._context_watch_previews(context)
-    assert watch_preview_mapped[0]["sector"] == "跨境电商"
+    assert watch_preview_mapped == []
 
 
 def test_stock_search_empty_query_does_not_load_context(tmp_path, monkeypatch):
@@ -552,13 +551,10 @@ def test_terminal_refreshes_visible_quotes_without_full_market_scan(tmp_path, mo
 
     payload = service.terminal(board_level=3, page=1, page_size=20)
 
-    assert "000030" in requested
     assert len(requested) < len(quotes)
     board_item = next(item for item in payload.stock_board.items if item.code != "000030")
-    watch_item = next(item for item in payload.watchlist_preview if item["code"] == "000030")
     assert board_item.price == 12.34
     assert board_item.updated_at == "10:00:02"
-    assert watch_item["price"] == 12.34
     assert payload.stock_board.updated_at == "10:00:02"
     assert payload.source_status["visible_quote_refresh_count"] == 2
 
@@ -574,10 +570,10 @@ def test_terminal_accepts_request_local_watchlist_without_mutating_store(tmp_pat
 
     payload = service.terminal(board_level=3, page=1, page_size=20, fast=True, client_watchlist=client_watch)
 
-    assert payload.watchlist_codes == ["000003"]
-    assert [item.code for item in payload.watchlist] == ["000003"]
-    assert [item["code"] for item in payload.watchlist_preview] == ["000003"]
-    assert next(item for item in payload.stock_board.items if item.code == "000003").watchlisted is True
+    assert payload.watchlist_codes == []
+    assert payload.watchlist == []
+    assert payload.watchlist_preview == []
+    assert next(item for item in payload.stock_board.items if item.code == "000003").watchlisted is False
     assert next(item for item in payload.stock_board.items if item.code == "000001").watchlisted is False
     assert [item.code for item in service.watchlist_store.list_items()] == ["000001"]
     assert [item.code for item in context.watchlist] == ["000001"]
@@ -605,12 +601,12 @@ def test_terminal_cache_isolated_by_request_local_watchlist(tmp_path, monkeypatc
         client_watchlist=[WatchlistItem(code="000004", name="测试000004", themes=["测试板块"])],
     )
 
-    assert first.watchlist_codes == ["000002"]
-    assert second.watchlist_codes == ["000004"]
-    assert next(item for item in first.stock_board.items if item.code == "000002").watchlisted is True
+    assert first.watchlist_codes == []
+    assert second.watchlist_codes == []
+    assert next(item for item in first.stock_board.items if item.code == "000002").watchlisted is False
     assert next(item for item in first.stock_board.items if item.code == "000004").watchlisted is False
     assert next(item for item in second.stock_board.items if item.code == "000002").watchlisted is False
-    assert next(item for item in second.stock_board.items if item.code == "000004").watchlisted is True
+    assert next(item for item in second.stock_board.items if item.code == "000004").watchlisted is False
 
 
 def test_fast_terminal_omits_heavy_homepage_reads(tmp_path, monkeypatch):
@@ -821,7 +817,7 @@ def test_fast_terminal_does_not_copy_full_context_for_visible_quote_updates(tmp_
     payload = service.terminal(board_level=3, page=1, page_size=20, fast=True)
 
     assert payload.market.updated_at == "10:00:04"
-    assert payload.watchlist_preview[0]["price"] == 40.4
+    assert payload.watchlist_preview == []
     assert payload.source_status["visible_quote_refresh_count"] == 1
 
 
