@@ -26,7 +26,7 @@ from app.models import (
     WatchlistItem,
 )
 from app.principal import Principal
-from app.user_state import LegacyImportResult, PrincipalState
+from app.user_state import LegacyImportResult, PrincipalState, RevisionConflict, UserStateUnavailable
 
 
 def test_health_endpoint() -> None:
@@ -755,21 +755,27 @@ def test_personal_state_endpoints_require_identity_for_writes_and_are_isolated(m
                 "ready",
             )
 
-        def upsert_position(self, principal, item):
+        def upsert_position(self, principal, item, *, expected_revision=None):
             key = self._key(principal)
+            if expected_revision is not None and expected_revision != self.revisions.get(key, 0):
+                raise RevisionConflict(expected_revision, self.revisions.get(key, 0))
             self.positions.setdefault(key, {})[item.code] = item
             self.revisions[key] = self.revisions.get(key, 0) + 1
             return item
 
-        def delete_position(self, principal, code):
+        def delete_position(self, principal, code, *, expected_revision=None):
             key = self._key(principal)
+            if expected_revision is not None and expected_revision != self.revisions.get(key, 0):
+                raise RevisionConflict(expected_revision, self.revisions.get(key, 0))
             deleted = self.positions.get(key, {}).pop(code, None) is not None
             if deleted:
                 self.revisions[key] = self.revisions.get(key, 0) + 1
             return deleted
 
-        def upsert_watchlist(self, principal, item):
+        def upsert_watchlist(self, principal, item, *, expected_revision=None):
             key = self._key(principal)
+            if expected_revision is not None and expected_revision != self.revisions.get(key, 0):
+                raise RevisionConflict(expected_revision, self.revisions.get(key, 0))
             self.watchlists.setdefault(key, {})[item.code] = item
             self.revisions[key] = self.revisions.get(key, 0) + 1
             return item
@@ -798,17 +804,19 @@ def test_personal_state_endpoints_require_identity_for_writes_and_are_isolated(m
     second = {"X-Client-ID": "client-api-0002"}
     missing = client.post("/api/positions", json=payload)
     invalid = client.post("/api/positions", headers={"X-Client-ID": "bad"}, json=payload)
-    created = client.post("/api/positions", headers=first, json=payload)
+    created = client.post("/api/positions", headers={**first, "X-Expected-Revision": "0"}, json=payload)
     listed = client.get("/api/positions", headers=first)
     other = client.get("/api/positions", headers=second)
     anonymous = client.get("/api/positions")
     mismatch = client.put("/api/positions/300476", headers=first, json=payload)
-    deleted = client.delete("/api/positions/300308", headers=first)
+    stale = client.delete("/api/positions/300308", headers={**first, "X-Expected-Revision": "0"})
+    deleted = client.delete("/api/positions/300308", headers={**first, "X-Expected-Revision": "1"})
 
     assert missing.status_code == 422
     assert invalid.status_code == 422
     assert created.status_code == 200
-    assert created.json()["available_quantity"] == 800
+    assert created.json()["items"][0]["available_quantity"] == 800
+    assert created.json()["revision"] == 1
     assert listed.status_code == 200
     assert listed.json()["items"][0]["code"] == "300308"
     assert listed.json()["revision"] == 1
@@ -816,8 +824,11 @@ def test_personal_state_endpoints_require_identity_for_writes_and_are_isolated(m
     assert other.json() == {"items": [], "revision": 0, "personalization_status": "ready"}
     assert anonymous.json() == {"items": [], "revision": 0, "personalization_status": "missing_identity"}
     assert mismatch.status_code == 400
+    assert stale.status_code == 409
+    assert stale.json()["current_revision"] == 1
     assert deleted.status_code == 200
-    assert client.get("/api/positions", headers=first).json()["items"] == []
+    assert deleted.json()["revision"] == 2
+    assert deleted.json()["items"] == []
 
     imported = client.post(
         "/api/watchlist/import-legacy",
@@ -825,8 +836,56 @@ def test_personal_state_endpoints_require_identity_for_writes_and_are_isolated(m
         json={"items": [{"code": "300476", "name": "胜宏科技", "themes": ["PCB"]}]},
     )
     assert imported.status_code == 200
-    assert imported.json()["imported"] is True
+    assert imported.json()["migration"] == {"applied": True, "reason": "applied"}
     assert imported.json()["items"][0]["code"] == "300476"
+
+
+def test_personal_state_write_failures_map_to_service_errors(monkeypatch) -> None:
+    class FailingService:
+        def upsert_watchlist(self, principal, item, *, expected_revision=None):
+            raise UserStateUnavailable("RDS unavailable")
+
+        def upsert_position(self, principal, item, *, expected_revision=None):
+            raise RevisionConflict(expected_revision or 0, 7)
+
+        def delete_watchlist(self, principal, code, *, expected_revision=None):
+            raise UserStateUnavailable("RDS unavailable")
+
+        def delete_position(self, principal, code, *, expected_revision=None):
+            raise UserStateUnavailable("RDS unavailable")
+
+        def import_legacy_watchlist_once(self, principal, items):
+            raise UserStateUnavailable("RDS unavailable")
+
+    monkeypatch.setattr(main_module, "service", FailingService())
+    client = TestClient(app)
+    headers = {"X-Client-ID": "client-api-0001", "X-Expected-Revision": "3"}
+    watchlist = client.post(
+        "/api/watchlist",
+        headers=headers,
+        json={"code": "300476", "name": "胜宏科技"},
+    )
+    position = client.post(
+        "/api/positions",
+        headers=headers,
+        json={"code": "300476", "name": "胜宏科技"},
+    )
+    watchlist_update = client.put(
+        "/api/watchlist/300476",
+        headers=headers,
+        json={"code": "300476", "name": "胜宏科技"},
+    )
+    watchlist_delete = client.delete("/api/watchlist/300476", headers=headers)
+    position_delete = client.delete("/api/positions/300476", headers=headers)
+    migration = client.post("/api/watchlist/import-legacy", headers=headers, json={"items": []})
+
+    assert watchlist.status_code == 503
+    assert position.status_code == 409
+    assert position.json()["current_revision"] == 7
+    assert watchlist_update.status_code == 503
+    assert watchlist_delete.status_code == 503
+    assert position_delete.status_code == 503
+    assert migration.status_code == 503
 
 
 def test_opening_decision_endpoint_returns_checkpoint_and_reasons(monkeypatch) -> None:

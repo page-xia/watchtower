@@ -7,12 +7,12 @@ import json
 from pathlib import Path
 import re
 import threading
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -34,6 +34,7 @@ from app.services import DashboardService
 from app.stream_delta import TerminalDeltaTracker
 from app.stream_hub import RESYNC, ChannelLimitExceeded, ChannelSpec, StreamHub, Subscription
 from app.trajectory_store import IntradayCollector
+from app.user_state import PrincipalState, RevisionConflict, UserStateUnavailable
 from app.webhook_push import WebhookSubscription
 
 
@@ -358,6 +359,16 @@ def require_principal(principal: Principal | None = Depends(read_principal)) -> 
     return principal
 
 
+def expected_revision(
+    x_expected_revision: int | None = Header(default=None, alias="X-Expected-Revision"),
+) -> int | None:
+    """Read the optional optimistic-concurrency version from a request header."""
+
+    if x_expected_revision is not None and x_expected_revision < 0:
+        raise HTTPException(status_code=422, detail="X-Expected-Revision must be non-negative")
+    return x_expected_revision
+
+
 def _principal_kwargs(principal: Principal | None) -> dict[str, Principal]:
     """Avoid imposing a ``principal=None`` keyword on legacy test doubles."""
 
@@ -381,6 +392,33 @@ def _personal_state_envelope(principal: Principal | None, item_type: str) -> dic
         "revision": state.revision,
         "personalization_status": state.personalization_status,
     }
+
+
+def _personal_mutation_result(
+    principal: Principal,
+    item_type: str,
+    mutate,
+    *,
+    extra: dict | None = None,
+) -> Any:
+    """Map repository failures and return the post-write canonical state."""
+
+    try:
+        mutate()
+    except RevisionConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "revision_conflict", "current_revision": exc.current_revision},
+        )
+    except UserStateUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "personalization_unavailable", "personalization_status": "unavailable"},
+        )
+    payload = _personal_state_envelope(principal, item_type)
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 @app.get("/")
@@ -729,8 +767,16 @@ def list_watchlist(principal: Principal | None = Depends(read_principal)) -> dic
 
 
 @app.post("/api/watchlist")
-def create_watchlist_item(item: WatchlistItem, principal: Principal = Depends(require_principal)) -> dict:
-    return service.upsert_watchlist(principal, item).model_dump(mode="json")
+def create_watchlist_item(
+    item: WatchlistItem,
+    principal: Principal = Depends(require_principal),
+    revision: int | None = Depends(expected_revision),
+) -> Any:
+    return _personal_mutation_result(
+        principal,
+        "watchlist",
+        lambda: service.upsert_watchlist(principal, item, expected_revision=revision),
+    )
 
 
 @app.put("/api/watchlist/{code}")
@@ -738,18 +784,35 @@ def update_watchlist_item(
     code: str,
     item: WatchlistItem,
     principal: Principal = Depends(require_principal),
-) -> dict:
+    revision: int | None = Depends(expected_revision),
+) -> Any:
     if code != item.code:
         raise HTTPException(status_code=400, detail="路径代码和请求体代码不一致")
-    return service.upsert_watchlist(principal, item).model_dump(mode="json")
+    return _personal_mutation_result(
+        principal,
+        "watchlist",
+        lambda: service.upsert_watchlist(principal, item, expected_revision=revision),
+    )
 
 
 @app.delete("/api/watchlist/{code}")
-def delete_watchlist_item(code: str, principal: Principal = Depends(require_principal)) -> dict:
-    deleted = service.delete_watchlist(principal, code)
-    if not deleted:
+def delete_watchlist_item(
+    code: str,
+    principal: Principal = Depends(require_principal),
+    revision: int | None = Depends(expected_revision),
+) -> Any:
+    deleted: list[bool] = []
+
+    def mutate() -> None:
+        deleted.append(service.delete_watchlist(principal, code, expected_revision=revision))
+
+    result = _personal_mutation_result(principal, "watchlist", mutate)
+    if isinstance(result, JSONResponse):
+        return result
+    if not deleted[0]:
         raise HTTPException(status_code=404, detail="自选股不存在")
-    return {"deleted": True, "code": code}
+    result.update({"deleted": True, "code": code})
+    return result
 
 
 class LegacyWatchlistImportRequest(BaseModel):
@@ -762,15 +825,18 @@ class LegacyWatchlistImportRequest(BaseModel):
 def import_legacy_watchlist(
     payload: LegacyWatchlistImportRequest,
     principal: Principal = Depends(require_principal),
-) -> dict:
-    result = service.import_legacy_watchlist_once(principal, payload.items)
-    return {
-        "imported": result.applied,
-        "reason": result.reason,
-        "items": [item.model_dump(mode="json") for item in result.items],
-        "revision": result.revision,
-        "personalization_status": "ready",
-    }
+) -> Any:
+    result_box = []
+
+    def mutate() -> None:
+        result_box.append(service.import_legacy_watchlist_once(principal, payload.items))
+
+    result = _personal_mutation_result(principal, "watchlist", mutate)
+    if isinstance(result, JSONResponse):
+        return result
+    migration = result_box[0]
+    result["migration"] = {"applied": migration.applied, "reason": migration.reason}
+    return result
 
 
 # ---------------------------------------------------------------- 飞书推送订阅
@@ -815,8 +881,16 @@ def list_positions(principal: Principal | None = Depends(read_principal)) -> dic
 
 
 @app.post("/api/positions")
-def create_position(item: PositionRecord, principal: Principal = Depends(require_principal)) -> dict:
-    return service.upsert_position(principal, item).model_dump(mode="json")
+def create_position(
+    item: PositionRecord,
+    principal: Principal = Depends(require_principal),
+    revision: int | None = Depends(expected_revision),
+) -> Any:
+    return _personal_mutation_result(
+        principal,
+        "positions",
+        lambda: service.upsert_position(principal, item, expected_revision=revision),
+    )
 
 
 @app.put("/api/positions/{code}")
@@ -824,17 +898,35 @@ def update_position(
     code: str,
     item: PositionRecord,
     principal: Principal = Depends(require_principal),
-) -> dict:
+    revision: int | None = Depends(expected_revision),
+) -> Any:
     if code != item.code:
         raise HTTPException(status_code=400, detail="路径代码和请求体代码不一致")
-    return service.upsert_position(principal, item).model_dump(mode="json")
+    return _personal_mutation_result(
+        principal,
+        "positions",
+        lambda: service.upsert_position(principal, item, expected_revision=revision),
+    )
 
 
 @app.delete("/api/positions/{code}")
-def delete_position(code: str, principal: Principal = Depends(require_principal)) -> dict:
-    if not service.delete_position(principal, code):
+def delete_position(
+    code: str,
+    principal: Principal = Depends(require_principal),
+    revision: int | None = Depends(expected_revision),
+) -> Any:
+    deleted: list[bool] = []
+
+    def mutate() -> None:
+        deleted.append(service.delete_position(principal, code, expected_revision=revision))
+
+    result = _personal_mutation_result(principal, "positions", mutate)
+    if isinstance(result, JSONResponse):
+        return result
+    if not deleted[0]:
         raise HTTPException(status_code=404, detail="持仓不存在")
-    return {"deleted": True, "code": code}
+    result.update({"deleted": True, "code": code})
+    return result
 
 
 @app.get("/api/watchlist/{code}/analysis")
