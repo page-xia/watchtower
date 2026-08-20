@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
@@ -10,6 +12,7 @@ import pytest
 from app.models import PositionRecord, WatchlistItem
 from app.principal import Principal
 from app.user_state import LegacyImportResult, RevisionConflict, UserStateUnavailable
+from app import user_state_json as user_state_json_module
 from app.user_state_json import JsonPrincipalStateRepository
 
 
@@ -187,6 +190,57 @@ def test_state_file_permission_error_is_unavailable(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(Path, "read_text", denied_read)
     with pytest.raises(UserStateUnavailable):
         repo.get_state(principal)
+
+
+def test_state_write_permission_error_is_unavailable(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "principal_state.json"
+    repo = JsonPrincipalStateRepository(path)
+    principal = _principal("alice")
+    original_open = user_state_json_module.os.open
+
+    def denied_temp_open(file, *args, **kwargs):
+        if str(file).startswith(str(path) + ".") and str(file).endswith(".tmp"):
+            raise PermissionError("denied")
+        return original_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(user_state_json_module.os, "open", denied_temp_open)
+    with pytest.raises(UserStateUnavailable):
+        repo.upsert_watchlist(principal, WatchlistItem(code="300476", name="胜宏科技"))
+
+
+def test_state_lock_open_error_is_unavailable(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "principal_state.json"
+    repo = JsonPrincipalStateRepository(path)
+    principal = _principal("alice")
+    original_open = Path.open
+
+    def denied_lock_open(self, *args, **kwargs):
+        if self == repo.lock_path:
+            raise PermissionError("denied")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", denied_lock_open)
+    with pytest.raises(UserStateUnavailable):
+        repo.get_state(principal)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not portable on Windows")
+def test_atomic_temp_and_replaced_state_are_private(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "principal_state.json"
+    repo = JsonPrincipalStateRepository(path)
+    principal = _principal("alice")
+    observed_modes: list[int] = []
+    original_replace = Path.replace
+
+    def spy_replace(self, target):
+        observed_modes.append(stat.S_IMODE(self.stat().st_mode))
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", spy_replace)
+    repo.upsert_watchlist(principal, WatchlistItem(code="300476", name="胜宏科技"))
+
+    assert observed_modes == [0o600]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_json_writes_are_atomic_and_concurrent_mutations_keep_valid_state(tmp_path, monkeypatch) -> None:

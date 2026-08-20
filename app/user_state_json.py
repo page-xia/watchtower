@@ -38,7 +38,10 @@ class JsonPrincipalStateRepository:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise UserStateUnavailable(f"cannot initialize state directory: {self.path.parent}") from error
         self.lock_path = self.path.with_name(self.path.name + ".lock")
         # Keep a stable, exactly-one-byte lock file.  Opening it in append mode
         # for each operation would grow it and replacing it would invalidate an
@@ -55,7 +58,9 @@ class JsonPrincipalStateRepository:
 
     @classmethod
     def _lock_for_path(cls, path: Path) -> RLock:
-        key = str(path.resolve())
+        # Windows paths are case-insensitive; normalize aliases so two
+        # repository instances cannot accidentally use different thread locks.
+        key = os.path.normcase(str(path.resolve()))
         with cls._thread_locks_guard:
             lock = cls._thread_locks.get(key)
             if lock is None:
@@ -72,7 +77,8 @@ class JsonPrincipalStateRepository:
                 handle = self.lock_path.open("r+b")
             except OSError as error:
                 raise UserStateUnavailable(f"cannot open state lock: {self.lock_path}") from error
-            with handle:
+            acquired = False
+            try:
                 if os.name == "nt":
                     import msvcrt
 
@@ -84,6 +90,7 @@ class JsonPrincipalStateRepository:
                             # relying on LK_LOCK's implementation-defined
                             # retry interval on Windows.
                             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                            acquired = True
                             break
                         except OSError as error:
                             if time.monotonic() >= deadline:
@@ -91,19 +98,43 @@ class JsonPrincipalStateRepository:
                                     f"timed out acquiring state lock: {self.lock_path}"
                                 ) from error
                             time.sleep(0.01)
-                    try:
-                        yield
-                    finally:
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     import fcntl
 
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                     try:
-                        yield
-                    finally:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                        acquired = True
+                    except OSError as error:
+                        raise UserStateUnavailable(
+                            f"cannot acquire state lock: {self.lock_path}"
+                        ) from error
+                yield
+            except UserStateUnavailable:
+                raise
+            except OSError as error:
+                raise UserStateUnavailable(f"state lock I/O failed: {self.lock_path}") from error
+            finally:
+                if acquired:
+                    try:
+                        handle.seek(0)
+                        if os.name == "nt":
+                            import msvcrt
+
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except OSError as error:
+                        raise UserStateUnavailable(
+                            f"cannot release state lock: {self.lock_path}"
+                        ) from error
+                try:
+                    handle.close()
+                except OSError as error:
+                    raise UserStateUnavailable(
+                        f"cannot close state lock: {self.lock_path}"
+                    ) from error
 
     def get_state(self, principal: Principal) -> PrincipalState:
         with self._process_lock():
@@ -283,11 +314,23 @@ class JsonPrincipalStateRepository:
         # cannot overwrite another writer's source file.  The stable lock file
         # still serializes the destination replacement.
         temporary = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        descriptor: int | None = None
         try:
-            with temporary.open("w", encoding="utf-8") as handle:
-                json.dump(document, handle, ensure_ascii=False, indent=2, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                    0o600,
+                )
+                if hasattr(os, "fchmod"):
+                    os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    descriptor = None
+                    json.dump(document, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as error:
+                raise UserStateUnavailable(f"cannot write temporary state file: {temporary}") from error
             deadline = time.monotonic() + 30.0
             while True:
                 try:
@@ -302,7 +345,14 @@ class JsonPrincipalStateRepository:
                     # other process releases the lock; retry while preserving
                     # the atomic replace contract.
                     time.sleep(0.01)
+                except OSError as error:
+                    raise UserStateUnavailable(f"cannot replace state file: {self.path}") from error
         finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             if temporary.exists():
                 try:
                     temporary.unlink()
