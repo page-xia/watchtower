@@ -186,10 +186,16 @@ WATCH_BACKGROUND_COLLECTOR=1
 WATCH_PERSISTENCE_BACKEND=local
 WATCH_MESSAGE_STORE_BACKEND=mysql      # RDS watchtower_msg 库，WATCH_MSG_MYSQL_* 连接配置
 WATCH_EOD_STORE_BACKEND=mysql          # RDS watchtower_eod 库，WATCH_EOD_MYSQL_* 连接配置
+WATCH_USER_STORE_BACKEND=mysql         # RDS watchtower_user 库，按 X-Client-ID 隔离自选/持仓
+WATCH_USER_MYSQL_HOST=<rds-endpoint>
+WATCH_USER_MYSQL_PORT=3306
+WATCH_USER_MYSQL_USER=<least-privilege-user>
+WATCH_USER_MYSQL_PWD=<secret>
+WATCH_USER_MYSQL_DB=watchtower_user
 WATCH_DARK_POOL=1
 ```
 
-RDS 连接信息放在服务器 `/root/watchtower/watchtower.env`（环境变量文件，不进镜像、不进仓库）；RDS 白名单只放行服务器 47.116.20.229 和本机出口 IP（本机宽带 IP 变了要去 RDS 控制台改白名单）。EOD 数据由本机收盘后跑 `scripts/ingest_eod_tushare.py` 直接落 RDS（`--days N` 回填，`--only` 选数据集）。网页自选股同时保存在用户浏览器 `localStorage`，不同用户看到的自选互不影响。暗盘资金面板只读 EOD 库与东财快照缓存（后台一次性线程补齐），不进入 5 秒全市场刷新链路，也不再轮询磁带。
+RDS 连接信息放在服务器 `/root/watchtower/watchtower.env`（环境变量文件，不进镜像、不进仓库）；RDS 白名单只放行服务器 47.116.20.229 和本机出口 IP（本机宽带 IP 变了要去 RDS 控制台改白名单）。首次部署后先在已加载 `watchtower.env` 的环境中运行 `python scripts/init_user_store.py`，创建 `principal_states`、`principal_watchlist_items`、`principal_positions`、`principal_migrations` 四张表；该命令不会读取旧的全局 `data/watchlist.json` / `data/positions.json`。EOD 数据由本机收盘后跑 `scripts/ingest_eod_tushare.py` 直接落 RDS（`--days N` 回填，`--only` 选数据集）。网页通过 `watchtower.client-id.v1` 生成匿名主体，服务端按 `X-Client-ID` 在用户存储中隔离自选和持仓；MySQL 故障时显示个人数据不可用，绝不回退到旧全局文件或其他主体。暗盘资金面板只读 EOD 库与东财快照缓存（后台一次性线程补齐），不进入 5 秒全市场刷新链路，也不再轮询磁带。
 
 星球消息证据读取走物化缓存：详情页按 `(scope=stock/sector, cache_key=代码/板块词)` 直接读 `message_evidence_cache`（1~2 次索引查询，亚秒）；未命中的键走动态查询兜底并回写（read-through，空结果也缓存）；每次消息同步后后台自动重建受影响实体的物化值（含板块查询词与链接名的子串别名桥接）。全新部署或物化表被清空后，下一次同步会自动触发一次全量预建，也可手动触发 `POST /api/messages/evidence/prebuild`（需 ingest token）；`scripts/materialize_message_evidence.py` 可从本地一次性全量重建（语义与服务端一致）。
 

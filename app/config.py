@@ -18,6 +18,7 @@ INTRADAY_WATCHTOWER_DB_FILE = DATA_DIR / "runtime" / "intraday_watchtower.sqlite
 AUCTION_HISTORY_FILE = DATA_DIR / "runtime" / "auction_snapshots.jsonl"
 OPENING_DECISION_FILE = DATA_DIR / "runtime" / "opening_decisions.jsonl"
 WEBHOOK_SUBSCRIPTIONS_FILE = DATA_DIR / "webhook_subscriptions.json"
+USER_STATE_FILE = DATA_DIR / "runtime" / "principal_state.json"
 
 
 def load_yaml(path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -51,6 +52,20 @@ class AppSettings:
         self.message_store_backend = (
             os.getenv("WATCH_MESSAGE_STORE_BACKEND", "cloudbase_mysql").strip().lower() or "cloudbase_mysql"
         )
+        # Principal-scoped personal state.  Local development uses the atomic
+        # JSON backend; production sets WATCH_USER_STORE_BACKEND=mysql and
+        # points at the dedicated watchtower_user RDS database.
+        self.user_store_backend = os.getenv("WATCH_USER_STORE_BACKEND", "json").strip().lower() or "json"
+        self.user_store_file = Path(os.getenv("WATCH_USER_STORE_FILE", str(USER_STATE_FILE)))
+        self.user_mysql_host = os.getenv("WATCH_USER_MYSQL_HOST", "").strip()
+        self.user_mysql_port = int(os.getenv("WATCH_USER_MYSQL_PORT", "3306"))
+        self.user_mysql_user = os.getenv("WATCH_USER_MYSQL_USER", "").strip()
+        self.user_mysql_pwd = os.getenv("WATCH_USER_MYSQL_PWD", "")
+        self.user_mysql_db = os.getenv("WATCH_USER_MYSQL_DB", "watchtower_user").strip() or "watchtower_user"
+        self.user_mysql_connect_timeout = max(
+            0.1, float(os.getenv("WATCH_USER_MYSQL_CONNECT_TIMEOUT", "5"))
+        )
+        self.user_mysql_pool_size = max(1, int(os.getenv("WATCH_USER_MYSQL_POOL_SIZE", "4")))
         self.cloudbase_mysql_instance = os.getenv("WATCH_CLOUDBASE_MYSQL_INSTANCE", "default").strip() or "default"
         self.cloudbase_mysql_schema = (
             os.getenv("WATCH_CLOUDBASE_MYSQL_SCHEMA", self.cloudbase_env_id).strip() or self.cloudbase_env_id
@@ -223,6 +238,18 @@ class AppSettings:
         }
 
     @property
+    def user_mysql_config(self) -> dict[str, Any]:
+        """Principal-state RDS connection settings (password stays private)."""
+
+        return {
+            "host": self.user_mysql_host,
+            "port": self.user_mysql_port,
+            "user": self.user_mysql_user,
+            "pwd": self.user_mysql_pwd,
+            "db": self.user_mysql_db,
+        }
+
+    @property
     def public_source_status(self) -> dict[str, Any]:
         secrets = self.secret_config
         analysis_provider = self._analysis_provider(secrets)
@@ -278,6 +305,12 @@ class AppSettings:
             "background_collector_enabled": self.background_collector_enabled,
             "persistence_backend": self.persistence_backend,
             "message_store_backend": self.message_store_backend,
+            "user_store_backend": self.user_store_backend,
+            "user_store_db": self.user_mysql_db,
+            "user_store_configured": (
+                self.user_store_backend == "json"
+                or bool(self.user_mysql_host and self.user_mysql_user and self.user_mysql_db)
+            ),
             "message_store_configured": (
                 bool(self.msg_mysql_host and self.msg_mysql_user and self.msg_mysql_db)
                 if self.message_store_backend == "mysql"
