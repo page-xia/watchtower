@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import AppSettings
+from app.data_update_buffer import DataUpdateBuffer
 from app.data_sources import BoardContext, MarketSnapshot, china_now
 from app.models import (
     EventItem,
@@ -44,6 +45,8 @@ from app.models import (
 from app.services import DashboardContext, DashboardService
 from app.storage import AnalysisStore
 from app.trajectory_store import IntradayWatchtowerStore
+from app.principal import Principal
+from app.user_state import PrincipalMutation, PrincipalState, UserStateUnavailable
 
 
 class MemoryWatchlistStore:
@@ -183,6 +186,55 @@ class FailingMessageStore(MemoryMessageStore):
         raise RuntimeError("mysql connection refused")
 
 
+class MemoryPrincipalStateStore:
+    """Small principal repository used by service isolation tests."""
+
+    def __init__(self, states=None):
+        self.states = dict(states or {})
+
+    def get_state(self, principal):
+        return self.states.get(
+            principal.storage_key,
+            PrincipalState(revision=0, watchlist=[], positions=[]),
+        )
+
+    def list_watchlist(self, principal):
+        return self.get_state(principal).watchlist
+
+    def list_positions(self, principal):
+        return self.get_state(principal).positions
+
+    def upsert_watchlist(self, principal, item, *, expected_revision=None):
+        state = self.get_state(principal)
+        if expected_revision is not None and expected_revision != state.revision:
+            raise AssertionError("unexpected revision")
+        rows = [row for row in state.watchlist if row.code != item.code] + [item]
+        next_state = PrincipalState(state.revision + 1, rows, state.positions)
+        self.states[principal.storage_key] = next_state
+        return PrincipalMutation(next_state.revision, item)
+
+    def delete_watchlist(self, principal, code, *, expected_revision=None):
+        state = self.get_state(principal)
+        rows = [row for row in state.watchlist if row.code != str(code).zfill(6)]
+        next_state = PrincipalState(state.revision + 1, rows, state.positions)
+        self.states[principal.storage_key] = next_state
+        return PrincipalMutation(next_state.revision)
+
+    def upsert_position(self, principal, item, *, expected_revision=None):
+        state = self.get_state(principal)
+        rows = [row for row in state.positions if row.code != item.code] + [item]
+        next_state = PrincipalState(state.revision + 1, state.watchlist, rows)
+        self.states[principal.storage_key] = next_state
+        return PrincipalMutation(next_state.revision, item)
+
+    def delete_position(self, principal, code, *, expected_revision=None):
+        state = self.get_state(principal)
+        rows = [row for row in state.positions if row.code != str(code).zfill(6)]
+        next_state = PrincipalState(state.revision + 1, state.watchlist, rows)
+        self.states[principal.storage_key] = next_state
+        return PrincipalMutation(next_state.revision)
+
+
 class FakeAIClient:
     available = True
 
@@ -215,7 +267,7 @@ class FakeAIClient:
         }
 
 
-def make_service(tmp_path, max_signals_per_group=10):
+def make_service(tmp_path, max_signals_per_group=10, data_update_buffer=None):
     settings = AppSettings()
     settings.max_signals_per_group = max_signals_per_group
     return DashboardService(
@@ -226,7 +278,95 @@ def make_service(tmp_path, max_signals_per_group=10):
         ai_client=FakeAIClient(),
         message_store=MemoryMessageStore(),
         trajectory_store=IntradayWatchtowerStore(tmp_path / "intraday.sqlite"),
+        data_update_buffer=data_update_buffer,
     )
+
+
+def make_principal_service(tmp_path):
+    settings = AppSettings()
+    settings.max_signals_per_group = 10
+    store = MemoryPrincipalStateStore()
+    service = DashboardService(
+        settings,
+        user_state_store=store,
+        theme_store=MemoryThemeStore(),
+        analysis_store=AnalysisStore(tmp_path),
+        ai_client=FakeAIClient(),
+        message_store=MemoryMessageStore(),
+        trajectory_store=IntradayWatchtowerStore(tmp_path / "intraday-principal.sqlite"),
+    )
+    context = DashboardContext(
+        watchlist=[],
+        themes=[],
+        snapshot=MarketSnapshot(
+            quotes=[quote("300476", "胜宏科技", ["PCB"]), quote("300308", "中际旭创", ["CPO"])],
+            indices=[],
+            data_mode="closed_static",
+            source_status={"active_source": "fixture", "trade_date": "20260807", "frozen": True},
+        ),
+        market=market().model_copy(update={"frozen": True}),
+        sectors=[sector("PCB", "300476"), sector("CPO", "300308")],
+        sector_flow=[],
+        signals_all=[],
+        core_watch=[],
+        events=[],
+        source_status={"active_source": "fixture", "trade_date": "20260807", "frozen": True},
+    )
+    service._context_cache = context
+    service._context_cache_at = time.time()
+    service._context_cache_bucket = service._context_bucket()
+    service._get_context = lambda: context
+    service.data_source.fetch_board_context = lambda level: BoardContext(
+        board_level=int(level),
+        source="fixture",
+        available=False,
+        fetched_at="",
+        sectors=[],
+        name_to_code={},
+        code_to_name={},
+        members_by_code={},
+    )
+    return service
+
+
+def test_two_principals_share_market_base_but_receive_private_overlay(tmp_path) -> None:
+    service = make_principal_service(tmp_path)
+    alice = Principal("anonymous_client", "alice-0001")
+    bob = Principal("anonymous_client", "bob-0001")
+    service.upsert_watchlist(alice, WatchlistItem(code="300476", name="胜宏科技"))
+
+    alice_payload = service.terminal(principal=alice, page_size=20)
+    bob_payload = service.terminal(principal=bob, page_size=20)
+
+    assert alice_payload.watchlist_codes == ["300476"]
+    assert bob_payload.watchlist_codes == []
+    assert alice_payload.personalization_revision == 1
+    assert bob_payload.personalization_revision == 0
+
+
+def test_public_activity_score_does_not_change_when_a_user_adds_watchlist(tmp_path) -> None:
+    service = make_principal_service(tmp_path)
+    public = service.public_terminal(page_size=20)
+    service.upsert_watchlist(
+        Principal("anonymous_client", "alice-0001"),
+        WatchlistItem(code="300476", name="胜宏科技"),
+    )
+    after = service.public_terminal(page_size=20)
+    assert [(item.code, item.activity_score) for item in public.stock_board.items] == [
+        (item.code, item.activity_score) for item in after.stock_board.items
+    ]
+
+
+def test_watchlist_mutation_publishes_terminal_update(tmp_path) -> None:
+    update_buffer = DataUpdateBuffer()
+    service = make_service(tmp_path, data_update_buffer=update_buffer)
+
+    service.upsert_watchlist(WatchlistItem(code="600519", name="贵州茅台"))
+
+    commit = update_buffer.snapshot()
+    assert commit.reason == "watchlist_upsert"
+    assert commit.changed_sections == frozenset({"watchlist", "terminal", "detail"})
+    assert commit.sections["terminal"]["code"] == "600519"
 
 
 def test_trajectory_cleanup_once_per_day_is_throttled(tmp_path, monkeypatch) -> None:

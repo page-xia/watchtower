@@ -1191,6 +1191,8 @@ class TerminalPayload(BaseModel):
     board_level: int = 3
     board_source: str = ""
     watchlist_codes: list[str] = Field(default_factory=list)
+    personalization_status: str = "missing_identity"
+    personalization_revision: int = 0
 
 
 class DashboardPayload(BaseModel):
@@ -1206,4 +1208,6 @@ class DashboardPayload(BaseModel):
     selected_sector: str | None = None
     sector_focus: SectorSnapshot | None = None
     watchlist_codes: list[str] = Field(default_factory=list)
+    personalization_status: str = "missing_identity"
+    personalization_revision: int = 0
 
