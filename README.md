@@ -211,6 +211,17 @@ RDS 连接信息放在服务器 `/root/watchtower/watchtower.env`（环境变量
 
 紧急回滚规则：若用户存储异常，保持个人化为 `unavailable` 并暂停个人写入/修复 RDS；不得通过重新启用全局 `watchlist.json` 或 `positions.json` 来“回滚”，否则会重新引入跨用户数据泄漏。
 
+### 多用户隔离与性能验收
+
+`tests/test_principal_isolation_integration.py` 使用真实的本地 JSON 主体仓库和随机匿名主体，覆盖 A/B 自选隔离、删除后取消置顶、同一行情事实一致、并发旧 revision 仅一个写入成功，以及旧浏览器自选只导入一次且服务端既有数据优先。它还在同一市场参数下连续请求 50 个主体：公共上下文和上游快照在一个缓存窗口内各只能构建一次，而每一次个人状态读取都必须使用该主体自己的存储键。
+
+性能验收目标是：公共行情/上下文每缓存窗口一次；个人叠层 p95 小于 50 ms；终端热路径和个人状态查询保持短时响应（生产观测目标分别小于 50 ms、20 ms）；自选写入在下一次 WebSocket 推送内可见。集成测试对容易受 CI 调度影响的完整终端 p95 使用 500 ms 的防回归上限；部署前可用下面命令记录本机/生产真实指标：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_principal_isolation_integration.py -q
+.\.venv\Scripts\python.exe scripts/probe_user_isolation.py --base-url https://omnisource.xin
+```
+
 星球消息证据读取走物化缓存：详情页按 `(scope=stock/sector, cache_key=代码/板块词)` 直接读 `message_evidence_cache`（1~2 次索引查询，亚秒）；未命中的键走动态查询兜底并回写（read-through，空结果也缓存）；每次消息同步后后台自动重建受影响实体的物化值（含板块查询词与链接名的子串别名桥接）。全新部署或物化表被清空后，下一次同步会自动触发一次全量预建，也可手动触发 `POST /api/messages/evidence/prebuild`（需 ingest token）；`scripts/materialize_message_evidence.py` 可从本地一次性全量重建（语义与服务端一致）。
 
 ### 知识星球消息同步
