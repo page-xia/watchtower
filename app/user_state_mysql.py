@@ -83,9 +83,11 @@ MYSQL_SCHEMA_STATEMENTS: list[str] = [
 # ``CREATE TABLE IF NOT EXISTS`` does not add columns to a table created by an
 # earlier image.  Keep this tiny forward migration in bootstrap so upgrading
 # an installation made before ``WatchlistItem.position`` was persisted is
-# safe and idempotent on MySQL 8/RDS.
+# safe.  Do not use ``ADD COLUMN IF NOT EXISTS``: the production RDS engine
+# currently rejects that syntax, so ``ensure_schema`` checks
+# ``information_schema`` before executing this portable statement.
 MYSQL_SCHEMA_MIGRATION_STATEMENTS: list[str] = [
-    "ALTER TABLE principal_watchlist_items ADD COLUMN IF NOT EXISTS position TINYINT(1) NOT NULL DEFAULT 1 AFTER core",
+    "ALTER TABLE principal_watchlist_items ADD COLUMN position TINYINT(1) NOT NULL DEFAULT 1 AFTER core",
 ]
 
 
@@ -209,8 +211,21 @@ class MySqlPrincipalStateRepository:
             with connection.cursor() as cursor:
                 for statement in MYSQL_SCHEMA_STATEMENTS:
                     cursor.execute(statement)
-                for statement in MYSQL_SCHEMA_MIGRATION_STATEMENTS:
-                    cursor.execute(statement)
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS column_count
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = %s
+                      AND COLUMN_NAME = %s
+                    """,
+                    ("principal_watchlist_items", "position"),
+                )
+                row = cursor.fetchone()
+                column_count = int((row or {}).get("column_count", 0))
+                if column_count == 0:
+                    for statement in MYSQL_SCHEMA_MIGRATION_STATEMENTS:
+                        cursor.execute(statement)
             connection.commit()
         except UserStateUnavailable:
             self._rollback(connection)

@@ -264,7 +264,20 @@ def test_schema_contains_all_principal_tables_and_scoped_keys() -> None:
     for table in ("principal_states", "principal_watchlist_items", "principal_positions", "principal_migrations"):
         assert f"CREATE TABLE IF NOT EXISTS {table}" in joined
     assert "PRIMARY KEY (principal_type, principal_id, code)" in joined
-    assert any("ADD COLUMN IF NOT EXISTS position" in statement for statement in MYSQL_SCHEMA_MIGRATION_STATEMENTS)
+    assert any("ADD COLUMN position" in statement for statement in MYSQL_SCHEMA_MIGRATION_STATEMENTS)
+    assert all("ADD COLUMN IF NOT EXISTS" not in statement for statement in MYSQL_SCHEMA_MIGRATION_STATEMENTS)
+
+
+def test_schema_bootstrap_checks_information_schema_before_portable_alter() -> None:
+    connection = FakeConnection()
+    repo = MySqlPrincipalStateRepository(connection_factory=lambda: connection)
+
+    repo.ensure_schema()
+
+    assert connection.last_cursor is not None
+    statements = [" ".join(sql.split()) for sql, _ in connection.last_cursor.execute_calls]
+    assert any("FROM information_schema.COLUMNS" in sql for sql in statements)
+    assert any("ALTER TABLE principal_watchlist_items ADD COLUMN position" in sql for sql in statements)
 
 
 def test_from_settings_uses_mysql_configuration() -> None:
