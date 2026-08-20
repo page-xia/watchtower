@@ -11,12 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WATCH_AUCTION_HISTORY_FILE=/tmp/watchtower/runtime/auction_snapshots.jsonl \
     WATCH_OPENING_DECISION_FILE=/tmp/watchtower/runtime/opening_decisions.jsonl \
     WATCH_BACKGROUND_COLLECTOR=1 \
-    WATCH_PERSISTENCE_BACKEND=cloudbase_nosql \
-    WATCH_CLOUDBASE_ENV_ID=server-d2g7x597t019f5cb0 \
-    WATCH_CLOUDBASE_STATE_COLLECTION=watchtower_state \
-    WATCH_MESSAGE_STORE_BACKEND=cloudbase_mysql \
-    WATCH_CLOUDBASE_MYSQL_INSTANCE=default \
-    WATCH_CLOUDBASE_MYSQL_SCHEMA=server-d2g7x597t019f5cb0 \
+    WATCH_PERSISTENCE_BACKEND=local \
     WATCH_DARK_POOL=1
 
 WORKDIR /app

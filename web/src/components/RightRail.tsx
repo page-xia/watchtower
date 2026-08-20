@@ -18,7 +18,7 @@ interface RightRailProps {
 function RailTable({ rows, emptyText, columns }: { rows: React.ReactNode[]; emptyText: string; columns?: typeof RAIL_COLUMNS }) {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto overflow-x-auto">
-      <table className="w-full min-w-[560px] border-collapse">
+      <table className="w-full min-w-[620px] border-collapse">
         <thead className="sticky top-0 z-10 bg-card">
           <tr className="border-b border-border text-left text-[10px] text-muted-foreground">
             {(columns ?? RAIL_COLUMNS).map((c, i) => (

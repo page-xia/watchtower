@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from app.data_sources import china_now, is_trading_window, market_session, normalize_board_level
 from app.config import ROOT_DIR, settings
 from app.market_schedule import market_refresh_policy
+from app.live_delta import PayloadDeltaTracker
 from app.message_store import MessageStoreError
 from app.models import (
     PositionRecord,
@@ -30,7 +31,7 @@ from app.models import (
 )
 from app.services import DashboardService
 from app.stream_delta import TerminalDeltaTracker
-from app.stream_hub import RESYNC, ChannelLimitExceeded, ChannelSpec, StreamHub
+from app.stream_hub import RESYNC, ChannelLimitExceeded, ChannelSpec, StreamHub, Subscription
 from app.trajectory_store import IntradayCollector
 from app.webhook_push import WebhookSubscription
 
@@ -492,8 +493,9 @@ def sectors_rank(board_level: int = 3, watchlist_codes: str | None = None) -> li
 def dark_pool(sector: str | None = None, board_level: int = 3) -> dict:
     """暗盘资金面板：暗吸/暗派（多日背离）+ 大手场外 + 东财盘中资金地图。
 
-    只读内存缓存与本地 SQLite，绝不在请求路径上发行情网络请求，
-    保证不拖慢首页 5 秒刷新链路。sector/board_level 用于首页板块联动过滤。
+    只读内存缓存与 EOD 存储（本地 MySQL / 生产 NoSQL 快照，见 app/eod_store.py），
+    绝不在请求路径上发行情网络请求，保证不拖慢首页 5 秒刷新链路。
+    sector/board_level 用于首页板块联动过滤。
     """
     return service.dark_pool_payload(sector=sector, board_level=board_level)
 
@@ -800,6 +802,141 @@ async def stream(websocket: WebSocket) -> None:
     await _stream_legacy(websocket, params)
 
 
+@app.websocket("/ws/live")
+async def live_stream(websocket: WebSocket) -> None:
+    """Persistent multiplexed live socket.
+
+    View interactions never reconnect this socket.  The client sends
+    ``subscribe``/``unsubscribe`` control messages; the server swaps StreamHub
+    subscriptions and always sends a fresh channel snapshot first.  Market phase
+    changes are announced on the same connection instead of closing it.
+    """
+    await websocket.accept()
+    outgoing: asyncio.Queue[str] = asyncio.Queue()
+    subscriptions: dict[str, tuple[Subscription, asyncio.Task, dict]] = {}
+
+    async def send_loop() -> None:
+        while True:
+            text = await outgoing.get()
+            await websocket.send_text(text)
+
+    async def phase_loop() -> None:
+        last_policy: dict | None = None
+        while True:
+            policy = _stream_refresh_policy()
+            if policy != last_policy:
+                last_policy = policy
+                await outgoing.put(
+                    json.dumps(
+                        {
+                            "type": "market_phase",
+                            "market_session": policy["market_session"],
+                            "traffic_mode": policy["traffic_mode"],
+                            "refresh_policy": policy,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+            await asyncio.sleep(1)
+
+    async def forward(channel: str, sub: Subscription) -> None:
+        while True:
+            item = await sub.queue.get()
+            text = sub.snapshot_text() if item is RESYNC else item
+            if text:
+                await outgoing.put(text)
+
+    async def cancel_task(task: asyncio.Task) -> None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def replace_subscription(channel: str, params: dict) -> None:
+        current = subscriptions.pop(channel, None)
+        if current is not None:
+            sub, task, _ = current
+            stream_hub.unsubscribe(sub)
+            await cancel_task(task)
+
+        key = _live_channel_key(channel, params)
+        try:
+            sub = stream_hub.subscribe(key, lambda: _live_channel_spec(channel, params))
+        except ChannelLimitExceeded as exc:
+            await outgoing.put(
+                json.dumps(
+                    {"type": "error", "channel": channel, "message": str(exc)},
+                    ensure_ascii=False,
+                )
+            )
+            return
+        snapshot = sub.snapshot_text()
+        if snapshot:
+            outgoing.put_nowait(snapshot)
+        task = asyncio.create_task(forward(channel, sub), name=f"live-{channel}")
+        subscriptions[channel] = (sub, task, params)
+
+    sender = asyncio.create_task(send_loop(), name="live-sender")
+    phase = asyncio.create_task(phase_loop(), name="live-phase")
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                message = json.loads(raw)
+                if not isinstance(message, dict):
+                    raise ValueError("message must be an object")
+            except (json.JSONDecodeError, ValueError) as exc:
+                await outgoing.put(
+                    json.dumps({"type": "error", "message": str(exc)}, ensure_ascii=False)
+                )
+                continue
+
+            kind = message.get("type")
+            channel = message.get("channel")
+            if kind == "subscribe":
+                if not isinstance(channel, str) or channel not in _LIVE_CHANNELS:
+                    await outgoing.put(
+                        json.dumps(
+                            {"type": "error", "message": "unsupported channel"},
+                            ensure_ascii=False,
+                        )
+                    )
+                    continue
+                params = message.get("params") or {}
+                if not isinstance(params, dict):
+                    await outgoing.put(
+                        json.dumps(
+                            {"type": "error", "channel": channel, "message": "params must be an object"},
+                            ensure_ascii=False,
+                        )
+                    )
+                    continue
+                await replace_subscription(channel, params)
+            elif kind == "unsubscribe":
+                if channel in subscriptions:
+                    current = subscriptions.pop(channel)
+                    stream_hub.unsubscribe(current[0])
+                    await cancel_task(current[1])
+            elif kind == "refresh":
+                if channel in subscriptions:
+                    await replace_subscription(channel, subscriptions[channel][2])
+            else:
+                await outgoing.put(
+                    json.dumps(
+                        {"type": "error", "message": "unsupported message type"},
+                        ensure_ascii=False,
+                    )
+                )
+    except (WebSocketDisconnect, RuntimeError, asyncio.CancelledError):
+        pass
+    finally:
+        for _sub, task, _params in subscriptions.values():
+            stream_hub.unsubscribe(_sub)
+            task.cancel()
+        subscriptions.clear()
+        sender.cancel()
+        phase.cancel()
+
+
 class StreamParams(NamedTuple):
     sector: str | None
     view: str
@@ -904,9 +1041,8 @@ async def _stream_send_static_notice(websocket: WebSocket, params: StreamParams)
 
 async def _stream_send_once_and_close(websocket: WebSocket, params: StreamParams) -> None:
     if params.view == "terminal":
-        payload = (
-            await asyncio.to_thread(
-                service.terminal,
+        def build_terminal_payload() -> dict:
+            return service.terminal(
                 sector=params.sector,
                 board_level=params.board_level,
                 sort=params.sort,
@@ -916,15 +1052,34 @@ async def _stream_send_once_and_close(websocket: WebSocket, params: StreamParams
                 near_trend=params.near_trend,
                 pin_buy=params.pin_buy,
                 **_stream_client_watchlist_kwargs(params),
-            )
-        ).model_dump(mode="json")
-        if params.delta_format:
-            tracker = TerminalDeltaTracker()
-            message = tracker.next_message(payload)
-            if message is not None:
-                await websocket.send_json(message)
-        else:
-            await websocket.send_json(payload)
+            ).model_dump(mode="json")
+
+        payload = await asyncio.to_thread(build_terminal_payload)
+        # 静态期一次性快照：若分时缩略图还在后台预热（deferred），等预热完成
+        # 后重建再发，避免翻页/冷启动后分时图与做T分析长期空缺（连接随后关闭，
+        # 不会再有增量推送补齐）。fast 路径本就不带缩略图，不等待。
+        if not params.fast:
+            for _ in range(4):
+                items = (payload.get("stock_board") or {}).get("items") or []
+                deferred = any(
+                    (item.get("mini_chart") or {}).get("source_quality") == "deferred"
+                    for item in items
+                )
+                if not deferred:
+                    break
+                await asyncio.sleep(1.5)
+                payload = await asyncio.to_thread(build_terminal_payload)
+        try:
+            if params.delta_format:
+                tracker = TerminalDeltaTracker()
+                message = tracker.next_message(payload)
+                if message is not None:
+                    await websocket.send_json(message)
+            else:
+                await websocket.send_json(payload)
+        except Exception:
+            # 等待预热期间客户端已断开（浏览器关闭/重连）：静默丢弃，不刷错误日志
+            return
     else:
         payload = (
             await asyncio.to_thread(
@@ -1043,6 +1198,221 @@ def _stream_channel_spec(params: StreamParams) -> ChannelSpec:
         build=build_dashboard,
         snapshot_text=lambda payload: json.dumps(payload),
         interval=_stream_interval,
+    )
+
+
+_LIVE_CHANNELS = {
+    "terminal",
+    "index_minutes",
+    "dark_pool",
+    "detail_chart",
+    "detail_overlay",
+    "detail_daily",
+    "dark_pool_stock",
+}
+
+
+def _live_int(params: dict, key: str, default: int) -> int:
+    try:
+        return int(params.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _live_float(params: dict, key: str, default: float) -> float:
+    try:
+        return float(params.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+
+def _live_str(params: dict, key: str) -> str | None:
+    value = params.get(key)
+    return str(value) if value is not None else None
+
+
+def _live_watchlist_codes(params: dict) -> tuple[str, ...]:
+    value = params.get("watchlist_codes")
+    if isinstance(value, list):
+        return _parse_watchlist_codes(",".join(str(item) for item in value))
+    if value is None:
+        return ()
+    return _parse_watchlist_codes(str(value))
+
+
+def _live_terminal_params(params: dict) -> StreamParams:
+    return StreamParams(
+        sector=_live_str(params, "sector"),
+        view="terminal",
+        sort=str(params.get("sort") or "activity"),
+        fast=False,
+        delta_format=True,
+        board_level=_live_int(params, "boardLevel", 3),
+        page=_live_int(params, "page", 1),
+        page_size=_live_int(params, "pageSize", 40),
+        near_trend=bool(params.get("nearTrend", False)),
+        pin_buy=bool(params.get("pinBuy", False)),
+        watchlist_codes=_live_watchlist_codes(params),
+        watchlist_codes_provided="watchlist_codes" in params,
+    )
+
+
+def _live_channel_key(channel: str, params: dict) -> tuple:
+    """Namespace live channels so they never reuse legacy /ws/stream specs."""
+    if channel == "terminal":
+        return ("live", "terminal", *_stream_channel_key(_live_terminal_params(params)))
+    if channel == "index_minutes":
+        return ("live", channel, _live_str(params, "trade_date") or "")
+    if channel == "dark_pool":
+        return (
+            "live",
+            channel,
+            _live_str(params, "sector") or "",
+            _live_int(params, "boardLevel", 3),
+        )
+    if channel == "dark_pool_stock":
+        return (
+            "live",
+            channel,
+            str(params.get("code") or ""),
+            max(1.0, _live_float(params, "intervalSeconds", 60.0)),
+        )
+
+    watchlist = _live_watchlist_codes(params)
+    return (
+        "live",
+        channel,
+        str(params.get("code") or ""),
+        _live_str(params, "sector") or "",
+        _live_str(params, "trade_date") or "",
+        _live_int(params, "count", 240),
+        watchlist,
+    )
+
+
+def _wrap_live_channel_spec(channel: str, spec: ChannelSpec) -> ChannelSpec:
+    """Add the multiplex envelope without changing a channel's payload protocol."""
+
+    def encode(text: str) -> str:
+        message = json.loads(text)
+        return json.dumps(
+            {"type": "channel", "channel": channel, "message": message},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    async def build() -> tuple[object, str | None]:
+        payload, text = await spec.build()
+        return payload, encode(text) if text is not None else None
+
+    return ChannelSpec(
+        build=build,
+        snapshot_text=lambda payload: encode(spec.snapshot_text(payload)),
+        interval=spec.interval,
+    )
+
+
+def _live_channel_spec(channel: str, params: dict) -> ChannelSpec:
+    if channel == "terminal":
+        return _wrap_live_channel_spec("terminal", _stream_channel_spec(_live_terminal_params(params)))
+
+    tracker = PayloadDeltaTracker()
+
+    def encode(message: dict | None) -> str | None:
+        if message is None:
+            return None
+        return json.dumps(
+            {"type": "channel", "channel": channel, "message": message},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    if channel == "index_minutes":
+        interval = 10.0
+
+        def build_payload() -> dict:
+            return service.index_minutes(trade_date=_live_str(params, "trade_date"))
+
+    elif channel == "dark_pool":
+        interval = 60.0
+
+        def build_payload() -> dict:
+            return service.dark_pool_payload(
+                sector=_live_str(params, "sector"),
+                board_level=_live_int(params, "boardLevel", 3),
+            )
+
+    elif channel == "detail_chart":
+        interval = 10.0
+        watchlist_raw = params.get("watchlist_codes")
+        watchlist_arg = (
+            ",".join(str(item) for item in watchlist_raw)
+            if isinstance(watchlist_raw, list)
+            else (None if watchlist_raw is None else str(watchlist_raw))
+        )
+
+        def build_payload() -> dict:
+            return service.signal_detail_chart(
+                str(params.get("code") or ""),
+                sector=_live_str(params, "sector"),
+                trade_date=_live_str(params, "trade_date"),
+                **_client_watchlist_kwargs(watchlist_arg),
+            ).model_dump(mode="json")
+
+    elif channel == "detail_overlay":
+        interval = 10.0
+        watchlist_raw = params.get("watchlist_codes")
+        watchlist_arg = (
+            ",".join(str(item) for item in watchlist_raw)
+            if isinstance(watchlist_raw, list)
+            else (None if watchlist_raw is None else str(watchlist_raw))
+        )
+
+        def build_payload() -> dict:
+            return service.signal_detail_overlay(
+                str(params.get("code") or ""),
+                sector=_live_str(params, "sector"),
+                trade_date=_live_str(params, "trade_date"),
+                **_client_watchlist_kwargs(watchlist_arg),
+            ).model_dump(mode="json")
+
+    elif channel == "detail_daily":
+        interval = 30.0
+        watchlist_raw = params.get("watchlist_codes")
+        watchlist_arg = (
+            ",".join(str(item) for item in watchlist_raw)
+            if isinstance(watchlist_raw, list)
+            else (None if watchlist_raw is None else str(watchlist_raw))
+        )
+
+        def build_payload() -> dict:
+            return service.signal_detail_daily(
+                str(params.get("code") or ""),
+                sector=_live_str(params, "sector"),
+                trade_date=_live_str(params, "trade_date"),
+                count=_live_int(params, "count", 240),
+                **_client_watchlist_kwargs(watchlist_arg),
+            )
+
+    elif channel == "dark_pool_stock":
+        interval = max(1.0, _live_float(params, "intervalSeconds", 60.0))
+
+        def build_payload() -> dict:
+            return service.dark_pool_stock_payload(str(params.get("code") or ""))
+
+    else:  # pragma: no cover - endpoint validates the whitelist first
+        raise ValueError(f"unsupported live channel: {channel}")
+
+    async def build() -> tuple[object, str | None]:
+        payload = await asyncio.to_thread(build_payload)
+        message = tracker.next_message(payload)
+        return payload, encode(message)
+
+    return ChannelSpec(
+        build=build,
+        snapshot_text=lambda payload: encode(tracker.snapshot_message(payload)),
+        interval=lambda: interval,
     )
 
 

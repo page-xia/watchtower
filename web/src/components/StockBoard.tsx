@@ -3,14 +3,12 @@ import { Star, ChevronLeft, ChevronRight, Crown } from "lucide-react"
 import type { BoardItem, SectorRank, StockBoard } from "@/types/api"
 import { SignalBadge } from "@/components/widgets"
 import {
-  AmountCell,
   DayPositionCell,
   HeatCell,
   IdentityCell,
-  OrderFlowCell,
   PriceCell,
-  RatioCell,
   SparklineCell,
+  TAnalysisCell,
 } from "@/components/boardCells"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
@@ -90,10 +88,6 @@ const StockRow = memo(function StockRow({
         <SignalBadge signal={item.signal} score={item.signal_score} />
         <div className="num mt-0.5 text-[9px] text-muted-foreground/70">{item.signal_time || ""}</div>
       </td>
-      {/* 量比 */}
-      <RatioCell value={item.minute_amount_ratio} />
-      {/* 大单 */}
-      <OrderFlowCell flow={item.order_flow} />
       {/* 压力/支撑（含低吸徽标 + 距最近买卖点 ±%） */}
       <DayPositionCell
         price={item.price}
@@ -106,8 +100,8 @@ const StockRow = memo(function StockRow({
       />
       {/* 板块热度 */}
       <HeatCell score={item.sector_heat_score} />
-      {/* 成交额 */}
-      <AmountCell amount={item.amount} />
+      {/* 做T分析：资金（外盘/内盘）+ 趋势多空 + 评分建议（替代原量比/大单/成交额） */}
+      <TAnalysisCell item={item} />
     </tr>
   )
 })
@@ -210,11 +204,9 @@ export function StockBoardPanel({
               <th className="w-[72px] pr-2 text-right font-normal">现价/涨幅</th>
               <th className="w-[120px] px-1 font-normal">分时</th>
               <th className="w-[86px] px-1 text-center font-normal">信号</th>
-              <th className="w-[56px] px-1 text-right font-normal">量比</th>
-              <th className="w-[60px] px-1 text-right font-normal">大单</th>
               <th className="w-[110px] px-2 font-normal">压/支</th>
               <th className="w-[50px] px-1 text-right font-normal">板块热</th>
-              <th className="w-[70px] pl-1 pr-2 text-right font-normal">成交额</th>
+              <th className="w-[122px] px-1 font-normal">做T分析</th>
             </tr>
           </thead>
           <tbody className={cn(loading && items.length === 0 && "opacity-40")}>
@@ -228,7 +220,7 @@ export function StockBoardPanel({
             ))}
             {items.length === 0 && !loading && (
               <tr>
-                <td colSpan={10} className="p-8 text-center text-xs text-muted-foreground">
+                <td colSpan={8} className="p-8 text-center text-xs text-muted-foreground">
                   无真实数据
                 </td>
               </tr>

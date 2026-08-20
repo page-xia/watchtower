@@ -24,14 +24,17 @@ from app.market_schedule import market_refresh_policy
 from app.message_store import MessageStore
 from app.webhook_push import SignalPushPool, WebhookSubscriptionStore
 from app.dark_pool import DarkPoolMonitor
+from app.eod_store import build_eod_store
 from app.em_moneyflow import EMMoneyflowCache
 from app.formula_engine import (
     SIGNAL_VERSION,
     ZuoTDayContext,
     compute_zuot_series,
+    compute_zuot_snapshot,
 )
 from app.models import (
     AnalysisRecord,
+    BoardTAnalysis,
     ConfluenceSnapshot,
     DashboardPayload,
     DetailChartSeries,
@@ -198,15 +201,17 @@ class DashboardService:
             load_yaml(settings.rules_file, {}),
             persist_path=settings.opening_decision_file,
         )
-        # 暗盘资金监控：官方口径读本地 tushare_eod.sqlite（300s TTL），
+        # 暗盘资金监控：官方口径走 EOD 访问层（app/eod_store.py，300s TTL），
         # 盘中资金地图走东财快照缓存（后台一次性线程补齐）；均不进 5 秒大盘刷新循环。
         self.em_moneyflow_cache = EMMoneyflowCache()
+        self.eod_store = build_eod_store(settings)
         self.dark_pool_monitor = DarkPoolMonitor(
             settings,
             context_provider=self._get_context,
             sector_mapper=self._stock_board_display_map_for_level,
             sector_members_provider=self._sector_members_for_level,
             em_cache=self.em_moneyflow_cache,
+            eod_store=self.eod_store,
         )
         self._context_cache: DashboardContext | None = None
         self._context_cache_at: float = 0.0
@@ -226,6 +231,9 @@ class DashboardService:
         self._sector_flow_names_by_key: dict[str, list[str]] = {}
         self._sector_flow_lock = threading.Lock()
         self._sector_flow_refresh_threads: dict[str, threading.Thread] = {}
+        # 板块曲线后台重建全局单飞：不同申万层级有不同 cache_key，过去会各起
+        # 一条全成员轨迹线程并发物化大量 SQLite 行，在小内存生产机上触发 OOM。
+        self._sector_flow_rebuild_lock = threading.Lock()
         # 个股 → 官方板块（easy_tdx 申万 1/2/3 级）名称映射：机会队列把 X410302 这类内部
         # 行业代码显示成「网络工程施工」；每级独立缓存，300s TTL，板块成员缓存本身也是热数据
         self._stock_board_name_map_by_level: dict[int, dict[str, str]] = {}
@@ -257,6 +265,18 @@ class DashboardService:
         self._mini_chart_warm_thread: threading.Thread | None = None
         self._sector_mini_chart_cache: dict[tuple[str, str], tuple[float, MiniIntradaySeries]] = {}
         self._fast_board_entries_cache: dict[str, tuple[float, list[BoardEntry]]] = {}
+        # 页无关共享缓存：全市场排序 entries 与官方板块分组结果按 context 签名缓存，
+        # 翻页/秒级刷新/多页面频道共享同一次排序与分组，只现算当前页切片。
+        self._board_entries_cache_by_key: dict[str, tuple[float, list[BoardEntry]]] = {}
+        self._board_entries_cache_lock = threading.Lock()
+        self._board_entries_build_locks: dict[str, threading.Lock] = {}
+        self._official_board_sectors_cache: dict[str, tuple[float, list[SectorSnapshot]]] = {}
+        self._official_board_sectors_lock = threading.Lock()
+        self._official_board_sectors_build_locks: dict[str, threading.Lock] = {}
+        # 分时缩略图缓存代数：预热 worker 每写完一批 +1。终端载荷缓存 key 携带代数，
+        # 预热完成后下一次构建自然带出真实曲线（替代旧的「deferred 不缓存」闸门，
+        # 半成品载荷长期挡住缓存会让每次刷新/翻页都全量重建）。
+        self._mini_chart_epoch = 0
         self._visible_quote_cache: dict[str, tuple[float, Quote]] = {}
         self._visible_quote_refresh_started_at_by_key: dict[str, float] = {}
         self._visible_quote_refresh_threads: dict[str, threading.Thread] = {}
@@ -307,7 +327,7 @@ class DashboardService:
         self._detail_daily_cache_lock = threading.Lock()
         self._detail_daily_build_locks: dict[str, threading.Lock] = {}
         # 流通市值快照缓存（板块中军口径用）：按（日期, 库文件 mtime）失效
-        self._float_mcap_cache_key: tuple[str, int] | None = None
+        self._float_mcap_cache_key: tuple[str, str] | None = None
         self._float_mcap_cache: dict[str, float] = {}
         # 详情页单票公式行缓存：轨迹库文件大、行按时间交错落盘，单票 180 行
         # 实际是随机页读，盘中与后台批量读写叠加时可能卡数秒。数据本身每
@@ -461,8 +481,35 @@ class DashboardService:
                     pin_buy=pin_buy,
                 ),
                 max_entries=24,
+                cache_if=self._terminal_payload_complete,
             )
         return payload
+
+    @staticmethod
+    def _terminal_payload_complete(payload: Any) -> bool:
+        """载荷内容是否齐备：可见榜单/自选/持仓的分时缩略图不处于 deferred 预热态。
+
+        deferred 表示后台 worker 正在预热（首次访问某页/某票时）；这种半成品
+        载荷不写入共享缓存，否则冻结期会被 context 签名无限期钉住，翻页后的
+        分时图与做T分析永远无法补齐。
+        """
+
+        def is_deferred(mini: Any) -> bool:
+            quality = getattr(mini, "source_quality", None)
+            if quality is None and isinstance(mini, dict):
+                quality = mini.get("source_quality")
+            return quality == "deferred"
+
+        board = getattr(payload, "stock_board", None)
+        for item in getattr(board, "items", None) or []:
+            if is_deferred(getattr(item, "mini_chart", None)):
+                return False
+        for section in ("watchlist_preview", "positions_preview"):
+            for row in getattr(payload, section, None) or []:
+                mini = row.get("mini_chart") if isinstance(row, dict) else getattr(row, "mini_chart", None)
+                if is_deferred(mini):
+                    return False
+        return True
 
     @staticmethod
     def _context_signature(context: DashboardContext) -> str:
@@ -542,12 +589,17 @@ class DashboardService:
         ttl: float | None,
         builder: Callable[[], Any],
         max_entries: int,
+        cache_if: Callable[[Any], bool] | None = None,
     ) -> Any:
         """共享载荷缓存 + 按 key 单飞构建。
 
         ttl=None（冻结/静态期）时缓存随 key 中的 context 签名失效，不做时间
         过期；ttl 为数（盘中）时超过 TTL 即重建。命中返回深拷贝，调用方可以
         自由挂载连接级字段而不污染缓存。
+
+        cache_if 返回 False 时本次构建结果直接返回但不写入缓存——用于「内容
+        尚未齐备」的载荷（如分时缩略图仍在后台预热），避免半成品在冻结期被
+        context 签名缓存永久钉住。
         """
         now = time.time()
         with store_lock:
@@ -562,6 +614,8 @@ class DashboardService:
                 if cached is not None and (ttl is None or time.time() - cached[0] <= ttl):
                     return cached[1].model_copy(deep=True)
             payload = builder()
+            if cache_if is not None and not cache_if(payload):
+                return payload
             with store_lock:
                 store[cache_key] = (time.time(), payload.model_copy(deep=True))
                 while len(store) > max_entries:
@@ -627,6 +681,9 @@ class DashboardService:
                 str(max(1, int(page_size or 80))),
                 "near_trend" if near_trend else "",
                 "pin_buy" if pin_buy else "",
+                # 分时缩略图预热完成时代数 +1，缓存随即失效重建，
+                # deferred 半成品不会长期占住缓存、预热结果也不会被旧载荷钉住。
+                str(self._mini_chart_epoch),
             ]
         )
 
@@ -1025,37 +1082,42 @@ class DashboardService:
     def _float_mcap_map(self) -> dict[str, float]:
         """最新一个交易日的流通市值（元），按 6 位代码索引。
 
-        数据源：tushare daily_basic 本地快照（circ_mv，万元；个股级数值，
-        不参与板块分类）。按（日期, 库文件 mtime）缓存——ingest 写库后
-        mtime 变化即重载；库缺失/查询失败返回空表，调用方回退成交额口径。
+        数据源：EOD 存储 daily_basic（circ_mv，万元；个股级数值，不参与板块分类）。
+        按（日期, 库内最新交易日）缓存——ingest 落库后最新交易日变化即重载；
+        存储不可用/查询失败返回空表，调用方回退成交额口径。
+        生产快照模式读预计算的 float_mcap 段。
         """
-        db_file = self.settings.data_dir / "runtime" / "tushare_eod.sqlite"
-        try:
-            mtime = int(db_file.stat().st_mtime)
-        except OSError:
+        store = self.eod_store
+        backend = getattr(store, "backend", "")
+        if backend == "cloudbase_snapshot":
+            doc = store.eod_payload()  # type: ignore[attr-defined]
+            result = {
+                str(code): float(value)
+                for code, value in (doc.get("float_mcap") or {}).items()
+                if value
+            }
+            return result
+        if not getattr(store, "available", False):
             return {}
-        cache_key = (china_now().strftime("%Y%m%d"), mtime)
+        latest = store.latest_date("daily_basic")
+        if not latest:
+            return {}
+        cache_key = (china_now().strftime("%Y%m%d"), latest)
         if self._float_mcap_cache_key == cache_key:
             return self._float_mcap_cache
         result: dict[str, float] = {}
         try:
-            import sqlite3
-
-            with sqlite3.connect(str(db_file), timeout=2) as conn:
-                row = conn.execute("SELECT MAX(trade_date) FROM daily_basic").fetchone()
-                latest = str(row[0]) if row and row[0] else ""
-                if latest:
-                    for ts_code, circ_mv in conn.execute(
-                        "SELECT ts_code, circ_mv FROM daily_basic WHERE trade_date = ?",
-                        (latest,),
-                    ):
-                        code = str(ts_code or "").split(".")[0].zfill(6)
-                        try:
-                            value = float(circ_mv) * 10_000.0  # 万元 → 元
-                        except (TypeError, ValueError):
-                            continue
-                        if len(code) == 6 and code.isdigit() and value > 0:
-                            result[code] = value
+            for row in store.query(
+                f"SELECT ts_code, circ_mv FROM {store.table('daily_basic')} WHERE trade_date = %s",
+                (latest,),
+            ):
+                code = str(row.get("ts_code") or "").split(".")[0].zfill(6)
+                try:
+                    value = float(row.get("circ_mv")) * 10_000.0  # 万元 → 元
+                except (TypeError, ValueError):
+                    continue
+                if len(code) == 6 and code.isdigit() and value > 0:
+                    result[code] = value
         except Exception:
             return {}
         self._float_mcap_cache_key = cache_key
@@ -1079,24 +1141,21 @@ class DashboardService:
         )
 
     def _lookup_float_shares(self, code: str) -> float | None:
-        db_file = self.settings.data_dir / "runtime" / "tushare_eod.sqlite"
-        if not db_file.exists():
+        store = self.eod_store
+        if not getattr(store, "available", False) or getattr(store, "backend", "") != "mysql":
             return None
         ts_code = f"{code}.{'SH' if code.startswith(('6', '5', '9')) else 'BJ' if code.startswith(('4', '8', '92')) else 'SZ'}"
         try:
-            import sqlite3
-
-            with sqlite3.connect(str(db_file), timeout=2) as conn:
-                row = conn.execute(
-                    "SELECT float_share FROM daily_basic WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1",
-                    (ts_code,),
-                ).fetchone()
+            rows = store.query(
+                f"SELECT float_share FROM {store.table('daily_basic')} WHERE ts_code = %s ORDER BY trade_date DESC LIMIT 1",
+                (ts_code,),
+            )
         except Exception:
             return None
-        if not row or row[0] in (None, ""):
+        if not rows or rows[0].get("float_share") in (None, ""):
             return None
         try:
-            value = float(row[0])  # 万股
+            value = float(rows[0]["float_share"])  # 万股
         except (TypeError, ValueError):
             return None
         return value * 10_000.0 if value > 0 else None
@@ -2259,6 +2318,30 @@ class DashboardService:
             return None
         mark_stage("trajectory_load_ms")
 
+        # 盘口（外盘/内盘）在持久化时从 quote 主帧剥离、单独存 order_flow_trajectory；
+        # 引导帧从这里回填，否则夜间/冷启动上下文的 order_flow 全部不可用，
+        # 榜单「做T分析」的资金维度与大单列会显示 '--'。
+        try:
+            raw_quotes = list(raw.get("quotes") or [])
+            flows_by_code = self.trajectory_store.latest_order_flows_by_code(
+                str(raw.get("trade_date") or ""),
+                str(raw.get("captured_at") or ""),
+            )
+            if flows_by_code:
+                for item in raw_quotes:
+                    if not isinstance(item, dict):
+                        continue
+                    existing = item.get("order_flow")
+                    if isinstance(existing, dict) and existing.get("available"):
+                        continue
+                    flow = flows_by_code.get(str(item.get("code") or "").zfill(6))
+                    if flow:
+                        item["order_flow"] = flow
+                raw = {**raw, "quotes": raw_quotes}
+            mark_stage("order_flow_rejoin_ms")
+        except Exception:  # pragma: no cover - 回填失败不阻断引导
+            pass
+
         try:
             watchlist = self.watchlist_store.list_items()
             positions = self.position_store.list_items()
@@ -2419,59 +2502,72 @@ class DashboardService:
             member_codes = self._sector_flow_member_codes(sector, quote_list, member_code_loader)
             if not member_codes:
                 continue
-            try:
-                ticks_by_code = loader(trade_date, member_codes)
-            except Exception:
-                continue
             # 每分钟一桶：全成员该分钟净流入求和（亿），不做跨分钟累计。
             step_buckets: dict[str, float] = {}
-            for code in member_codes:
-                raw_ticks = list(ticks_by_code.get(code) or [])
-                # 只保留正常交易时段的观测；盘前（竞价金额 0）的最后一根留作零基线，
-                # 否则 09:30 首分钟的真实成交会被当作起点丢掉。
-                baseline: dict[str, Any] | None = None
-                ticks: list[dict[str, Any]] = []
-                for tick in raw_ticks:
-                    tick_label = str(tick.get("time") or "")[:5]
-                    if self._is_regular_mini_time(tick_label):
-                        ticks.append(tick)
-                    elif tick_label and tick_label < "09:30":
-                        baseline = tick
-                if baseline is not None:
-                    ticks.insert(0, baseline)
-                prev_tick: dict[str, Any] | None = None
-                prev_label = ""
-                last_direction = 0
-                for tick in ticks:
-                    price = self._safe_float(tick.get("price"))
-                    amount = self._safe_float(tick.get("amount"))
-                    label = str(tick.get("time") or "")[:5]
-                    if prev_tick is None or price <= 0 or not label:
+            # 动态轨迹表每票最多 2880 根。大板块若一次读取数百只，会把数百万
+            # dict 同时留在内存；按 16 只分批并在本地桶中立即归约，峰值有明确上限。
+            for batch_start in range(0, len(member_codes), 16):
+                batch_codes = member_codes[batch_start : batch_start + 16]
+                try:
+                    ticks_by_code = loader(trade_date, batch_codes)
+                except Exception:
+                    continue
+                for code in batch_codes:
+                    raw_ticks = list(ticks_by_code.get(code) or [])
+                    # 只保留正常交易时段的观测；盘前（竞价金额 0）的最后一根留作零基线，
+                    # 否则 09:30 首分钟的真实成交会被当作起点丢掉。
+                    baseline: dict[str, Any] | None = None
+                    ticks: list[dict[str, Any]] = []
+                    for tick in raw_ticks:
+                        tick_label = str(tick.get("time") or "")[:5]
+                        if self._is_regular_mini_time(tick_label):
+                            ticks.append(tick)
+                        elif tick_label and tick_label < "09:30":
+                            baseline = tick
+                    if baseline is not None:
+                        ticks.insert(0, baseline)
+                    prev_tick: dict[str, Any] | None = None
+                    prev_label = ""
+                    last_direction = 0
+                    for tick in ticks:
+                        price = self._safe_float(tick.get("price"))
+                        amount = self._safe_float(tick.get("amount"))
+                        label = str(tick.get("time") or "")[:5]
+                        if prev_tick is None or price <= 0 or not label:
+                            prev_tick = tick
+                            prev_label = label
+                            continue
+                        prev_price = self._safe_float(prev_tick.get("price")) or price
+                        delta_amount = amount - self._safe_float(prev_tick.get("amount"))
+                        # 相邻观测跨度过大（采集中断）时，成交额增量是整个空窗期的总量，
+                        # 按空窗分钟数（封顶 5）摊薄，避免单分钟尖刺；午间休市无成交，天然跳过。
+                        previous_label = prev_label
+                        gap_minutes = self._minutes_between(previous_label, label)
                         prev_tick = tick
                         prev_label = label
-                        continue
-                    prev_price = self._safe_float(prev_tick.get("price")) or price
-                    delta_amount = amount - self._safe_float(prev_tick.get("amount"))
-                    # 相邻观测跨度过大（采集中断）时，成交额增量是整个空窗期的总量，
-                    # 按空窗分钟数（封顶 5）摊薄，避免单分钟尖刺；午间休市无成交，天然跳过。
-                    gap_minutes = self._minutes_between(prev_label, label)
-                    prev_tick = tick
-                    prev_label = label
-                    if delta_amount <= 0:
-                        continue
-                    if price > prev_price:
-                        direction = 1
-                    elif price < prev_price:
-                        direction = -1
-                    else:
-                        direction = last_direction  # 走平沿用上一方向：平推的连续成交不该被丢
-                    if direction == 0:
-                        continue
-                    last_direction = direction
-                    step = delta_amount / 100_000_000 * direction
-                    if gap_minutes > 2:
-                        step /= min(gap_minutes, 5)
-                    step_buckets[label] = step_buckets.get(label, 0.0) + step
+                        if delta_amount <= 0:
+                            continue
+                        if price > prev_price:
+                            direction = 1
+                        elif price < prev_price:
+                            direction = -1
+                        else:
+                            direction = last_direction  # 走平沿用上一方向：平推的连续成交不该被丢
+                        if direction == 0:
+                            continue
+                        last_direction = direction
+                        step = delta_amount / 100_000_000 * direction
+                        allocation_labels = (
+                            self._flow_gap_labels(previous_label, label)
+                            if gap_minutes > 2
+                            else [label]
+                        )
+                        share = step / max(1, len(allocation_labels))
+                        for allocation_label in allocation_labels:
+                            step_buckets[allocation_label] = (
+                                step_buckets.get(allocation_label, 0.0) + share
+                            )
+                del ticks_by_code
             if not step_buckets:
                 continue
             raw_points: list[dict[str, Any]] = []
@@ -2483,9 +2579,9 @@ class DashboardService:
                 raw_points.append({"captured_at": label, "change_pct": round(value, 4)})
             # 120 点上限：全交易日约 240 个分钟桶，压缩一半足以保形；
             # 48 点会把分钟级锯齿欠采样成更低频的假波动
-            sampled = self._sample_mini_rows(raw_points, max_points=120)
+            sampled = self._sample_flow_rows_preserving_total(raw_points, max_points=120)
             points = [
-                SectorFlowPoint(time=self._mini_time_label(row.get("captured_at")), value=round(self._safe_float(row.get("change_pct")), 2))
+                SectorFlowPoint(time=self._mini_time_label(row.get("captured_at")), value=round(self._safe_float(row.get("change_pct")), 4))
                 for row in sampled
             ]
             if len(points) < 2:
@@ -3939,6 +4035,57 @@ class DashboardService:
             return base
         return base.model_copy(update={"markers": markers})
 
+    def _zuot_board_analysis(
+        self,
+        item: StockBoardItem,
+        chart: MiniIntradaySeries | None,
+    ) -> BoardTAnalysis:
+        """榜单做T紧凑分析：从分时缩略点按「每分钟最后一个采样」还原分钟涨幅序列。
+
+        分钟级 EMA30/EMA900 与做T公式.md 同口径；资金维度用五档外盘/内盘
+        （公式「买卖净」口径），不做逐笔轮询。缩略图 deferred/不可用时返回
+        unavailable，随下一轮缓存命中自动补齐（与分时缩略图同生命周期）。
+        """
+        if chart is None or not chart.price_pcts:
+            return BoardTAnalysis()
+        minute_pcts: dict[str, float] = {}
+        times = chart.times or []
+        for index, pct in enumerate(chart.price_pcts):
+            label = str(times[index]) if index < len(times) else ""
+            key = label or f"#{index}"
+            minute_pcts[key] = self._safe_float(pct)
+        vwap_pct = None
+        if chart.vwap_pcts:
+            vwap_pct = self._safe_float(chart.vwap_pcts[-1])
+        flow = item.order_flow
+        try:
+            data = compute_zuot_snapshot(
+                list(minute_pcts.values()),
+                vwap_pct=vwap_pct,
+                price=float(item.price or 0),
+                resistance=float(item.resistance or 0),
+                support=float(item.support or 0),
+                outer_volume=float(getattr(flow, "active_buy_volume", 0) or 0),
+                inner_volume=float(getattr(flow, "active_sell_volume", 0) or 0),
+                flow_available=bool(getattr(flow, "available", False)),
+            )
+        except Exception:  # pragma: no cover - 分析失败不阻塞榜单
+            return BoardTAnalysis()
+        if not data.get("available"):
+            return BoardTAnalysis()
+        return BoardTAnalysis(**data)
+
+    def _board_item_live_attachments(
+        self,
+        item: StockBoardItem,
+        chart: MiniIntradaySeries | None,
+    ) -> dict[str, Any]:
+        """榜单行实时挂载件：带买卖标记的分时缩略图 + 做T紧凑分析。"""
+        return {
+            "mini_chart": self._mini_chart_with_board_marker(item, chart),
+            "t_analysis": self._zuot_board_analysis(item, chart),
+        }
+
     def _context_watch_previews(
         self,
         context: DashboardContext,
@@ -4013,12 +4160,10 @@ class DashboardService:
             }
         watch_items = [
             item.model_copy(
-                update={
-                    "mini_chart": self._mini_chart_with_board_marker(
-                        item,
-                        mini_cache.get(item.code, MiniIntradaySeries(source_quality="unavailable")),
-                    )
-                }
+                update=self._board_item_live_attachments(
+                    item,
+                    mini_cache.get(item.code, MiniIntradaySeries(source_quality="unavailable")),
+                )
             )
             for item in watch_items
         ]
@@ -4026,12 +4171,10 @@ class DashboardService:
         position_preview = []
         for board_item, position_item in position_items:
             board_item = board_item.model_copy(
-                update={
-                    "mini_chart": self._mini_chart_with_board_marker(
-                        board_item,
-                        mini_cache.get(board_item.code, MiniIntradaySeries(source_quality="unavailable")),
-                    )
-                }
+                update=self._board_item_live_attachments(
+                    board_item,
+                    mini_cache.get(board_item.code, MiniIntradaySeries(source_quality="unavailable")),
+                )
             )
             row = board_item.model_dump(mode="json")
             row["name"] = position_item.name or row.get("name") or position_item.code
@@ -4072,6 +4215,24 @@ class DashboardService:
             return max(1, b - a)
         except (TypeError, ValueError):
             return 1
+
+    @staticmethod
+    def _flow_gap_labels(earlier: str, later: str) -> list[str]:
+        """空窗累计量的守恒分摊标签：覆盖缺口内的全部交易分钟。"""
+        try:
+            start = int(str(earlier)[:2]) * 60 + int(str(earlier)[3:5])
+            end = int(str(later)[:2]) * 60 + int(str(later)[3:5])
+        except (TypeError, ValueError):
+            return [str(later)[:5]] if later else []
+        labels: list[str] = []
+        for value in range(start + 1, end + 1):
+            hour, minute = divmod(value, 60)
+            label = f"{hour:02d}:{minute:02d}"
+            if DashboardService._is_regular_mini_time(label):
+                labels.append(label)
+        if not labels:
+            return [str(later)[:5]] if later else []
+        return labels
 
     @staticmethod
     def _mini_row_time_label(row: dict[str, Any]) -> str:
@@ -4197,6 +4358,34 @@ class DashboardService:
                 keep.update(remaining[round(pos * step)] for pos in range(target))
             indexes = keep
         return [rows[index] for index in sorted(indexes)]
+
+    @staticmethod
+    def _sample_flow_rows_preserving_total(
+        rows: list[dict[str, Any]],
+        max_points: int = 120,
+    ) -> list[dict[str, Any]]:
+        """压缩每分钟净流入时按连续桶求和，保证前端重新积分后的总量不变。"""
+        regular = DashboardService._dedupe_mini_rows_by_minute(
+            DashboardService._regular_mini_rows(rows)
+        )
+        limit = max(2, min(int(max_points or 120), 120))
+        if len(regular) <= limit:
+            return regular
+        output: list[dict[str, Any]] = []
+        total_rows = len(regular)
+        for bucket in range(limit):
+            start = int(bucket * total_rows / limit)
+            end = int((bucket + 1) * total_rows / limit)
+            if end <= start:
+                continue
+            group = regular[start:end]
+            last = dict(group[-1])
+            last["change_pct"] = round(
+                sum(DashboardService._safe_float(row.get("change_pct")) for row in group),
+                4,
+            )
+            output.append(last)
+        return output
 
     @staticmethod
     def _rolling_mean(values: list[float]) -> list[float]:
@@ -4940,12 +5129,10 @@ class DashboardService:
             self._last_stock_mini_chart_loaded_count = 0
         visible = [
             item.model_copy(
-                update={
-                    "mini_chart": self._mini_chart_with_board_marker(
-                        item,
-                        mini_cache.get(item.code, MiniIntradaySeries(source_quality="unavailable")),
-                    )
-                }
+                update=self._board_item_live_attachments(
+                    item,
+                    mini_cache.get(item.code, MiniIntradaySeries(source_quality="unavailable")),
+                )
             )
             for item in visible
         ]
@@ -5513,7 +5700,23 @@ class DashboardService:
         now = time.time()
         with self._sector_flow_lock:
             cached = self._sector_flow_cache_by_key.get(cache_key)
-        if cached and cached[1] and now - cached[0] < max(1, ttl):
+        cached_has_expected_names = bool(
+            cached
+            and cached[1]
+            and self._sector_flow_list_covers_expected_names(
+                cached[1], sectors, state_key=cache_key
+            )
+        )
+        cached_complete = bool(
+            cached_has_expected_names
+            and (
+                not frozen
+                or self._sector_flow_list_covers_snapshot(
+                    cached[1], sectors, snapshot, state_key=cache_key
+                )
+            )
+        )
+        if cached and cached_complete and now - cached[0] < max(1, ttl):
             if prefer_async and live_mode and not frozen:
                 needs_opening_backfill = self._sector_flow_needs_opening_backfill(cached[1], snapshot)
                 needs_live_tail = self._sector_flow_needs_live_tail(cached[1], snapshot)
@@ -5531,43 +5734,34 @@ class DashboardService:
             else:
                 return cached[1]
 
-        # 冻结/非实时（收盘后、重启冷启动）：优先用本地板块轨迹重建资金流，
-        # 而不是逐票请求 TDX 历史分钟线——后者盘后大量失败会导致只剩个别板块。
+        # 冻结/非实时（收盘后、重启冷启动）：完整持久化曲线可直接恢复；残缺
+        # 曲线必须重建，不能把动态优先级 stock_features 当成全市场轨迹。
         if frozen or not live_mode:
             cloud_flow = self._load_sector_flow_cloud(cache_key, trade_date)
             if cloud_flow:
                 cloud_flow = self._anchor_flow_list_to_active_net(
                     cloud_flow, sectors, getattr(snapshot, "quotes", None), member_code_loader
                 )
-                with self._sector_flow_lock:
-                    self._sector_flow_cache_by_key[cache_key] = (now, cloud_flow)
-                return cloud_flow
+                cloud_flow_complete = self._sector_flow_list_covers_snapshot(
+                    cloud_flow, sectors, snapshot, state_key=cache_key
+                )
+                if cloud_flow_complete:
+                    with self._sector_flow_lock:
+                        self._sector_flow_cache_by_key[cache_key] = (now, cloud_flow)
+                    return cloud_flow
+            else:
+                cloud_flow_complete = False
             if allow_deferred:
-                # 首屏不等 80GB 轨迹库的冷读：先返回过期缓存/空，
-                # 后台重建后清终端缓存，下一轮 WS 增量带出曲线。
-                # 快照为空（冷启动、上下文尚未就绪）时不要调度：没有 quotes
-                # 的重建无法做 L1 真值锚定，未锚定结果会占住冻结缓存 300s，
-                # 把「成交额毛口径」当成定数展示（2026-08-17 本地/生产分歧
-                # 的诱因之一）。
+                # 首屏不等上游分钟线：残缺持久化曲线先剔除，后台用少量代表股
+                # 分钟形态重建并以官方全成员 L1 收盘净额定标。stock_features
+                # 每帧只记录动态优先级约 160 只，不能再冒充全市场成员轨迹。
                 if getattr(snapshot, "quotes", None):
                     self._schedule_sector_flow_trajectory_refresh(
                         cache_key,
-                        trade_date,
-                        sectors,
-                        member_code_loader,
-                        snapshot.quotes,
-                    )
-                if cached and cached[1]:
-                    return cached[1]
-                if getattr(self, "state_store", None) is not None:
-                    fallback_flow = self._build_and_cache_sector_flow(
-                        cache_key,
                         snapshot,
                         sectors,
-                        member_code_loader=member_code_loader,
+                        member_code_loader,
                     )
-                    if fallback_flow:
-                        return fallback_flow
                 return []
             trajectory_flow = self._sector_flow_from_trajectory(
                 trade_date,
@@ -5576,7 +5770,13 @@ class DashboardService:
                 quotes=getattr(snapshot, "quotes", None),
                 state_key=cache_key,
             )
-            if trajectory_flow:
+            bootstrap_trajectory = str(snapshot.source_status.get("active_source") or "") == "local_trajectory_bootstrap"
+            if trajectory_flow and (
+                bootstrap_trajectory
+                or self._sector_flow_list_covers_snapshot(
+                    trajectory_flow, sectors, snapshot, state_key=cache_key
+                )
+            ):
                 with self._sector_flow_lock:
                     self._sector_flow_cache_by_key[cache_key] = (now, trajectory_flow)
                 self._persist_sector_flow_cloud(cache_key, trade_date, trajectory_flow, force=True)
@@ -5596,17 +5796,20 @@ class DashboardService:
                     cloud_flow = self._anchor_flow_list_to_active_net(
                         cloud_flow, sectors, getattr(snapshot, "quotes", None), member_code_loader
                     )
-                    self._seed_sector_flow_proxy_state(cache_key, trade_date, cloud_flow)
-                    with self._sector_flow_lock:
-                        self._sector_flow_cache_by_key[cache_key] = (now, cloud_flow)
-                    self._ensure_sector_flow_refresh(
-                        cache_key,
-                        snapshot,
-                        sectors,
-                        member_code_loader=member_code_loader,
-                    )
-                    if not self._sector_flow_needs_live_tail(cloud_flow, snapshot):
-                        return cloud_flow
+                    if self._sector_flow_list_covers_expected_names(
+                        cloud_flow, sectors, state_key=cache_key
+                    ):
+                        self._seed_sector_flow_proxy_state(cache_key, trade_date, cloud_flow)
+                        with self._sector_flow_lock:
+                            self._sector_flow_cache_by_key[cache_key] = (now, cloud_flow)
+                        self._ensure_sector_flow_refresh(
+                            cache_key,
+                            snapshot,
+                            sectors,
+                            member_code_loader=member_code_loader,
+                        )
+                        if not self._sector_flow_needs_live_tail(cloud_flow, snapshot):
+                            return cloud_flow
             # 盘中每次刷新都返回快照代理曲线：全成员成交额增量×方向求和，
             # 零网络开销，随主循环逐点累积。
             proxy = self._sector_flow_proxy_tick(
@@ -5617,9 +5820,12 @@ class DashboardService:
             )
             # 仅冷启动（刚启动/换交易日，曲线还很薄）时后台用本地轨迹按
             # 同一口径回灌一次当日分钟历史；之后曲线完全由快照 tick 驱动。
+            proxy_has_expected_names = self._sector_flow_list_covers_expected_names(
+                proxy, sectors, state_key=cache_key
+            )
             proxy_points = min((len(series.points) for series in proxy), default=0)
             if (
-                not proxy
+                not proxy_has_expected_names
                 or proxy_points < 3
                 or self._sector_flow_needs_opening_backfill(proxy, snapshot)
             ):
@@ -5629,10 +5835,10 @@ class DashboardService:
                     sectors,
                     member_code_loader=member_code_loader,
             )
-            if proxy:
+            if proxy_has_expected_names:
                 self._persist_sector_flow_cloud(cache_key, trade_date, proxy)
                 return proxy
-            return cached[1] if cached else []
+            return cached[1] if cached_has_expected_names else []
 
         return self._build_and_cache_sector_flow(
             cache_key,
@@ -5699,16 +5905,16 @@ class DashboardService:
         if current_index is None or current_index < 10:
             return False
 
-        first_indices: list[int] = []
         for item in series:
+            first_index: int | None = None
             for point in item.points:
                 point_index = session_order.get(str(point.time or "")[:5])
                 if point_index is not None:
-                    first_indices.append(point_index)
+                    first_index = point_index
                     break
-        if not first_indices:
-            return True
-        return min(first_indices) > 3
+            if first_index is None or first_index > 3:
+                return True
+        return False
 
     def _sector_flow_needs_live_tail(
         self,
@@ -5727,16 +5933,86 @@ class DashboardService:
         if current_index is None:
             return False
 
-        last_indices: list[int] = []
         for item in series:
+            last_index: int | None = None
             for point in reversed(item.points):
                 point_index = session_order.get(str(point.time or "")[:5])
                 if point_index is not None:
-                    last_indices.append(point_index)
+                    last_index = point_index
                     break
-        if not last_indices:
-            return True
-        return max(last_indices) < current_index
+            if last_index is None or last_index < current_index:
+                return True
+        return False
+
+    def _sector_flow_series_covers_snapshot(
+        self,
+        series: SectorFlowSeries,
+        snapshot: MarketSnapshot,
+    ) -> bool:
+        """严格判断单个板块曲线是否覆盖当前应有交易时段。
+
+        不能只看列表里最早起点/最晚终点：那会让一条完整曲线掩盖银行等
+        午后才入库的残缺曲线。点数阈值最高 80（全日采样上限 120 的 2/3），
+        兼容平段压缩，同时拒绝生产上 5/8/14/35/67 点的明显断档。
+        """
+        labels = [
+            str(point.time or "")[:5]
+            for point in series.points
+            if self._is_regular_mini_time(str(point.time or "")[:5])
+        ]
+        if not labels:
+            return False
+        current_label = self._minute_label_from_clock(
+            str(snapshot.source_status.get("clock_label") or "")
+        )
+        if not current_label:
+            frozen = bool(
+                snapshot.source_status.get(
+                    "frozen",
+                    getattr(snapshot, "data_mode", "") == "closed_static",
+                )
+            )
+            current_label = "15:00" if frozen else china_now().strftime("%H:%M")
+        expected_minutes = self._elapsed_session_minutes_for_label(current_label)
+        if expected_minutes <= 10:
+            return len(set(labels)) >= 2
+        if self._elapsed_session_minutes_for_label(labels[0]) > 6:
+            return False
+        last_elapsed = self._elapsed_session_minutes_for_label(labels[-1])
+        if last_elapsed < max(1, expected_minutes - 5):
+            return False
+        minimum_points = min(80, max(2, ceil(expected_minutes / 3)))
+        return len(set(labels)) >= minimum_points
+
+    def _sector_flow_list_covers_expected_names(
+        self,
+        series: list[SectorFlowSeries],
+        sectors: list[SectorSnapshot],
+        *,
+        state_key: str,
+    ) -> bool:
+        """整组资金曲线必须覆盖当前口径下应展示的全部板块。"""
+        if not series:
+            return False
+        expected = self._sector_flow_membership(state_key, sectors)
+        expected_names = {item.name for item in expected if getattr(item, "name", "")}
+        actual_names = {item.name for item in series if item.name}
+        return bool(expected_names and expected_names.issubset(actual_names))
+
+    def _sector_flow_list_covers_snapshot(
+        self,
+        series: list[SectorFlowSeries],
+        sectors: list[SectorSnapshot],
+        snapshot: MarketSnapshot,
+        *,
+        state_key: str,
+    ) -> bool:
+        """整组资金曲线完整性：应展示的板块一条不能少，且每条时段覆盖达标。"""
+        if not self._sector_flow_list_covers_expected_names(
+            series, sectors, state_key=state_key
+        ):
+            return False
+        return all(self._sector_flow_series_covers_snapshot(item, snapshot) for item in series)
 
     def _sector_flow_proxy_tick(
         self,
@@ -5788,8 +6064,7 @@ class DashboardService:
                 if not sector.name:
                     continue
                 member_codes = member_codes_by_sector.get(sector.name) or set()
-                step_total = 0.0
-                active_codes = 0
+                step_amounts_by_label: dict[str, float] = {}
                 for code in member_codes:
                     quote = by_code.get(code)
                     if quote is None or quote.price <= 0:
@@ -5803,8 +6078,9 @@ class DashboardService:
                     active_net_amount = self._active_quote_net_amount(quote, tick_entry, time_label)
                     if active_net_amount is not None:
                         if active_net_amount:
-                            step_total += active_net_amount
-                            active_codes += 1
+                            step_amounts_by_label[time_label] = (
+                                step_amounts_by_label.get(time_label, 0.0) + active_net_amount
+                            )
                         continue
                     prev_tick = tick_entry.get("prev") or (None, None, "")
                     prev_price, prev_amount = prev_tick[0], prev_tick[1]
@@ -5829,18 +6105,27 @@ class DashboardService:
                     tick_entry["dir"] = direction
                     step_amount = delta_amount * direction
                     # 相邻观测跨度过大（采集中断/故障恢复）时，成交额增量是整个
-                    # 空窗期的总量，按空窗分钟数（封顶 5）摊薄，与轨迹回灌同一规则，
+                    # 空窗期的总量，按缺口内全部交易分钟摊薄，与轨迹回灌同一规则，
                     # 避免空窗毛成交额被单一方向一次性定号。
                     gap_minutes = self._minutes_between(prev_label, time_label) if prev_label else 0
-                    if gap_minutes > 2:
-                        step_amount /= min(gap_minutes, 5)
-                    step_total += step_amount
-                    active_codes += 1
+                    allocation_labels = (
+                        self._flow_gap_labels(prev_label, time_label)
+                        if gap_minutes > 2
+                        else [time_label]
+                    )
+                    share = step_amount / max(1, len(allocation_labels))
+                    for allocation_label in allocation_labels:
+                        step_amounts_by_label[allocation_label] = (
+                            step_amounts_by_label.get(allocation_label, 0.0) + share
+                        )
 
                 points_map = state["points"].setdefault(sector.name, {})
-                if active_codes:
-                    step = step_total / 100_000_000  # 亿元：全成员求和，不平均、不缩放
-                    points_map[time_label] = round(points_map.get(time_label, 0.0) + step, 4)
+                for allocation_label, step_amount in step_amounts_by_label.items():
+                    step = step_amount / 100_000_000  # 亿元：全成员求和，不平均、不缩放
+                    points_map[allocation_label] = round(
+                        points_map.get(allocation_label, 0.0) + step,
+                        4,
+                    )
                 ordered = sorted(points_map.items())
                 if len(ordered) > 240:
                     ordered = ordered[-240:]
@@ -6158,19 +6443,31 @@ class DashboardService:
     def _schedule_sector_flow_trajectory_refresh(
         self,
         cache_key: str,
-        trade_date: str,
+        snapshot: MarketSnapshot,
         sectors: list[SectorSnapshot],
         member_code_loader: Callable[[SectorSnapshot], list[str]] | None,
-        quotes: list[Quote] | None,
     ) -> None:
-        """冻结分支的后台轨迹重建：与盘中分钟线回灌共用去重线程表。"""
+        """冻结分支后台重建（历史方法名保留）：代表股分钟形态 × 全成员 L1 定标。"""
         with self._sector_flow_lock:
             thread = self._sector_flow_refresh_threads.get(cache_key)
             if thread is not None and thread.is_alive():
                 return
+            if not hasattr(self, "_sector_flow_rebuild_lock"):
+                self._sector_flow_rebuild_lock = threading.Lock()
+            if not hasattr(self, "_sector_flow_last_build_at"):
+                self._sector_flow_last_build_at = {}
+            settings = getattr(self, "settings", None)
+            min_interval = max(
+                15.0,
+                float(getattr(settings, "sector_flow_minute_refresh_seconds", 60) or 60),
+            )
+            now = time.time()
+            if now - self._sector_flow_last_build_at.get(cache_key, 0.0) < min_interval:
+                return
+            self._sector_flow_last_build_at[cache_key] = now
             thread = threading.Thread(
                 target=self._refresh_sector_flow_trajectory,
-                args=(cache_key, trade_date, sectors, member_code_loader, quotes),
+                args=(cache_key, snapshot, sectors, member_code_loader),
                 name=f"watchtower-sector-flow-traj-{abs(hash(cache_key))}",
                 daemon=True,
             )
@@ -6180,27 +6477,59 @@ class DashboardService:
     def _refresh_sector_flow_trajectory(
         self,
         cache_key: str,
-        trade_date: str,
+        snapshot: MarketSnapshot,
         sectors: list[SectorSnapshot],
         member_code_loader: Callable[[SectorSnapshot], list[str]] | None,
-        quotes: list[Quote] | None,
     ) -> None:
+        # 不丢后到的层级：后台线程可以轻量排队，但任一时刻只有一个重建真正
+        # 读取数据/请求分钟线。完成后各自发布缓存并清首屏载荷。
+        self._sector_flow_rebuild_lock.acquire()
         try:
-            flow = self._sector_flow_from_trajectory(
-                trade_date,
-                sectors,
-                member_code_loader=member_code_loader,
-                quotes=quotes,
-                state_key=cache_key,
+            bootstrap_trajectory = str(snapshot.source_status.get("active_source") or "") == "local_trajectory_bootstrap"
+            if bootstrap_trajectory:
+                # 离线 bootstrap/研究回放可能只有几帧，保留本地轨迹的真实稀疏形态；
+                # 生产 easy_tdx 盘后则走代表股分钟形态 × 全成员 L1 定标。
+                flow = self._sector_flow_from_trajectory(
+                    str(snapshot.source_status.get("trade_date") or china_now().strftime("%Y%m%d")),
+                    sectors,
+                    member_code_loader=member_code_loader,
+                    quotes=getattr(snapshot, "quotes", None),
+                    state_key=cache_key,
+                )
+            else:
+                # stock_features 只覆盖动态优先级股票，不能用于官方板块全成员盘后重建。
+                # 分钟线仅取每板块少量代表股塑形，最终总量仍由官方成员 L1 主动量定标。
+                flow = self._build_and_cache_sector_flow(
+                    cache_key,
+                    snapshot,
+                    sectors,
+                    member_code_loader=member_code_loader,
+                    publish=False,
+                )
+            complete = bool(
+                flow
+                and (
+                    bootstrap_trajectory
+                    or self._sector_flow_list_covers_snapshot(
+                        flow, sectors, snapshot, state_key=cache_key
+                    )
+                )
             )
-            if flow:
+            if complete:
                 with self._sector_flow_lock:
                     self._sector_flow_cache_by_key[cache_key] = (time.time(), flow)
+                self._persist_sector_flow_cloud(
+                    cache_key,
+                    str(snapshot.source_status.get("trade_date") or china_now().strftime("%Y%m%d")),
+                    flow,
+                    force=True,
+                )
                 # 让下一轮终端构建立刻采用新曲线（WS 增量随之带出）
                 self._clear_payload_caches()
-        except Exception:  # pragma: no cover - 后台重建失败不影响请求路径
-            pass
+        except Exception as exc:  # pragma: no cover - 后台重建失败不影响请求路径
+            logger.warning("sector_flow background rebuild failed: key=%s error=%r", cache_key, exc)
         finally:
+            self._sector_flow_rebuild_lock.release()
             with self._sector_flow_lock:
                 current = self._sector_flow_refresh_threads.get(cache_key)
                 if current is threading.current_thread():
@@ -6217,6 +6546,8 @@ class DashboardService:
             thread = self._sector_flow_refresh_threads.get(cache_key)
             if thread is not None and thread.is_alive():
                 return
+            if not hasattr(self, "_sector_flow_rebuild_lock"):
+                self._sector_flow_rebuild_lock = threading.Lock()
             # 冷启动/晚启动回灌限速：曲线厚度或起点不达标时重试，但失败
             # 后按 sector_flow_minute_refresh_seconds 放慢节奏，避免打满分钟线源。
             last_build = self._sector_flow_last_build_at.get(cache_key, 0.0)
@@ -6244,6 +6575,7 @@ class DashboardService:
         CloudRun 容器中途启动导致本地轨迹为空时，回退到 easy_tdx 当日分钟线
         补一次早盘曲线；后续仍由实时快照代理继续增量。
         """
+        self._sector_flow_rebuild_lock.acquire()
         try:
             trade_date = str(snapshot.source_status.get("trade_date") or china_now().strftime("%Y%m%d"))
             flow_sectors = self._sector_flow_membership(cache_key, sectors)
@@ -6289,6 +6621,7 @@ class DashboardService:
         except Exception:  # pragma: no cover - 后台回灌失败不影响请求路径
             pass
         finally:
+            self._sector_flow_rebuild_lock.release()
             with self._sector_flow_lock:
                 current = self._sector_flow_refresh_threads.get(cache_key)
                 if current is threading.current_thread():
@@ -6302,6 +6635,8 @@ class DashboardService:
         snapshot: MarketSnapshot,
         sectors: list[SectorSnapshot],
         member_code_loader: Callable[[SectorSnapshot], list[str]] | None = None,
+        *,
+        publish: bool = True,
     ) -> list[SectorFlowSeries]:
         trade_date = str(snapshot.source_status.get("trade_date") or china_now().strftime("%Y%m%d"))
         live_mode = snapshot.data_mode == "live" or snapshot.source_status.get("active_source") == "easy_tdx"
@@ -6387,30 +6722,31 @@ class DashboardService:
             anchored.append(next_series)
         # 锚定把 final_value 换成真值后必须按真值重排，否则榜单顺序与数值矛盾
         result = sorted(anchored, key=lambda series: (series.final_value, series.heat_score), reverse=True)
-        with self._sector_flow_lock:
-            self._sector_flow_cache_by_key[cache_key] = (time.time(), result)
-            if len(self._sector_flow_cache_by_key) > 12:
-                oldest = min(self._sector_flow_cache_by_key, key=lambda item: self._sector_flow_cache_by_key[item][0])
-                self._sector_flow_cache_by_key.pop(oldest, None)
-                self._sector_flow_names_by_key.pop(oldest, None)
-            # 冷启动回灌合并：把分钟线历史按时间标签写进代理曲线的 points，
-            # 但保留 live 正在成形的最新一分钟（它的 tick 增量更及时），
-            # 分钟口径下无需累计偏移，天然无跳变。
-            proxy_state = self._sector_flow_proxy_by_key.get(cache_key)
-            if proxy_state is not None and proxy_state.get("trade_date") == trade_date:
-                for series in result:
-                    if not series.points:
-                        continue
-                    live_map = dict(proxy_state["points"].get(series.name) or {})
-                    forming_label = max(live_map) if live_map else ""
-                    merged = {
-                        point.time: float(point.value)
-                        for point in series.points
-                        if point.time and point.time != forming_label
-                    }
-                    merged.update(live_map)
-                    proxy_state["points"][series.name] = merged
-        self._persist_sector_flow_cloud(cache_key, trade_date, result, force=True)
+        if publish:
+            with self._sector_flow_lock:
+                self._sector_flow_cache_by_key[cache_key] = (time.time(), result)
+                if len(self._sector_flow_cache_by_key) > 12:
+                    oldest = min(self._sector_flow_cache_by_key, key=lambda item: self._sector_flow_cache_by_key[item][0])
+                    self._sector_flow_cache_by_key.pop(oldest, None)
+                    self._sector_flow_names_by_key.pop(oldest, None)
+                # 冷启动回灌合并：把分钟线历史按时间标签写进代理曲线的 points，
+                # 但保留 live 正在成形的最新一分钟（它的 tick 增量更及时），
+                # 分钟口径下无需累计偏移，天然无跳变。
+                proxy_state = self._sector_flow_proxy_by_key.get(cache_key)
+                if proxy_state is not None and proxy_state.get("trade_date") == trade_date:
+                    for series in result:
+                        if not series.points:
+                            continue
+                        live_map = dict(proxy_state["points"].get(series.name) or {})
+                        forming_label = max(live_map) if live_map else ""
+                        merged = {
+                            point.time: float(point.value)
+                            for point in series.points
+                            if point.time and point.time != forming_label
+                        }
+                        merged.update(live_map)
+                        proxy_state["points"][series.name] = merged
+            self._persist_sector_flow_cloud(cache_key, trade_date, result, force=True)
         return result
 
     @staticmethod

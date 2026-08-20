@@ -103,6 +103,10 @@ class TerminalDeltaTracker:
             return None
         return {"type": "delta", "seq": self.seq, "sections": sections}
 
+    def snapshot_message(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Build a full snapshot from the channel's latest terminal payload."""
+        return {"type": "snapshot", "seq": self.seq, "data": payload}
+
     def _record(self, payload: dict[str, Any]) -> None:
         for key in _REPLACE_SECTIONS:
             self._section_sigs[key] = _sig(payload.get(key))

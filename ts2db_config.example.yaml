@@ -4,6 +4,15 @@
 # Tushare / EOD ingest
 tushare_token: ""
 
+# EOD 落库（本地 MySQL，库不存在时 ingest 自动创建）
+db_config:
+  db_type: mysql
+  host: 127.0.0.1
+  port: 3306
+  db: watchtower_eod
+  user: root
+  pwd: ""
+
 # Optional AI providers. The first non-empty provider wins.
 cf_base_url: ""
 cf_key: ""

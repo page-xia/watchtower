@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { X, Star, Sparkles } from "lucide-react"
-import { getDetailDaily, getDetailExtras, getSignalChart, getSignalOverlay, runAiAnalysis } from "@/lib/api"
+import { getDetailExtras, runAiAnalysis } from "@/lib/api"
+import { useLiveChannel } from "@/hooks/useLiveChannel"
 import { usePolling } from "@/hooks/usePolling"
 import { fmtPct, fmtPrice, pctClass } from "@/lib/format"
 import { SignalBadge } from "@/components/widgets"
@@ -11,7 +12,7 @@ import { TapePanel } from "@/components/detail/TapePanel"
 import { ConfluenceCard, FormulaCard, RiskRewardCard } from "@/components/detail/DetailSide"
 import { DetailTabs } from "@/components/detail/DetailTabs"
 import { cn } from "@/lib/utils"
-import type { DailyMainFormula, StockTags } from "@/types/api"
+import type { DailyDetailResponse, DailyMainFormula, SignalChartResponse, SignalOverlayResponse, StockTags } from "@/types/api"
 
 interface StockDetailProps {
   code: string
@@ -23,8 +24,8 @@ interface StockDetailProps {
 
 export function StockDetail({ code, onClose, onToggleWatch, watchlisted, watchlistCodes }: StockDetailProps) {
   const watchlistKey = watchlistCodes.join(",")
-  const chartState = usePolling(() => getSignalChart(code, watchlistCodes), 10000, [code, watchlistKey])
-  const overlayState = usePolling(() => getSignalOverlay(code, watchlistCodes), 10000, [code, watchlistKey])
+  const chartState = useLiveChannel<SignalChartResponse>("detail_chart", { code, watchlistCodes })
+  const overlayState = useLiveChannel<SignalOverlayResponse>("detail_overlay", { code, watchlistCodes })
   const coreExtrasState = usePolling(
     () =>
       getDetailExtras(code, watchlistCodes, {
@@ -38,12 +39,12 @@ export function StockDetail({ code, onClose, onToggleWatch, watchlisted, watchli
     0,
     [code, watchlistKey],
   )
-  // 分时 / 日K 主图视图 + 日K副图选择；日K载荷（公式/筹码/题材标签）30s 轮询
+  // 分时 / 日K 主图视图 + 日K副图选择；日K载荷（公式/筹码/题材标签）走 30s WS 频道
   const [chartView, setChartView] = useState<"minute" | "daily">("minute")
   const [subView, setSubView] = useState<DailySubView>("resonance")
   // 日K向前拖动动态加载：count 240 → 480 → 720 → 800（后端上限 800）
   const [dailyCount, setDailyCount] = useState(240)
-  const dailyState = usePolling(() => getDetailDaily(code, dailyCount), 30000, [code, dailyCount])
+  const dailyState = useLiveChannel<DailyDetailResponse>("detail_daily", { code, count: dailyCount })
   const dailyLoadingMore = dailyState.loading && dailyState.data != null
   const handleNeedMoreHistory = useCallback(() => {
     setDailyCount((c) => (c >= 800 ? c : Math.min(800, c + 240)))
@@ -352,7 +353,7 @@ function DailyInfoOverlay({ main }: { main: DailyMainFormula }) {
       {tomorrow && (
         <div className="border-t border-border/50 pt-0.5 text-[9px] leading-snug">
           <span className="num text-down">阻力 {tomorrow.resistance.toFixed(2)} · 突破 {tomorrow.breakthrough.toFixed(2)}</span>
-          <span className="text-muted-foreground/60">　</span>
+          <span className="text-muted-foreground/60">&nbsp;</span>
           <span className="num text-up">支撑 {tomorrow.support.toFixed(2)} · 反转 {tomorrow.reverse.toFixed(2)}</span>
         </div>
       )}

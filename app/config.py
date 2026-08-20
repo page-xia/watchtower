@@ -56,6 +56,13 @@ class AppSettings:
             os.getenv("WATCH_CLOUDBASE_MYSQL_SCHEMA", self.cloudbase_env_id).strip() or self.cloudbase_env_id
         )
         self.cloudbase_mysql_openid = os.getenv("WATCH_CLOUDBASE_MYSQL_OPENID", "watchtower").strip() or "watchtower"
+        # 消息存储直连 MySQL（WATCH_MESSAGE_STORE_BACKEND=mysql，目标阿里云 RDS）：
+        # 连接参数只走环境变量，不落 ts2db_config.yaml。
+        self.msg_mysql_host = os.getenv("WATCH_MSG_MYSQL_HOST", "").strip()
+        self.msg_mysql_port = int(os.getenv("WATCH_MSG_MYSQL_PORT", "3306"))
+        self.msg_mysql_user = os.getenv("WATCH_MSG_MYSQL_USER", "").strip()
+        self.msg_mysql_pwd = os.getenv("WATCH_MSG_MYSQL_PWD", "")
+        self.msg_mysql_db = os.getenv("WATCH_MSG_MYSQL_DB", "").strip()
         self.cloudbase_state_collection = (
             os.getenv("WATCH_CLOUDBASE_STATE_COLLECTION", "watchtower_state").strip() or "watchtower_state"
         )
@@ -173,10 +180,13 @@ class AppSettings:
         self.transaction_rows = int(os.getenv("WATCH_TRANSACTION_ROWS", "240"))
         self.auction_history_max_points = int(os.getenv("WATCH_AUCTION_HISTORY_MAX_POINTS", "180"))
         self.auction_history_file = Path(os.getenv("WATCH_AUCTION_HISTORY_FILE", str(AUCTION_HISTORY_FILE)))
-        # 暗盘资金模块：官方口径读本地 tushare_eod.sqlite（300s TTL），
+        # 暗盘资金模块：官方口径走 EOD 访问层（app/eod_store.py，整包 300s TTL），
+        # 本地默认 pymysql 直连 MySQL（watchtower_eod 库，db_config 可覆盖），
+        # 生产云托管 WATCH_EOD_STORE_BACKEND=cloudbase_snapshot 读 NoSQL 预计算快照；
         # 盘中资金地图走东财快照缓存（WATCH_EM_MONEYFLOW=0 关闭，TTL 见 em_moneyflow.py）；
         # 均与 5 秒大盘刷新循环完全隔离；WATCH_DARK_POOL=0 可整体关闭。
         self.dark_pool_enabled = os.getenv("WATCH_DARK_POOL", "1").lower() in {"1", "true", "yes"}
+        self.eod_store_backend = os.getenv("WATCH_EOD_STORE_BACKEND", "mysql").strip().lower() or "mysql"
         self.opening_decision_file = Path(
             os.getenv("WATCH_OPENING_DECISION_FILE", str(OPENING_DECISION_FILE))
         )
@@ -187,6 +197,30 @@ class AppSettings:
     @property
     def secret_config(self) -> dict[str, Any]:
         return load_yaml(self.config_file, {})
+
+    @property
+    def eod_db_config(self) -> dict[str, Any]:
+        """本地 MySQL 连接配置：ts2db_config.yaml 的 db_config，环境变量优先。"""
+        raw = self.secret_config.get("db_config")
+        cfg = dict(raw) if isinstance(raw, dict) else {}
+        return {
+            "host": os.getenv("WATCH_EOD_MYSQL_HOST", str(cfg.get("host") or "127.0.0.1")).strip(),
+            "port": int(os.getenv("WATCH_EOD_MYSQL_PORT", str(cfg.get("port") or 3306))),
+            "user": os.getenv("WATCH_EOD_MYSQL_USER", str(cfg.get("user") or "root")).strip(),
+            "pwd": os.getenv("WATCH_EOD_MYSQL_PWD", str(cfg.get("pwd") or cfg.get("password") or "")),
+            "db": os.getenv("WATCH_EOD_MYSQL_DB", str(cfg.get("db") or "watchtower_eod")).strip(),
+        }
+
+    @property
+    def msg_mysql_config(self) -> dict[str, Any]:
+        """消息存储直连 MySQL 配置（阿里云 RDS），对应实例属性在 __init__ 读取环境变量。"""
+        return {
+            "host": self.msg_mysql_host,
+            "port": self.msg_mysql_port,
+            "user": self.msg_mysql_user,
+            "pwd": self.msg_mysql_pwd,
+            "db": self.msg_mysql_db,
+        }
 
     @property
     def public_source_status(self) -> dict[str, Any]:
@@ -244,12 +278,15 @@ class AppSettings:
             "background_collector_enabled": self.background_collector_enabled,
             "persistence_backend": self.persistence_backend,
             "message_store_backend": self.message_store_backend,
-            "message_store_configured": bool(
-                self.message_store_backend == "cloudbase_mysql"
-                and self.cloudbase_env_id
-                and self.cloudbase_api_token
-                and self.cloudbase_mysql_instance
-                and self.cloudbase_mysql_schema
+            "message_store_configured": (
+                bool(self.msg_mysql_host and self.msg_mysql_user and self.msg_mysql_db)
+                if self.message_store_backend == "mysql"
+                else bool(
+                    self.cloudbase_env_id
+                    and self.cloudbase_api_token
+                    and self.cloudbase_mysql_instance
+                    and self.cloudbase_mysql_schema
+                )
             ),
             "cloudbase_mysql_instance": self.cloudbase_mysql_instance,
             "cloudbase_mysql_schema": self.cloudbase_mysql_schema,

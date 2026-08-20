@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { getIndexMinutes } from "@/lib/api"
 import { syncPushCodes } from "@/lib/pushSubscription"
 import {
   applyLocalWatchlistToPayload,
@@ -10,10 +9,10 @@ import {
   upsertLocalWatchlist,
   watchlistCodes,
 } from "@/lib/localWatchlist"
-import { usePolling } from "@/hooks/usePolling"
+import { useLiveChannel } from "@/hooks/useLiveChannel"
 import { useTerminalStream } from "@/hooks/useTerminalStream"
 import { refreshPolicyFromPayload } from "@/lib/marketRefresh"
-import type { BoardItem } from "@/types/api"
+import type { BoardItem, IndexMinutesResponse } from "@/types/api"
 import { TopBar } from "@/components/TopBar"
 import { MarketStrip } from "@/components/MarketStrip"
 import { SectorPanel } from "@/components/SectorPanel"
@@ -24,8 +23,6 @@ import { DarkPoolPanel } from "@/components/DarkPoolPanel"
 import { StockBoardPanel } from "@/components/StockBoard"
 import { RightRail } from "@/components/RightRail"
 import { StockDetail } from "@/components/detail/StockDetail"
-
-const INDEX_REFRESH_MS = 10000
 
 export default function App() {
   const [sector, setSector] = useState<string | null>(null)
@@ -45,12 +42,11 @@ export default function App() {
     void syncPushCodes(localWatchlistCodes)
   }, [localWatchlistCodes])
 
-  // 单条 WebSocket 增量流替代原三路轮询中的两路：
-  // 连接时全量快照，之后只推变化分区（榜单按 code upsert/remove/order）。
-  // 指数分钟共振序列保持独立的慢速轮询（10s，append-only 低频数据）。
+  // 全页共用一条持久 /ws/live：终端、指数分钟线、暗盘资金都在同一连接上
+  // 订阅/切换；页面交互只换频道，不关闭浏览器 WebSocket。
   const stream = useTerminalStream({ sector, boardLevel, sort, page, pageSize: 40, nearTrend, pinBuy, watchlistCodes: localWatchlistCodes })
   const refreshStream = stream.refresh
-  const indexMinutes = usePolling(() => getIndexMinutes(), INDEX_REFRESH_MS, [])
+  const indexMinutes = useLiveChannel<IndexMinutesResponse>("index_minutes", {})
 
   const data = useMemo(() => applyLocalWatchlistToPayload(stream.data, localWatchlist), [stream.data, localWatchlist])
   // 休市判定：盘后/非交易日后端会冻结并停流，此时断线属正常“休息中”而非连接异常

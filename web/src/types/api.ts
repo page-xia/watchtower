@@ -132,6 +132,23 @@ export interface RiskReward {
   risks: string[]
 }
 
+/** 做T公式榜单紧凑快照：趋势多空 / 资金态度（外盘/内盘口径）/ 评分建议 */
+export interface TAnalysis {
+  available: boolean
+  trend_text: string
+  trend_bull: boolean | null
+  fund_pct: number
+  fund_text: string
+  fund_attitude: string
+  fund_available: boolean
+  position_text: string
+  vwap_relation: string
+  score: number
+  advice: string
+  advice_label: string
+  advice_detail: string
+}
+
 export interface BoardItem {
   code: string
   name: string
@@ -181,6 +198,7 @@ export interface BoardItem {
   auction?: AuctionInfo
   risk_reward?: RiskReward
   mini_chart?: MiniChart
+  t_analysis?: TAnalysis
 }
 
 export interface StockBoard {
@@ -824,6 +842,7 @@ export interface DarkPoolStockPayload {
   as_of: string
   note?: string
   eod_available?: boolean
+  pending?: boolean
   trade_date?: string
   flow_10d?: DarkPoolStockFlowDay[]
   verdict?: DarkPoolStockVerdict

@@ -12,7 +12,9 @@ node_modules/
 
 logs/
 *.log
-data/runtime/
+data/runtime/*
+!data/runtime/
+!data/runtime/tushare_eod.sqlite
 data/watchlist.json
 data/positions.json
 data/*.local.*

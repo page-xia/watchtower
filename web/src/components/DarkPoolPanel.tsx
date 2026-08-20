@@ -1,7 +1,6 @@
 import { useState } from "react"
 import { X } from "lucide-react"
-import { usePolling } from "@/hooks/usePolling"
-import { getDarkPool } from "@/lib/api"
+import { useLiveChannel } from "@/hooks/useLiveChannel"
 import { fmtAmount, fmtPct, pctClass } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type {
@@ -11,9 +10,8 @@ import type {
   DarkPoolInstRow,
   DarkPoolNorthRow,
   DarkPoolSectorBucket,
+  DarkPoolPayload,
 } from "@/types/api"
-
-const REFRESH_MS = 60000 // 独立慢轮询：东财快照后端 90s TTL / EOD 本地库 300s TTL，前端 60s 取缓存即可
 
 function TagChip({ text, tone }: { text: string; tone: "up" | "down" | "gold" | "mute" }) {
   const cls =
@@ -204,10 +202,10 @@ interface DarkPoolPanelProps {
  * ① 暗吸/暗派：Tushare moneyflow 多日窗口 × 价格背离（核心）；
  * ② 大手场外：北向十大成交（仅成交额）/ 大宗交易折溢价 / 龙虎榜机构席位；
  * ③ 盘中资金地图：东财 push2 全市场资金流（推断口径），板块归组走 easy_tdx 申万映射。
- * 独立 60s 轮询 /api/dark-pool，后端只读缓存/本地库，不进主流刷新链路。
+ * 走持久 /ws/live 的 dark_pool 频道（60s 服务端节奏），后端只读缓存/本地库。
  */
 export function DarkPoolPanel({ selected = null, boardLevel = 3, onSelectSector }: DarkPoolPanelProps) {
-  const { data } = usePolling(() => getDarkPool(selected, boardLevel), REFRESH_MS, [selected, boardLevel])
+  const { data } = useLiveChannel<DarkPoolPayload>("dark_pool", { sector: selected, boardLevel })
   const [absTab, setAbsTab] = useState<"in" | "out">("in")
   const [offTab, setOffTab] = useState<"north" | "block" | "inst">("north")
   const [emTab, setEmTab] = useState<"sector" | "in" | "out">("sector")

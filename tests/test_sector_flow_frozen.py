@@ -1,11 +1,10 @@
-"""Regression test: frozen/closed context must rebuild sector flow from the
-local trajectory instead of partial after-hours TDX minute fetches."""
+"""Regression tests for frozen/closed sector-flow recovery and quality gates."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-from app.models import SectorFlowSeries
+from app.models import SectorFlowPoint, SectorFlowSeries
 from app.services import DashboardService
 
 
@@ -20,6 +19,13 @@ def _sectors() -> list[SimpleNamespace]:
     return [SimpleNamespace(name="半导体"), SimpleNamespace(name="PCB")]
 
 
+def _complete_points() -> list[SectorFlowPoint]:
+    labels = [f"09:{minute:02d}" for minute in range(31, 60)]
+    labels += [f"10:{minute:02d}" for minute in range(50)]
+    labels += ["15:00"]
+    return [SectorFlowPoint(time=label, value=0.1) for label in labels]
+
+
 def test_frozen_sector_flow_prefers_local_trajectory(monkeypatch) -> None:
     service = DashboardService.__new__(DashboardService)
     service._sector_flow_lock = __import__("threading").Lock()
@@ -32,8 +38,8 @@ def test_frozen_sector_flow_prefers_local_trajectory(monkeypatch) -> None:
     )
 
     expected = [
-        SectorFlowSeries(name="半导体", heat_score=80, final_value=80.0, change_pct=1.2, points=[]),
-        SectorFlowSeries(name="PCB", heat_score=70, final_value=70.0, change_pct=0.8, points=[]),
+        SectorFlowSeries(name="半导体", heat_score=80, final_value=80.0, change_pct=1.2, points=_complete_points()),
+        SectorFlowSeries(name="PCB", heat_score=70, final_value=70.0, change_pct=0.8, points=_complete_points()),
     ]
     calls = {"trajectory": 0, "build": 0}
 

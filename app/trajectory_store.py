@@ -1692,6 +1692,66 @@ class IntradayWatchtowerStore:
                 output[name] = series
         return output
 
+    def latest_order_flows_by_code(
+        self,
+        trade_date: str,
+        captured_at: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """每只票当天（≤帧时间）最近一次的盘口快照（order_flow 完整 payload），按 code 索引。
+
+        盘口数据持久化在 order_flow_trajectory（quote 主帧里被剥离以瘦身）；
+        冷启动从本地轨迹引导上下文时用它把盘口字段回填给 quotes。
+        按 code 取各自最近批次而非全市场同一批次：高频采集集随时间变化，
+        单一末批会漏掉白天早些时候才入集的票。
+        """
+        normalized_date = str(trade_date or "").strip()
+        if not self.enabled or not self.path.exists() or not normalized_date:
+            return {}
+        try:
+            with self._lock, self._read_connect() as connection:
+                # 按每只票取当天（≤帧时间）最近一个批次：只取最后一批会漏掉当天
+                # 早些时间才入过高频集的票；分组子查询走 (trade_date, captured_at, code)
+                # 覆盖索引，无需回表，几万行扫描为启动期一次性成本。
+                if captured_at:
+                    rows = connection.execute(
+                        """
+                        SELECT f.code, f.payload_json
+                        FROM order_flow_trajectory f
+                        JOIN (
+                            SELECT code, MAX(captured_at) AS latest_at
+                            FROM order_flow_trajectory
+                            WHERE trade_date = ? AND captured_at <= ?
+                            GROUP BY code
+                        ) m ON f.code = m.code AND f.captured_at = m.latest_at
+                        WHERE f.trade_date = ?
+                        """,
+                        (normalized_date, str(captured_at), normalized_date),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT f.code, f.payload_json
+                        FROM order_flow_trajectory f
+                        JOIN (
+                            SELECT code, MAX(captured_at) AS latest_at
+                            FROM order_flow_trajectory
+                            WHERE trade_date = ?
+                            GROUP BY code
+                        ) m ON f.code = m.code AND f.captured_at = m.latest_at
+                        WHERE f.trade_date = ?
+                        """,
+                        (normalized_date, normalized_date),
+                    ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        output: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            code = str(row["code"] or "").zfill(6)
+            payload = self._loads(row["payload_json"])
+            if code and isinstance(payload, dict) and payload.get("available"):
+                output[code] = payload
+        return output
+
     def latest_context_payload(self, trade_date: str | None = None) -> dict[str, Any] | None:
         """Return the latest persisted dashboard frame without contacting upstream data sources."""
 

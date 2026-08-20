@@ -2095,6 +2095,9 @@ def test_sector_flow_deferred_frozen_restores_cloud_state(tmp_path, monkeypatch)
         },
     )
     cache_key = "20260810|live|easy_tdx|unit-test-cloud-flow"
+    complete_labels = [f"09:{minute:02d}" for minute in range(31, 60)]
+    complete_labels += [f"10:{minute:02d}" for minute in range(50)]
+    complete_labels += ["15:00"]
     cloud.set_json(
         "sector_flow",
         cache_key,
@@ -2106,7 +2109,10 @@ def test_sector_flow_deferred_frozen_restores_cloud_state(tmp_path, monkeypatch)
                     "heat_score": 80,
                     "final_value": 1.2,
                     "change_pct": 2.2,
-                    "points": [{"time": "14:59", "value": 0.4}, {"time": "15:00", "value": 0.8}],
+                    "points": [
+                        {"time": label, "value": round(index * 0.01, 2)}
+                        for index, label in enumerate(complete_labels, start=1)
+                    ],
                 }
             ],
         },
@@ -2125,7 +2131,228 @@ def test_sector_flow_deferred_frozen_restores_cloud_state(tmp_path, monkeypatch)
     )
 
     assert [item.name for item in series] == ["PCB"]
-    assert [point.time for point in series[0].points] == ["14:59", "15:00"]
+    assert series[0].points[0].time == "09:31"
+    assert series[0].points[-1].time == "15:00"
+
+
+def test_sector_flow_deferred_frozen_rejects_incomplete_cloud_state(tmp_path, monkeypatch) -> None:
+    """同日收盘只剩尾盘几点的持久化曲线不能冒充完整板块资金数据。"""
+    service = make_service(tmp_path)
+    cloud = MemoryStateStore()
+    service.state_store = cloud
+    sectors = [sector("PCB", "300476")]
+    quotes = [quote("300476", "胜宏科技", ["PCB"])]
+    snapshot = MarketSnapshot(
+        quotes=quotes,
+        indices=[],
+        data_mode="live",
+        source_status={
+            "active_source": "easy_tdx",
+            "trade_date": "20260820",
+            "clock_label": "15:00:00",
+            "frozen": True,
+        },
+    )
+    cache_key = "20260820|live|easy_tdx|unit-test-incomplete-cloud-flow"
+    cloud.set_json(
+        "sector_flow",
+        cache_key,
+        {
+            "trade_date": "20260820",
+            "series": [
+                {
+                    "name": "PCB",
+                    "heat_score": 80,
+                    "final_value": 1.2,
+                    "change_pct": 2.2,
+                    "points": [{"time": "14:59", "value": 0.4}, {"time": "15:00", "value": 0.8}],
+                }
+            ],
+        },
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_schedule_sector_flow_trajectory_refresh",
+        lambda key, *_args, **_kwargs: scheduled.append(key),
+    )
+
+    series = service._sector_flow_for_context(
+        snapshot,
+        sectors,
+        cache_namespace="unit-test-incomplete-cloud-flow",
+        allow_deferred=True,
+    )
+
+    assert series == []
+    assert scheduled == [cache_key]
+
+
+def test_sector_flow_deferred_frozen_rejects_mixed_complete_and_sparse_cloud_state(tmp_path, monkeypatch) -> None:
+    """云端列表只要有一个板块残缺，就不能回显剩余半套榜单。"""
+    service = make_service(tmp_path)
+    cloud = MemoryStateStore()
+    service.state_store = cloud
+    sectors = [sector("完整", "300476"), sector("残缺", "300308")]
+    quotes = [
+        quote("300476", "完整票", ["完整"]),
+        quote("300308", "残缺票", ["残缺"]),
+    ]
+    snapshot = MarketSnapshot(
+        quotes=quotes,
+        indices=[],
+        data_mode="live",
+        source_status={
+            "active_source": "easy_tdx",
+            "trade_date": "20260820",
+            "clock_label": "15:00:00",
+            "frozen": True,
+        },
+    )
+    cache_key = "20260820|live|easy_tdx|unit-test-mixed-cloud-flow"
+    complete_labels = [f"09:{minute:02d}" for minute in range(31, 60)]
+    complete_labels += [f"10:{minute:02d}" for minute in range(50)]
+    complete_labels += ["15:00"]
+    cloud.set_json(
+        "sector_flow",
+        cache_key,
+        {
+            "trade_date": "20260820",
+            "series": [
+                {
+                    "name": "完整",
+                    "heat_score": 80,
+                    "final_value": 1.2,
+                    "change_pct": 2.2,
+                    "points": [{"time": label, "value": 0.1} for label in complete_labels],
+                },
+                {
+                    "name": "残缺",
+                    "heat_score": 70,
+                    "final_value": 0.8,
+                    "change_pct": 1.2,
+                    "points": [{"time": "14:59", "value": 0.4}, {"time": "15:00", "value": 0.4}],
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(service, "_schedule_sector_flow_trajectory_refresh", lambda *args, **kwargs: None)
+
+    series = service._sector_flow_for_context(
+        snapshot,
+        sectors,
+        cache_namespace="unit-test-mixed-cloud-flow",
+        allow_deferred=True,
+    )
+
+    assert series == []
+
+
+def test_sector_flow_deferred_frozen_rejects_missing_expected_cloud_sector(tmp_path, monkeypatch) -> None:
+    """返回的一条曲线即使完整，也不能掩盖当前应展示的另一板块整条缺失。"""
+    service = make_service(tmp_path)
+    cloud = MemoryStateStore()
+    service.state_store = cloud
+    sectors = [sector("完整", "300476"), sector("整条缺失", "300308")]
+    quotes = [
+        quote("300476", "完整票", ["完整"]),
+        quote("300308", "缺失票", ["整条缺失"]),
+    ]
+    snapshot = MarketSnapshot(
+        quotes=quotes,
+        indices=[],
+        data_mode="live",
+        source_status={
+            "active_source": "easy_tdx",
+            "trade_date": "20260820",
+            "clock_label": "15:00:00",
+            "frozen": True,
+        },
+    )
+    cache_key = "20260820|live|easy_tdx|unit-test-missing-cloud-sector"
+    labels = [f"09:{minute:02d}" for minute in range(31, 60)]
+    labels += [f"10:{minute:02d}" for minute in range(50)]
+    labels += ["15:00"]
+    cloud.set_json(
+        "sector_flow",
+        cache_key,
+        {
+            "trade_date": "20260820",
+            "series": [
+                {
+                    "name": "完整",
+                    "heat_score": 80,
+                    "final_value": 1.2,
+                    "change_pct": 2.2,
+                    "points": [{"time": label, "value": 0.1} for label in labels],
+                }
+            ],
+        },
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_schedule_sector_flow_trajectory_refresh",
+        lambda key, *_args, **_kwargs: scheduled.append(key),
+    )
+
+    series = service._sector_flow_for_context(
+        snapshot,
+        sectors,
+        cache_namespace="unit-test-missing-cloud-sector",
+        allow_deferred=True,
+    )
+
+    assert series == []
+    assert scheduled == [cache_key]
+
+
+def test_live_sector_flow_does_not_return_partial_cached_board_set(tmp_path, monkeypatch) -> None:
+    """盘中缓存也要覆盖 expected 板块集合，不能用一条完整曲线掩盖整条缺失。"""
+    service = make_service(tmp_path)
+    sectors = [sector("完整", "300476"), sector("整条缺失", "300308")]
+    quotes = [
+        quote("300476", "完整票", ["完整"]),
+        quote("300308", "缺失票", ["整条缺失"]),
+    ]
+    snapshot = MarketSnapshot(
+        quotes=quotes,
+        indices=[],
+        data_mode="live",
+        source_status={
+            "active_source": "easy_tdx",
+            "trade_date": "20260820",
+            "clock_label": "15:00:00",
+            "frozen": False,
+        },
+    )
+    cache_key = "20260820|live|easy_tdx|unit-test-live-partial-cache"
+    labels = [f"09:{minute:02d}" for minute in range(31, 60)]
+    labels += [f"10:{minute:02d}" for minute in range(50)]
+    labels += ["15:00"]
+    service._sector_flow_cache_by_key[cache_key] = (
+        time.time(),
+        [
+            SectorFlowSeries(
+                name="完整",
+                heat_score=80,
+                final_value=1.2,
+                change_pct=2.2,
+                points=[SectorFlowPoint(time=label, value=0.1) for label in labels],
+            )
+        ],
+    )
+    monkeypatch.setattr(service, "_sector_flow_proxy_tick", lambda *args, **kwargs: [])
+    monkeypatch.setattr(service, "_ensure_sector_flow_refresh", lambda *args, **kwargs: None)
+
+    series = service._sector_flow_for_context(
+        snapshot,
+        sectors,
+        cache_namespace="unit-test-live-partial-cache",
+        prefer_async=True,
+    )
+
+    assert series == []
 
 
 def test_sector_flow_deferred_frozen_builds_once_when_cloud_state_empty(tmp_path, monkeypatch) -> None:
@@ -2149,17 +2376,36 @@ def test_sector_flow_deferred_frozen_builds_once_when_cloud_state_empty(tmp_path
             "heat_score": 80,
             "final_value": 1.2,
             "change_pct": 2.2,
-            "points": [{"time": "09:31", "value": 0.4}, {"time": "09:32", "value": 0.8}],
+            "points": [
+                {"time": label, "value": round(index * 0.01, 2)}
+                for index, label in enumerate(
+                    [
+                        *[f"09:{minute:02d}" for minute in range(31, 60)],
+                        *[f"10:{minute:02d}" for minute in range(50)],
+                        "15:00",
+                    ],
+                    start=1,
+                )
+            ],
         }
     ]
     calls = []
 
-    def fake_build(cache_key, snapshot_arg, sectors_arg, member_code_loader=None):
+    def fake_build(cache_key, snapshot_arg, sectors_arg, member_code_loader=None, **_kwargs):
         calls.append(cache_key)
         return [SectorFlowSeries.model_validate(item) for item in expected]
 
     monkeypatch.setattr(service, "_build_and_cache_sector_flow", fake_build)
 
+    series = service._sector_flow_for_context(
+        snapshot,
+        sectors,
+        cache_namespace="unit-test-empty-cloud-flow",
+        allow_deferred=True,
+    )
+
+    for thread in list(service._sector_flow_refresh_threads.values()):
+        thread.join(timeout=10)
     series = service._sector_flow_for_context(
         snapshot,
         sectors,

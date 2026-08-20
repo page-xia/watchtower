@@ -57,32 +57,45 @@ npm run dev
 
 前端默认运行在 `http://localhost:7100`，通过 Vite 代理把 `/api` 和 `/ws` 转到后端 `127.0.0.1:8788`。后端不在该端口时，可用 `WATCH_BACKEND=http://127.0.0.1:8790` 覆盖。
 
-## CloudBase 部署
+## 生产部署（阿里云轻量服务器）
 
-项目提供一键部署脚本，默认部署到生产环境 `server-d2g7x597t019f5cb0` 的 CloudRun 服务 `watchtower`：
+生产环境跑在阿里云轻量应用服务器 `47.116.20.229`：Docker 容器运行 `watchtower:local` 镜像，宿主机 nginx 终结 TLS，域名 omnisource.xin / www.omnisource.xin（已启用 HTTPS，80 端口自动 301 跳转 443）。
 
-```powershell
-.\scripts\deploy_cloudbase.ps1
-```
-
-脚本会依次运行后端关键回归测试、构建 `web/dist`、调用 `scripts/package_cloudbase.ps1` 生成干净部署包、执行 `tcb cloudrun deploy --service-name watchtower --env-id server-d2g7x597t019f5cb0 --port 8788 --force`，最后检查生产接口 `/api/health`、`/api/dashboard?view=terminal`、`/api/indices/minutes` 和 `/api/sectors/rank`。
-
-首次使用前需要安装并登录 CloudBase CLI：
+日常更新用一键脚本（测试 → 前端构建 → 白名单打包 → 上传 → 服务器端 docker build → 重建容器 → HTTPS 冒烟检查）：
 
 ```powershell
-npm i -g @cloudbase/cli
-tcb login
+.\scripts\deploy_aliyun.ps1                         # 完整流程
+.\scripts\deploy_aliyun.ps1 -SkipTests              # 已单独确认测试通过
+.\scripts\deploy_aliyun.ps1 -SkipTests -SkipBuild   # 只改了后端 Python
 ```
 
-常用参数：
+脚本执行的就是下面这套手动流程（排障时可逐步对照）：
 
-```powershell
-.\scripts\deploy_cloudbase.ps1 -DryRun -SkipTests
-.\scripts\deploy_cloudbase.ps1 -SkipTests
-.\scripts\deploy_cloudbase.ps1 -SkipBuild -SkipVerify
+更新部署流程：
+
+1. 本地打包 `Dockerfile`、`pyproject.toml`、`app/`、`web/dist/`、`data/themes.yaml`、`data/trading_rules.yaml`，scp 到服务器 `/root/watchtower/`。
+2. 服务器上构建镜像：`docker build -t watchtower:local .`（服务器上的 Dockerfile 副本需加 `ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/`，docker 已配镜像加速器）。
+3. 重建容器：
+
+```bash
+docker rm -f watchtower
+docker run -d --name watchtower --restart unless-stopped \
+  -p 127.0.0.1:8788:8788 \
+  -v /root/watchtower/data:/data \
+  --env-file /root/watchtower/watchtower.env \
+  watchtower:local
 ```
 
-`-DryRun` 只构建和打包，不改云端资源。若测试阶段出现 `KeyboardInterrupt` 或失败，脚本会在部署前停止；已经单独确认测试通过时，可以用 `-SkipTests` 直接发布。部署后的 smoke check 会重试等待新实例脱离冷启动 bootstrap，并检查大盘分时、板块资金动能是否从早盘开始且尾部接近当前交易进度。部署包只包含 `app/`、`web/dist/`、`data/themes.yaml`、`data/trading_rules.yaml`、`pyproject.toml`、`Dockerfile` 和 `.dockerignore`；脚本会阻止 `ts2db_config.yaml`、本地自选、持仓和 `data/runtime` 进入生产包。
+容器只监听本机 `127.0.0.1:8788`；外部流量由宿主机 nginx 处理（80→443 跳转、HTTPS 反代到 8788，含 WebSocket 头）。站点配置在 `/etc/nginx/conf.d/omnisource.conf`（本地副本 `.deploy/omnisource-nginx.conf`），证书在 `/etc/nginx/ssl/omnisource.xin.{pem,key}`。证书为 DigiCert DV 免费证书，2026-11-15 到期，到期替换证书文件后 `nginx -s reload` 即可。
+
+部署后 smoke check：
+
+```text
+https://omnisource.xin/api/health
+https://omnisource.xin/api/dashboard?view=terminal
+https://omnisource.xin/api/indices/minutes
+https://omnisource.xin/api/sectors/rank
+```
 
 ## Web 前端
 
@@ -162,43 +175,27 @@ $env:WATCH_SECTOR_FLOW_REFRESH_SECONDS="20"
 
 ## 持久化与同步
 
-### CloudBase 云托管持久化
+### 生产持久化（阿里云 RDS + 数据卷）
 
-CloudBase CloudRun 容器文件系统不是持久化存储，实例重启、扩缩容或重新部署后，本地 `/tmp`、SQLite 和 JSON 文件都可能回到镜像初始状态。生产方案是保持服务无状态：高频行情轨迹仍写本地 SQLite 做运行期缓存，跨重启必须保留的小状态写入 CloudBase NoSQL，知识星球消息历史写入 CloudBase MySQL。
+生产容器保持无状态：高频行情轨迹写容器内 SQLite 做运行期缓存；跨重启必须保留的状态（自选股、持仓、运行态 SQLite）落在容器 `/data`，通过卷挂载持久化到宿主机 `/root/watchtower/data`。星球消息历史和收盘 EOD 数据统一写阿里云 RDS MySQL。
 
-当前镜像默认开启：
+当前容器环境变量要点：
 
 ```text
 WATCH_BACKGROUND_COLLECTOR=1
-WATCH_PERSISTENCE_BACKEND=cloudbase_nosql
-WATCH_CLOUDBASE_ENV_ID=server-d2g7x597t019f5cb0
-WATCH_CLOUDBASE_STATE_COLLECTION=watchtower_state
-WATCH_MESSAGE_STORE_BACKEND=cloudbase_mysql
-WATCH_CLOUDBASE_MYSQL_INSTANCE=default
-WATCH_CLOUDBASE_MYSQL_SCHEMA=server-d2g7x597t019f5cb0
+WATCH_PERSISTENCE_BACKEND=local
+WATCH_MESSAGE_STORE_BACKEND=mysql      # RDS watchtower_msg 库，WATCH_MSG_MYSQL_* 连接配置
+WATCH_EOD_STORE_BACKEND=mysql          # RDS watchtower_eod 库，WATCH_EOD_MYSQL_* 连接配置
 WATCH_DARK_POOL=1
 ```
 
-需要在 CloudBase 控制台准备 NoSQL 集合 `watchtower_state`，并在云托管服务环境变量里配置服务端 token：
+RDS 连接信息放在服务器 `/root/watchtower/watchtower.env`（环境变量文件，不进镜像、不进仓库）；RDS 白名单只放行服务器 47.116.20.229 和本机出口 IP（本机宽带 IP 变了要去 RDS 控制台改白名单）。EOD 数据由本机收盘后跑 `scripts/ingest_eod_tushare.py` 直接落 RDS（`--days N` 回填，`--only` 选数据集）。网页自选股同时保存在用户浏览器 `localStorage`，不同用户看到的自选互不影响。暗盘资金面板只读 EOD 库与东财快照缓存（后台一次性线程补齐），不进入 5 秒全市场刷新链路，也不再轮询磁带。
 
-```text
-WATCH_CLOUDBASE_API_TOKEN=<CloudBase API Key>
-```
-
-`WATCH_CLOUDBASE_API_TOKEN` 只能放在云托管环境变量或本机临时环境变量里，不要写进 Dockerfile、README、`ts2db_config.yaml` 或前端代码。默认实例和数据库都是 `(default)`；如使用非默认库，再设置：
-
-```text
-WATCH_CLOUDBASE_DATABASE_INSTANCE=(default)
-WATCH_CLOUDBASE_DATABASE_NAME=(default)
-```
-
-云端 NoSQL 会保存最新 dashboard 快照和官方板块成员缓存；CloudBase MySQL 会保存 `message_topics`、`message_events`、`message_event_links`、`message_sync_runs` 和物化证据表 `message_evidence_cache`。网页自选股保存在用户浏览器 `localStorage`，并通过请求参数传给看板和详情接口；不同用户看到的自选互不影响，也不会随部署包上传。容器重启后，服务优先从 NoSQL 恢复这些服务端轻量状态，并从 MySQL 读取星球消息证据；服务保持活跃时，后台采集器会继续按行情源重新构建本地轨迹缓存。暗盘资金面板只读本地 EOD 库与东财快照缓存（后台一次性线程补齐），不进入 5 秒全市场刷新链路，也不再轮询磁带。若希望减少冷启动和空档，CloudRun 建议设置最小实例数 `MinNum=1`；如果为了省成本设为 `0`，冷启动后仍可恢复云端持久数据，但运行期 SQLite 缓存需要重新采集。
-
-星球消息证据读取走物化缓存：详情页按 `(scope=stock/sector, cache_key=代码/板块词)` 直接读 `message_evidence_cache`（1~2 次索引查询，亚秒）；未命中的键走动态查询兜底并回写（read-through，空结果也缓存）；每次消息同步后后台自动重建受影响实体的物化值（含板块查询词与链接名的子串别名桥接）。全新部署或物化表被清空后，下一次同步会自动触发一次全量预建，也可手动触发 `POST /api/messages/evidence/prebuild`（需 ingest token）；`scripts/materialize_message_evidence.py` 可在临时开放 MySQL 直连时从本地一次性全量重建（语义与服务端一致）。
+星球消息证据读取走物化缓存：详情页按 `(scope=stock/sector, cache_key=代码/板块词)` 直接读 `message_evidence_cache`（1~2 次索引查询，亚秒）；未命中的键走动态查询兜底并回写（read-through，空结果也缓存）；每次消息同步后后台自动重建受影响实体的物化值（含板块查询词与链接名的子串别名桥接）。全新部署或物化表被清空后，下一次同步会自动触发一次全量预建，也可手动触发 `POST /api/messages/evidence/prebuild`（需 ingest token）；`scripts/materialize_message_evidence.py` 可从本地一次性全量重建（语义与服务端一致）。
 
 ### 知识星球消息同步
 
-盯盘系统运行时只读 CloudBase MySQL 中的消息表，不直接读取 `G:\ai\lh\zsxq`，也不再用项目本地 sqlite 保存星球消息。需要先用 MCP/控制台初始化 MySQL 表 `message_topics`、`message_events`、`message_event_links`、`message_sync_runs`、`message_evidence_cache`（`MessageStore.schema_statements()` 里有全部 DDL）。本地知识星球工程同步和归类完成后，用推送脚本把处理好的消息写入盯盘系统：
+盯盘系统运行时只读阿里云 RDS `watchtower_msg` 库中的消息表，不直接读取 `G:\ai\lh\zsxq`，也不再用项目本地 sqlite 保存星球消息。消息表为 `message_topics`、`message_events`、`message_event_links`、`message_sync_runs`、`message_evidence_cache`（`MessageStore.schema_statements()` 里有全部 DDL）。本地知识星球工程同步和归类完成后，用推送脚本把处理好的消息写入盯盘系统：
 
 ```powershell
 $env:WATCH_INGEST_TOKEN="your-local-secret"
@@ -206,7 +203,7 @@ $env:WATCH_INGEST_TOKEN="your-local-secret"
 .\.venv\Scripts\python.exe scripts\push_zsxq_messages.py --lookback-days 1 --media-mode fast --target-url http://127.0.0.1:8788 --token $env:WATCH_INGEST_TOKEN
 ```
 
-推送脚本会给每条主题带上 `media_kind`：`text`、`image`、`file`、`voice`、`mixed`。`--media-mode fast` 只推文本/图片；`--media-mode full` 会推全部类型。生产部署时同样只开放 `POST /api/ingest/zsxq/messages` 接收推送，token 放在生产后端环境变量 `WATCH_INGEST_TOKEN`；服务端会把批次写入 CloudBase MySQL。查看同步状态：
+推送脚本会给每条主题带上 `media_kind`：`text`、`image`、`file`、`voice`、`mixed`。`--media-mode fast` 只推文本/图片；`--media-mode full` 会推全部类型。生产部署时同样只开放 `POST /api/ingest/zsxq/messages` 接收推送，token 放在生产后端环境变量 `WATCH_INGEST_TOKEN`；服务端会把批次写入 RDS 消息库。查看同步状态：
 
 ```text
 GET /api/messages/status
@@ -217,7 +214,7 @@ GET /api/messages/status
 同时推送生产和本地时：
 
 ```powershell
-$env:WATCH_TARGET_URLS="https://你的生产域名;http://127.0.0.1:8788"
+$env:WATCH_TARGET_URLS="https://omnisource.xin;http://127.0.0.1:8788"
 ```
 
 ## 配置
@@ -227,7 +224,6 @@ $env:WATCH_TARGET_URLS="https://你的生产域名;http://127.0.0.1:8788"
 | 字段 | 必要性 | 说明 |
 | --- | --- | --- |
 | `tushare_token` | 必需（仅 `scripts/ingest_eod_tushare.py`） | 拉取 Tushare 收盘 EOD 数据。 |
-| `cf_base_url` + `cf_key` | 需要成组配置，二选一即可 | CloudBase AI 代理。`cf_model_id` 可选。 |
 | `deepseek-key` / `zhipu_key` / `bailian_key` / `huoshan_key` | 至少填一组即可 | 选择一个直连 AI 提供方。 |
 | `message_ingest_token` / `watch_ingest_token` | 可选 | 消息推送备用配置；生产更建议用 `WATCH_INGEST_TOKEN` 环境变量。 |
 | `news_api_key` | 可选 / 预留 | 当前只用于状态展示，主功能不依赖。 |
@@ -239,7 +235,7 @@ $env:WATCH_TARGET_URLS="https://你的生产域名;http://127.0.0.1:8788"
 - `web/src/lib/localWatchlist.ts`：网页自选股保存在浏览器 `localStorage`，默认不参与全市场股票板扫描。
 - `data/themes.yaml`：手工交易主题和核心票映射。
 - `data/trading_rules.yaml`：买 T、卖 T、板块强度等阈值。
-- CloudBase MySQL `message_*` 表：盯盘系统自己的星球消息库，由 ingest API 写入。
+- 阿里云 RDS `watchtower_msg` 库 `message_*` 表：盯盘系统自己的星球消息库，由 ingest API 写入。
 - `data/runtime/auction_snapshots.jsonl`：交易日内可行动竞价候选的采样轨迹。
 - `data/runtime/opening_decisions.jsonl`：盘中保存的真实开盘检查点快照，供收盘后复盘。
 - `ts2db_config.example.yaml`：空模板，复制成 `ts2db_config.yaml` 后再填写。

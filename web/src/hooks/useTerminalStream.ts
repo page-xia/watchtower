@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import type { BoardItem, StockBoard, TerminalPayload } from "@/types/api"
-import { shouldReconnectTerminalStream, type MarketRefreshPolicy } from "@/lib/marketRefresh"
-import { useDocumentHidden } from "@/hooks/useDocumentHidden"
+import { liveSocket, type LiveChannelPayload } from "@/lib/liveSocket"
+import { useLiveStatus } from "@/hooks/useLiveChannel"
 
 export interface TerminalStreamParams {
   sector?: string | null
@@ -35,15 +35,6 @@ interface DeltaMessage {
   data?: TerminalPayload
   sections?: Record<string, unknown> & { board?: BoardDelta }
 }
-
-interface MarketPhaseMessage {
-  type: "market_phase"
-  market_session?: string
-  traffic_mode?: string
-  refresh_policy?: MarketRefreshPolicy
-}
-
-type StreamMessage = DeltaMessage | MarketPhaseMessage
 
 const REPLACE_SECTIONS = [
   "market",
@@ -85,107 +76,45 @@ function applyDelta(prev: TerminalPayload, sections: NonNullable<DeltaMessage["s
   return next
 }
 
-function buildStreamUrl(params: TerminalStreamParams): string {
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:"
-  const q = new URLSearchParams()
-  q.set("view", "terminal")
-  q.set("format", "delta")
-  q.set("board_level", String(params.boardLevel ?? 3))
-  q.set("sort", params.sort ?? "activity")
-  q.set("page", String(params.page ?? 1))
-  q.set("page_size", String(params.pageSize ?? 40))
-  if (params.sector) q.set("sector", params.sector)
-  if (params.nearTrend) q.set("near_trend", "1")
-  if (params.pinBuy) q.set("pin_buy", "1")
-  q.set("watchlist_codes", (params.watchlistCodes ?? []).join(","))
-  return `${protocol}//${location.host}/ws/stream?${q.toString()}`
-}
-
 /**
- * 终端数据流：连接时收一次全量快照，之后只收变化分区（榜单按 code 增量）。
- * 未变化的榜单行保持对象引用不变，配合 React.memo 避免整表重绘。
- * 参数变化（板块/排序/翻页）时重连并重新拿快照；断线指数退避重连。
+ * 终端数据流：全页共用一条持久 /ws/live 连接。
+ * 连接后先收全量快照，之后只收变化分区（榜单按 code upsert/remove/order）。
+ * 板块/排序/翻页等交互只发送 subscribe 控制消息，服务端切换 StreamHub 频道，
+ * 不关闭浏览器 WebSocket；真实网络断开才由管理器指数退避重连。
  */
 export function useTerminalStream(params: TerminalStreamParams): TerminalStreamState {
   const [data, setData] = useState<TerminalPayload | null>(null)
-  const [connected, setConnected] = useState(false)
-  const [error, setError] = useState<string | null>(null)
   const [lastMessageAt, setLastMessageAt] = useState<number | null>(null)
-  const [nonce, setNonce] = useState(0)
   const dataRef = useRef<TerminalPayload | null>(null)
-  const streamPolicyRef = useRef<MarketRefreshPolicy | null>(null)
-  const documentHidden = useDocumentHidden()
-  dataRef.current = data
+  const status = useLiveStatus()
+  const paramsKey = JSON.stringify(params)
 
-  const refresh = useCallback(() => setNonce((n) => n + 1), [])
+  const refresh = useCallback(() => liveSocket.refresh("terminal"), [])
 
   useEffect(() => {
-    if (documentHidden) {
-      setConnected(false)
-      return
-    }
-    let ws: WebSocket | null = null
-    let closed = false
-    let retry = 0
-    let retryTimer: number | undefined
-
-    const connect = () => {
-      if (closed) return
-      ws = new WebSocket(buildStreamUrl(params))
-      ws.onopen = () => {
-        retry = 0
-        streamPolicyRef.current = null
-        setConnected(true)
-        setError(null)
-      }
-      ws.onmessage = (event) => {
-        let message: StreamMessage
-        try {
-          message = JSON.parse(event.data as string) as StreamMessage
-        } catch {
-          return
-        }
-        if (message.type === "market_phase") {
-          streamPolicyRef.current =
-            message.refresh_policy ?? {
-              market_session: message.market_session,
-              traffic_mode: message.traffic_mode,
-              should_stream: false,
-            }
-          return
-        }
-        if (message.type === "snapshot" && message.data) {
-          dataRef.current = message.data
-          setData(message.data)
-          setLastMessageAt(Date.now())
-        } else if (message.type === "delta" && message.sections && dataRef.current) {
-          const merged = applyDelta(dataRef.current, message.sections)
-          dataRef.current = merged
-          setData(merged)
-          setLastMessageAt(Date.now())
-        }
-      }
-      ws.onerror = () => {
-        setError("WebSocket 连接异常")
-      }
-      ws.onclose = () => {
-        setConnected(false)
-        if (closed) return
-        if (!shouldReconnectTerminalStream(dataRef.current, streamPolicyRef.current)) return
-        const delay = Math.min(1000 * 2 ** retry, 10000)
-        retry += 1
-        retryTimer = window.setTimeout(connect, delay)
+    const handleMessage = (message: LiveChannelPayload) => {
+      if (message.type === "snapshot" && message.data) {
+        dataRef.current = message.data as TerminalPayload
+        setData(message.data as TerminalPayload)
+        setLastMessageAt(Date.now())
+      } else if (message.type === "delta" && message.sections && dataRef.current) {
+        const merged = applyDelta(
+          dataRef.current,
+          message.sections as NonNullable<DeltaMessage["sections"]>,
+        )
+        dataRef.current = merged
+        setData(merged)
+        setLastMessageAt(Date.now())
       }
     }
 
-    connect()
-    return () => {
-      closed = true
-      if (retryTimer !== undefined) window.clearTimeout(retryTimer)
-      ws?.close()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [documentHidden, params.sector, params.boardLevel, params.sort, params.page, params.pageSize, params.nearTrend, params.pinBuy, params.watchlistCodes?.join(","), nonce])
+    const streamParams = JSON.parse(paramsKey) as TerminalStreamParams
+    return liveSocket.subscribe(
+      "terminal",
+      streamParams as unknown as Record<string, unknown>,
+      handleMessage,
+    )
+  }, [paramsKey])
 
-  return { data, connected, error, lastMessageAt, refresh }
+  return { data, connected: status.connected, error: status.error, lastMessageAt, refresh }
 }

@@ -530,6 +530,28 @@ class OpeningDecisionPayload(BaseModel):
     research: dict[str, Any] = Field(default_factory=dict)
 
 
+class BoardTAnalysis(BaseModel):
+    """做T公式（做T公式.md）的榜单紧凑快照：趋势多空 / 资金态度 / 评分建议。
+
+    全部由榜单既有数据派生（分钟涨幅缩略序列 + 五档外盘/内盘 + 做T压/支），
+    不新增逐笔轮询；大单分钟 A2/A3 口径仍只在详情页 formula_state 展示。
+    """
+
+    available: bool = False
+    trend_text: str = ""  # 多头强势/多头震荡/空头震荡/空头弱势
+    trend_bull: bool | None = None  # EMA30 > EMA900（强弱线）
+    fund_pct: float = 0  # (外盘-内盘)/(外盘+内盘)×100
+    fund_text: str = ""  # +12%
+    fund_attitude: str = ""  # 积极做多/偏多/偏空/积极做空
+    fund_available: bool = False
+    position_text: str = ""  # 突破阻力/强势区/弱势区/跌破支撑
+    vwap_relation: str = ""  # ↑均价/↓均价/≈均价
+    score: int = 0
+    advice: str = ""  # ★强推(85) 积极做多
+    advice_label: str = ""  # 强推/关注/观望/减仓/规避
+    advice_detail: str = ""
+
+
 class StockBoardItem(BaseModel):
     code: str
     name: str
@@ -583,6 +605,7 @@ class StockBoardItem(BaseModel):
     t_plus_one_restricted: bool = False
     risk_reward: RiskRewardPlan = Field(default_factory=RiskRewardPlan)
     mini_chart: MiniIntradaySeries = Field(default_factory=MiniIntradaySeries)
+    t_analysis: BoardTAnalysis = Field(default_factory=BoardTAnalysis)
 
 
 class StockBoardPayload(BaseModel):

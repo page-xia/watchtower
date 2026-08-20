@@ -1,12 +1,11 @@
 import { useMemo } from "react"
-import { usePolling } from "@/hooks/usePolling"
-import { getDarkPoolStock } from "@/lib/api"
+import { useLiveChannel } from "@/hooks/useLiveChannel"
 import { fmtAmount, fmtPct, pctClass } from "@/lib/format"
 import { chartPalette, useTheme } from "@/lib/theme"
 import { cn } from "@/lib/utils"
 import type { DarkPoolStockPayload } from "@/types/api"
 
-const POLL_MS = 60000 // 数据多为日频（东财盘中值 90s TTL），60s 轮询本地缓存即可
+const POLL_SECONDS = 5 // 本地库/缓存读取很轻；payload 不变时服务端不会发送消息
 
 const VERDICT_TONE: Record<string, "up" | "down" | "gold" | "mute"> = {
   疑似暗吸: "up",
@@ -78,13 +77,21 @@ function FlowBars({ data }: { data: NonNullable<DarkPoolStockPayload["flow_10d"]
  * （大宗/北向十大/龙虎榜）+ 两融。全部本地库 + 东财快照，零行情请求。
  */
 export function DarkPoolStockPane({ code }: { code: string }) {
-  const { data } = usePolling(() => getDarkPoolStock(code), POLL_MS, [code])
+  const { data } = useLiveChannel<DarkPoolStockPayload>("dark_pool_stock", {
+    code,
+    intervalSeconds: POLL_SECONDS,
+  })
 
   if (!data) {
     return <div className="p-3 text-center text-[10px] text-muted-foreground">暗盘资金加载中…</div>
   }
   if (!data.available || data.eod_available === false) {
-    return <div className="p-3 text-center text-[10px] text-muted-foreground">{data.note || "暗盘资金暂无数据"}</div>
+    return (
+      <div className="p-3 text-center text-[10px] text-muted-foreground">
+        {data.note || "暗盘资金暂无数据"}
+        {data.pending && <div className="mt-1 text-muted-foreground/70">等待本地管线推送，自动刷新中…</div>}
+      </div>
+    )
   }
 
   const verdict = data.verdict

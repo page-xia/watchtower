@@ -16,9 +16,17 @@
 
 个股摘要 stock_payload(code)：详情页右侧「暗盘资金」区使用。
 
+存储（2026-08-18 起 sqlite → 统一 EOD 访问层，见 app/eod_store.py）：
+
+- 本地：pymysql 直连 MySQL（watchtower_eod 库 eod_* 表），
+  由 scripts/ingest_eod_tushare.py 收盘后落库；
+- 生产云托管：容器访问不到本地库，EOD 面板/个股摘要由收盘管线预计算成
+  快照推送 CloudBase NoSQL（ingest --push-prod），本模块读快照并用容器
+  自己的 easy_tdx 映射回填名称/板块。
+
 性能边界（首页不能被拖慢）：
 
-- HTTP 端点只读内存缓存 / 本地 SQLite（带 TTL），永远不在请求路径上发
+- HTTP 端点只读内存缓存 / EOD 存储（带 TTL），永远不在请求路径上发
   行情网络请求；东财快照由 em_moneyflow.EMMoneyflowCache 后台一次性线程补齐；
 - 原「24 只自选股磁带大单推断慢循环」已下线（2026-08-18）：样本太小、
   口径与详情页磁带重复；逐笔磁带回归「个股详情按需读取」的既定边界。
@@ -27,17 +35,14 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-import sqlite3
 import time
 from typing import Any, Callable
 
 from app.config import AppSettings
 from app.data_sources import china_now, market_session
+from app.eod_store import EodStore, build_eod_store
 
 logger = logging.getLogger(__name__)
-
-EOD_DB_FILE = "tushare_eod.sqlite"
 
 # 暗吸/暗派判定窗口与阈值
 ABSORB_WINDOW_DAYS = 5       # 近 N 个交易日
@@ -49,7 +54,7 @@ EOD_CACHE_TTL_SECONDS = 300
 
 
 class DarkPoolMonitor:
-    """暗盘资金监控：官方口径本地库读取 + 东财盘中快照 + 板块联动过滤。"""
+    """暗盘资金监控：官方口径 EOD 存储读取 + 东财盘中快照 + 板块联动过滤。"""
 
     def __init__(
         self,
@@ -58,13 +63,14 @@ class DarkPoolMonitor:
         sector_mapper: Callable[[int], dict[str, str]] | None = None,
         sector_members_provider: Callable[[int], dict[str, list[str]]] | None = None,
         em_cache: Any = None,
+        eod_store: EodStore | None = None,
     ) -> None:
         self.settings = settings
         self._context_provider = context_provider
         self._sector_mapper = sector_mapper
         self._sector_members_provider = sector_members_provider
         self._em = em_cache
-        self._db_path = Path(settings.data_dir) / "runtime" / EOD_DB_FILE
+        self._store = eod_store or build_eod_store(settings)
 
         self._eod_cache: tuple[float, dict[str, Any]] | None = None
 
@@ -111,7 +117,7 @@ class DarkPoolMonitor:
         }
 
     def stock_payload(self, code: str) -> dict[str, Any]:
-        """个股暗盘资金摘要：详情页右栏使用。全部本地库 + 东财快照，零行情请求。"""
+        """个股暗盘资金摘要：详情页右栏使用。EOD 存储 + 东财快照，零行情请求。"""
         code = str(code or "").strip().zfill(6)
         if not code.isdigit():
             return {"available": False, "note": "无效代码"}
@@ -223,7 +229,7 @@ class DarkPoolMonitor:
         return market
 
     # ------------------------------------------------------------------
-    # 官方口径：本地 SQLite（300s TTL）
+    # 官方口径：EOD 访问层（300s TTL）
     # ------------------------------------------------------------------
     def _eod_payload(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -234,25 +240,48 @@ class DarkPoolMonitor:
         self._eod_cache = (now, payload)
         return dict(payload)
 
-    def _query(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
-        conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=2)
-        conn.row_factory = sqlite3.Row
-        try:
-            return conn.execute(sql, args).fetchall()
-        finally:
-            conn.close()
+    def _t(self, logical: str) -> str:
+        return self._store.table(logical)
+
+    def _query(self, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
+        return self._store.query(sql, args)
 
     def _latest_date(self, table: str) -> str:
-        row = self._query(f'SELECT MAX(trade_date) AS d FROM "{table}"')
-        return str(row[0]["d"] or "") if row else ""
+        return self._store.latest_date(table)
+
+    def _attach_identity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """快照模式：快照只存代码与数值，名称/板块用本容器 easy_tdx 映射回填。"""
+        if not payload.get("available"):
+            return payload
+        names = self._name_map()
+        sectors = self._sector_map(3)
+
+        def fill(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            for row in rows:
+                code = str(row.get("code") or "")
+                row["name"] = names.get(code, code)
+                row["sector"] = sectors.get(code, "")
+            return rows
+
+        absorb = dict(payload.get("absorb") or {})
+        absorb["inflow"] = fill(list(absorb.get("inflow") or []))
+        absorb["outflow"] = fill(list(absorb.get("outflow") or []))
+        payload["absorb"] = absorb
+        offmarket = dict(payload.get("offmarket") or {})
+        for key in ("north_top10", "blocks", "top_inst"):
+            offmarket[key] = fill(list(offmarket.get(key) or []))
+        payload["offmarket"] = offmarket
+        return payload
 
     def _load_eod(self) -> dict[str, Any]:
-        if not self._db_path.exists():
-            return {"available": False, "note": "尚未跑收盘管线 scripts/ingest_eod_tushare.py"}
+        if getattr(self._store, "backend", "") == "cloudbase_snapshot":
+            return self._attach_identity(self._store.eod_payload())  # type: ignore[attr-defined]
+        if not self._store.available:
+            return {"available": False, "note": "EOD 存储未配置（pymysql 或 db_config 缺失）"}
         try:
             trade_date = self._latest_date("moneyflow")
             if not trade_date:
-                return {"available": False, "note": "tushare_eod.sqlite 中暂无 moneyflow 数据"}
+                return {"available": False, "note": "MySQL 暂无 moneyflow 数据：跑 scripts/ingest_eod_tushare.py 落库"}
             names = self._name_map()
             sectors = self._sector_map(3)
             return {
@@ -264,18 +293,18 @@ class DarkPoolMonitor:
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning("dark pool eod load failed: %s", exc)
-            return {"available": False, "note": f"读取本地库失败：{exc}"}
+            return {"available": False, "note": f"读取 EOD 存储失败：{exc}"}
 
     def _load_market(self, trade_date: str) -> dict[str, Any]:
         market: dict[str, Any] = {"trade_date": trade_date}
-        row = self._query("SELECT SUM(net_mf_amount) AS v FROM moneyflow WHERE trade_date = ?", (trade_date,))
+        row = self._query(f"SELECT SUM(net_mf_amount) AS v FROM {self._t('moneyflow')} WHERE trade_date = %s", (trade_date,))
         if row and row[0]["v"] is not None:
             # moneyflow 金额单位万元 → 元
             market["main_net_amount"] = round(float(row[0]["v"]) * 10000, 0)
 
         hsgt_date = self._latest_date("moneyflow_hsgt")
         if hsgt_date:
-            row = self._query("SELECT north_money FROM moneyflow_hsgt WHERE trade_date = ?", (hsgt_date,))
+            row = self._query(f"SELECT north_money FROM {self._t('moneyflow_hsgt')} WHERE trade_date = %s", (hsgt_date,))
             try:
                 # 百万元 → 元；2024-08 起北向只披露成交额，无净额口径
                 market["north_turnover"] = round(float(row[0]["north_money"]) * 1e6, 0) if row and row[0]["north_money"] is not None else None
@@ -283,10 +312,10 @@ class DarkPoolMonitor:
             except (TypeError, ValueError):
                 pass
 
-        margin_dates = [str(r["d"]) for r in self._query("SELECT DISTINCT trade_date AS d FROM margin_detail ORDER BY d DESC LIMIT 2")]
+        margin_dates = [str(r["d"]) for r in self._query(f"SELECT DISTINCT trade_date AS d FROM {self._t('margin_detail')} ORDER BY d DESC LIMIT 2")]
         if margin_dates:
             def rzye(d: str) -> float:
-                row = self._query("SELECT SUM(rzye) AS v FROM margin_detail WHERE trade_date = ?", (d,))
+                row = self._query(f"SELECT SUM(rzye) AS v FROM {self._t('margin_detail')} WHERE trade_date = %s", (d,))
                 return float(row[0]["v"] or 0) if row else 0.0
 
             latest = rzye(margin_dates[0])
@@ -295,21 +324,26 @@ class DarkPoolMonitor:
             if len(margin_dates) > 1:
                 market["margin_change"] = round(latest - rzye(margin_dates[1]), 0)
 
-        row = self._query("SELECT SUM(amount) AS v FROM block_trade WHERE trade_date = ?", (trade_date,))
+        row = self._query(f"SELECT SUM(amount) AS v FROM {self._t('block_trade')} WHERE trade_date = %s", (trade_date,))
         if row and row[0]["v"] is not None:
             market["block_amount"] = round(float(row[0]["v"]) * 10000, 0)
         return market
 
     def _load_absorb(self, names: dict[str, str], sectors: dict[str, str]) -> dict[str, Any]:
         """暗吸/暗派：多日连续同向净额 + 价格滞涨/抗跌。"""
-        dates = [str(r["d"]) for r in self._query("SELECT DISTINCT trade_date AS d FROM moneyflow ORDER BY d DESC LIMIT ?", (ABSORB_WINDOW_DAYS,))]
+        dates = [
+            str(r["d"])
+            for r in self._query(
+                f"SELECT DISTINCT trade_date AS d FROM {self._t('moneyflow')} ORDER BY d DESC LIMIT {int(ABSORB_WINDOW_DAYS)}"
+            )
+        ]
         if len(dates) < ABSORB_MIN_DAYS:
-            return {"available": False, "note": f"历史不足（{len(dates)}/{ABSORB_WINDOW_DAYS} 天），跑 scripts/ingest_eod_tushare.py --date 回填"}
+            return {"available": False, "note": f"历史不足（{len(dates)}/{ABSORB_WINDOW_DAYS} 天），跑 scripts/ingest_eod_tushare.py --days 回填"}
         dates = sorted(dates)
-        placeholders = ",".join("?" for _ in dates)
+        placeholders = ",".join(["%s"] * len(dates))
         rows = self._query(
-            "SELECT m.ts_code, m.trade_date, m.net_mf_amount, d.close, d.turnover_rate"
-            " FROM moneyflow m LEFT JOIN daily_basic d"
+            f"SELECT m.ts_code, m.trade_date, m.net_mf_amount, d.close, d.turnover_rate"
+            f" FROM {self._t('moneyflow')} m LEFT JOIN {self._t('daily_basic')} d"
             "   ON m.ts_code = d.ts_code AND m.trade_date = d.trade_date"
             f" WHERE m.trade_date IN ({placeholders})",
             tuple(dates),
@@ -376,8 +410,8 @@ class DarkPoolMonitor:
         north_top10: list[dict[str, Any]] = []
         if north_date:
             for r in self._query(
-                "SELECT ts_code, name, close, change, amount FROM hsgt_top10"
-                " WHERE trade_date = ? ORDER BY amount DESC LIMIT 10",
+                f"SELECT ts_code, name, close, `change`, amount FROM {self._t('hsgt_top10')}"
+                " WHERE trade_date = %s ORDER BY amount DESC LIMIT 10",
                 (north_date,),
             ):
                 code = str(r["ts_code"])[:6]
@@ -395,14 +429,14 @@ class DarkPoolMonitor:
         if trade_date:
             top_list_codes = {
                 str(r["ts_code"])
-                for r in self._query("SELECT DISTINCT ts_code FROM top_list WHERE trade_date = ?", (trade_date,))
+                for r in self._query(f"SELECT DISTINCT ts_code FROM {self._t('top_list')} WHERE trade_date = %s", (trade_date,))
             }
             for r in self._query(
-                "SELECT b.ts_code, b.price, b.vol, b.amount, d.close,"
+                f"SELECT b.ts_code, b.price, b.vol, b.amount, d.close,"
                 "       ROUND((b.price / d.close - 1) * 100, 2) AS premium_pct"
-                " FROM block_trade b JOIN daily_basic d"
+                f" FROM {self._t('block_trade')} b JOIN {self._t('daily_basic')} d"
                 "   ON b.ts_code = d.ts_code AND b.trade_date = d.trade_date"
-                " WHERE b.trade_date = ? ORDER BY b.amount DESC LIMIT 10",
+                " WHERE b.trade_date = %s ORDER BY b.amount DESC LIMIT 10",
                 (trade_date,),
             ):
                 code = str(r["ts_code"])[:6]
@@ -423,10 +457,10 @@ class DarkPoolMonitor:
         top_inst: list[dict[str, Any]] = []
         if inst_date:
             for r in self._query(
-                "SELECT ts_code,"
-                "       SUM(CASE WHEN exalter LIKE '%机构%' THEN net_buy ELSE 0 END) AS inst_net,"
+                f"SELECT ts_code,"
+                "       SUM(CASE WHEN exalter LIKE '%%机构%%' THEN net_buy ELSE 0 END) AS inst_net,"
                 "       SUM(net_buy) AS total_net, COUNT(*) AS seats"
-                " FROM top_inst WHERE trade_date = ?"
+                f" FROM {self._t('top_inst')} WHERE trade_date = %s"
                 " GROUP BY ts_code HAVING inst_net != 0"
                 " ORDER BY ABS(inst_net) DESC LIMIT 10",
                 (inst_date,),
@@ -458,8 +492,29 @@ class DarkPoolMonitor:
     # 个股摘要（详情页）
     # ------------------------------------------------------------------
     def _stock_eod(self, code: str) -> dict[str, Any]:
-        if not self._db_path.exists():
-            return {"eod_available": False, "note": "尚未跑收盘管线 scripts/ingest_eod_tushare.py"}
+        if getattr(self._store, "backend", "") == "cloudbase_snapshot":
+            summary = self._store.stock_summary(code)  # type: ignore[attr-defined]
+            if summary:
+                out = {"eod_available": True}
+                out.update(summary)
+                return out
+            # 快照未覆盖：登记补数请求，本地履约管线推送单票摘要后前端轮询自取
+            requested = False
+            request_fn = getattr(self._store, "request_stock", None)
+            if callable(request_fn):
+                try:
+                    requested = bool(request_fn(code))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("暗盘补数请求登记失败 %s: %s", code, exc)
+            if requested:
+                return {
+                    "eod_available": False,
+                    "pending": True,
+                    "note": "快照未覆盖该票，已提交补数请求：本地管线履约后自动加载",
+                }
+            return {"eod_available": False, "note": "生产快照未覆盖该票（快照预计算范围为面板+自选/持仓）"}
+        if not self._store.available:
+            return {"eod_available": False, "note": "EOD 存储未配置（pymysql 或 db_config 缺失）"}
         ts_code = self._to_ts_code(code)
         out: dict[str, Any] = {"eod_available": True}
         try:
@@ -471,10 +526,10 @@ class DarkPoolMonitor:
                     "turnover": float(r["turnover_rate"] or 0),
                 }
                 for r in self._query(
-                    "SELECT m.trade_date, m.net_mf_amount, d.close, d.turnover_rate"
-                    " FROM moneyflow m LEFT JOIN daily_basic d"
+                    f"SELECT m.trade_date, m.net_mf_amount, d.close, d.turnover_rate"
+                    f" FROM {self._t('moneyflow')} m LEFT JOIN {self._t('daily_basic')} d"
                     "   ON m.ts_code = d.ts_code AND m.trade_date = d.trade_date"
-                    " WHERE m.ts_code = ? ORDER BY m.trade_date DESC LIMIT 10",
+                    " WHERE m.ts_code = %s ORDER BY m.trade_date DESC LIMIT 10",
                     (ts_code,),
                 )
             ]
@@ -510,7 +565,7 @@ class DarkPoolMonitor:
                 }
 
             ths = self._query(
-                "SELECT net_amount, net_d5_amount FROM moneyflow_ths WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1",
+                f"SELECT net_amount, net_d5_amount FROM {self._t('moneyflow_ths')} WHERE ts_code = %s ORDER BY trade_date DESC LIMIT 1",
                 (ts_code,),
             )
             if ths:
@@ -519,25 +574,25 @@ class DarkPoolMonitor:
                     "net_d5": round(float(ths[0]["net_d5_amount"] or 0) * 10000, 0),
                 }
             dc = self._query(
-                "SELECT net_amount FROM moneyflow_dc WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1",
+                f"SELECT net_amount FROM {self._t('moneyflow_dc')} WHERE ts_code = %s ORDER BY trade_date DESC LIMIT 1",
                 (ts_code,),
             )
             if dc:
                 out["dc"] = {"net_today": round(float(dc[0]["net_amount"] or 0) * 10000, 0)}
 
             north = self._query(
-                "SELECT trade_date, amount FROM hsgt_top10 WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 1",
+                f"SELECT trade_date, amount FROM {self._t('hsgt_top10')} WHERE ts_code = %s ORDER BY trade_date DESC LIMIT 1",
                 (ts_code,),
             )
             if north:
                 out["north_top10"] = {"trade_date": str(north[0]["trade_date"]), "amount": round(float(north[0]["amount"] or 0), 0)}
 
             blocks = self._query(
-                "SELECT b.trade_date, b.price, b.amount, d.close,"
+                f"SELECT b.trade_date, b.price, b.amount, d.close,"
                 "       ROUND((b.price / d.close - 1) * 100, 2) AS premium_pct"
-                " FROM block_trade b JOIN daily_basic d"
+                f" FROM {self._t('block_trade')} b JOIN {self._t('daily_basic')} d"
                 "   ON b.ts_code = d.ts_code AND b.trade_date = d.trade_date"
-                " WHERE b.ts_code = ? ORDER BY b.trade_date DESC LIMIT 5",
+                " WHERE b.ts_code = %s ORDER BY b.trade_date DESC LIMIT 5",
                 (ts_code,),
             )
             out["blocks"] = [
@@ -552,7 +607,7 @@ class DarkPoolMonitor:
             ]
 
             margin_rows = self._query(
-                "SELECT trade_date, rzye, rzmre FROM margin_detail WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 2",
+                f"SELECT trade_date, rzye, rzmre FROM {self._t('margin_detail')} WHERE ts_code = %s ORDER BY trade_date DESC LIMIT 2",
                 (ts_code,),
             )
             if margin_rows:
@@ -562,7 +617,7 @@ class DarkPoolMonitor:
                 out["margin"] = latest
 
             top_hits = self._query(
-                "SELECT trade_date, reason FROM top_list WHERE ts_code = ? ORDER BY trade_date DESC LIMIT 3",
+                f"SELECT trade_date, reason FROM {self._t('top_list')} WHERE ts_code = %s ORDER BY trade_date DESC LIMIT 3",
                 (ts_code,),
             )
             out["top_list"] = [
@@ -572,7 +627,7 @@ class DarkPoolMonitor:
         except Exception as exc:  # noqa: BLE001
             logger.warning("dark pool stock eod failed for %s: %s", code, exc)
             out["eod_available"] = False
-            out["note"] = f"读取本地库失败：{exc}"
+            out["note"] = f"读取 EOD 存储失败：{exc}"
         return out
 
     # ------------------------------------------------------------------

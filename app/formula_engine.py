@@ -428,6 +428,104 @@ def compute_zuot_state(
     return dict(compute_zuot_series(rows, day=day).latest)
 
 
+def _advice_label(score: float) -> str:
+    if score >= 70:
+        return "强推"
+    if score >= 50:
+        return "关注"
+    if score >= 30:
+        return "观望"
+    if score >= 15:
+        return "减仓"
+    return "规避"
+
+
+def compute_zuot_snapshot(
+    minute_pcts: Sequence[float],
+    *,
+    vwap_pct: float | None = None,
+    price: float = 0.0,
+    resistance: float = 0.0,
+    support: float = 0.0,
+    outer_volume: float = 0.0,
+    inner_volume: float = 0.0,
+    flow_available: bool = False,
+) -> dict[str, Any]:
+    """榜单用做T紧凑快照：趋势多空 / 资金态度 / 评分建议。
+
+    与 compute_zuot_series 的差异（为榜单 5s 刷新做的口径适配）：
+
+    - 输入是分钟涨幅序列（minute_pcts，每分钟的最新涨幅），不是完整分钟 OHLCV；
+      EMA 是线性算子，EMA(价格)=昨收×(1+EMA(涨幅)/100)，大小关系完全一致。
+    - 资金维度用五档快照的外盘/内盘（DYNAINFO 26/25，对应公式「买卖净」口径），
+      不做逐笔轮询；大单分钟 A2/A3 仍只在详情页（formula_state）展示。
+    - 均价关系用分钟 VWAP 涨幅快照与现价涨幅比较。
+
+    评分权重与做T公式.md 一致：趋势30 + 均价20 + 资金30 + 支撑20。
+    """
+    pcts = [_number(item) for item in minute_pcts if math.isfinite(_number(item))]
+    if len(pcts) < 2:
+        return {"available": False}
+
+    ma30 = ema(pcts, 30)
+    qs = ema(pcts, 900)
+    index = len(pcts) - 1
+    ma30_now = ma30[index]
+    qs_now = qs[index]
+    ma30_prev3 = ma30[index - 3] if index >= 3 else ma30[0]
+    trend_bull = ma30_now > qs_now
+    trend_text = _trend_text(ma30_now, qs_now, ma30_prev3)
+
+    outer = max(_number(outer_volume), 0.0)
+    inner = max(_number(inner_volume), 0.0)
+    fund_ok = bool(flow_available) and (outer + inner) > 0
+    fund_pct = _safe_div(outer - inner, outer + inner) * 100.0 if fund_ok else 0.0
+    fund_text = (
+        f"{'+' if fund_pct > 0 else ''}{fund_pct:.0f}%" if fund_ok else "--"
+    )
+    fund_attitude = _fund_attitude(outer, inner) if fund_ok else ""
+
+    resistance = _number(resistance)
+    support = _number(support)
+    mid = (resistance + support) / 2.0 if resistance > 0 and support > 0 else 0.0
+    price = _number(price)
+    position_text = (
+        _position_text(price, resistance, mid, support)
+        if price > 0 and resistance > 0 and support > 0
+        else ""
+    )
+
+    above_vwap: bool | None = None
+    vwap_relation = ""
+    if vwap_pct is not None and math.isfinite(_number(vwap_pct)):
+        latest_pct = pcts[index]
+        above_vwap = latest_pct > _number(vwap_pct)
+        vwap_relation = "↑均价" if above_vwap else "↓均价" if latest_pct < _number(vwap_pct) else "≈均价"
+
+    score = 0
+    score += 30 if trend_bull else 0
+    score += 20 if above_vwap else 0
+    score += 30 if fund_ok and outer > inner else 0
+    score += 20 if support > 0 and price > support else 0
+    advice, advice_detail = _advice(score)
+
+    return {
+        "available": True,
+        "trend_text": trend_text,
+        "trend_bull": trend_bull,
+        "fund_pct": round(fund_pct, 1),
+        "fund_text": fund_text,
+        "fund_attitude": fund_attitude,
+        "fund_available": fund_ok,
+        "position_text": position_text,
+        "vwap_relation": vwap_relation,
+        "score": score,
+        "advice": advice,
+        "advice_label": _advice_label(score),
+        "advice_detail": advice_detail,
+    }
+
+
 def latest_zuot_event(
     states: Sequence[Mapping[str, Any]],
     *,
@@ -473,6 +571,7 @@ __all__ = [
     "ZuoTDayContext",
     "ZuoTSeriesResult",
     "compute_zuot_series",
+    "compute_zuot_snapshot",
     "compute_zuot_state",
     "latest_zuot_event",
     "ema",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import queue
 import re
 import threading
 import uuid
@@ -44,6 +45,186 @@ MESSAGE_EVIDENCE_CACHE_TABLE = "message_evidence_cache"
 MESSAGE_STATUS_CACHE_MIN_SECONDS = 300.0
 # like '%关键词%' 只能全表扫描，串行化以免并发把 MySQL CPU 打满后集体超时。
 MESSAGE_STORE_HEAVY_QUERY_CONCURRENCY = 2
+# 直连 MySQL（mysql 后端）连接池上限：读线程池 6+12 并发，16 条连接够用且
+# 不会把 RDS 小规格实例的连接数打满。
+MESSAGE_STORE_MYSQL_POOL_SIZE = 16
+
+# 各表主键：直连模式 upsert 的 ON DUPLICATE KEY UPDATE 只更新非主键列。
+MYSQL_TABLE_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "message_topics": ("topic_id",),
+    "message_events": ("event_id",),
+    "message_event_links": ("event_id", "entity_type", "code", "name"),
+    "message_sync_runs": ("run_id",),
+    "message_evidence_cache": ("scope", "cache_key"),
+}
+
+_MYSQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str) -> str:
+    """表名/列名全部来自代码内部常量，仍统一校验标识符合法性，防止拼接注入。"""
+    value = str(name or "").strip()
+    if not _MYSQL_IDENTIFIER_RE.match(value):
+        raise MessageStoreError(f"invalid mysql identifier: {name!r}")
+    return value
+
+
+def _translate_filter(column: str, expression: str) -> tuple[str, list[Any]]:
+    """PostgREST 过滤表达式 → (WHERE 片段, 参数)。值一律走 %s 占位符。"""
+    field = _validate_identifier(column)
+    if expression.startswith("eq."):
+        return f"{field} = %s", [expression[3:]]
+    if expression.startswith("like."):
+        return f"{field} LIKE %s", [expression[5:]]
+    if expression.startswith("in.(") and expression.endswith(")"):
+        # 实际调用点的 in 元素都是纯文本（不含引号/逗号），直接按逗号切。
+        items = expression[4:-1].split(",")
+        if not items or any(not item for item in items):
+            return "1 = 0", []
+        return f"{field} IN ({','.join(['%s'] * len(items))})", items
+    raise MessageStoreError(f"unsupported filter expression: {column}={expression}")
+
+
+def _build_select_sql(table: str, params: Iterable[tuple[str, str]]) -> tuple[str, list[Any]]:
+    """把 REST 风格的查询参数翻译成参数化 SELECT，供直连模式与单元测试使用。"""
+    select_clause = "*"
+    order_clause = ""
+    limit_clause = ""
+    where_parts: list[str] = []
+    args: list[Any] = []
+    for key, raw_value in params:
+        value = str(raw_value or "").strip()
+        if key == "select":
+            if value and value != "*":
+                select_clause = ", ".join(_validate_identifier(part) for part in value.split(","))
+        elif key == "order":
+            order_parts = []
+            for item in value.split(","):
+                field, _, direction = item.strip().partition(".")
+                order_parts.append(
+                    f"{_validate_identifier(field)} {'DESC' if direction.strip().lower() == 'desc' else 'ASC'}"
+                )
+            if order_parts:
+                order_clause = " ORDER BY " + ", ".join(order_parts)
+        elif key == "limit":
+            limit_clause = f" LIMIT {max(1, int(value))}"
+        else:
+            fragment, fragment_args = _translate_filter(key, value)
+            where_parts.append(fragment)
+            args.extend(fragment_args)
+    sql = f"SELECT {select_clause} FROM {_validate_identifier(table)}"
+    if where_parts:
+        sql += " WHERE " + " AND ".join(where_parts)
+    return sql + order_clause + limit_clause, args
+
+
+def _build_count_sql(table: str) -> str:
+    return f"SELECT COUNT(*) AS cnt FROM {_validate_identifier(table)}"
+
+
+def _build_upsert_sql(table: str, rows: list[dict[str, Any]]) -> tuple[str, list[Any]]:
+    """INSERT ... ON DUPLICATE KEY UPDATE：语义对齐 REST 的 merge-duplicates。"""
+    if not rows:
+        raise MessageStoreError("upsert requires at least one row")
+    table_name = _validate_identifier(table)
+    columns = [_validate_identifier(key) for key in rows[0]]
+    if not columns:
+        raise MessageStoreError("upsert row has no columns")
+    primary_keys = set(MYSQL_TABLE_PRIMARY_KEYS.get(table_name, ()))
+    update_columns = [column for column in columns if column not in primary_keys]
+    placeholders = "(" + ",".join(["%s"] * len(columns)) + ")"
+    sql = (
+        f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES "
+        + ", ".join([placeholders] * len(rows))
+    )
+    if update_columns:
+        sql += " ON DUPLICATE KEY UPDATE " + ", ".join(f"{c} = VALUES({c})" for c in update_columns)
+    else:
+        # 整行都是主键（当前没有这种表）：冲突时退化为幂等空更新。
+        sql += f" ON DUPLICATE KEY UPDATE {columns[0]} = {columns[0]}"
+    args = [row.get(column) for row in rows for column in columns]
+    return sql, args
+
+
+class _MySqlConnectionPool:
+    """极简 pymysql 连接池：懒创建、用完归还、取出时 ping 保活。
+
+    pymysql 连接不是线程安全的，MessageStore 读路径有 6+12 并发线程，
+    必须每次独占一条连接；RDS 空闲会踢长连接，取出时 ping(reconnect=True)。
+    """
+
+    def __init__(self, conn_kwargs: dict[str, Any], max_size: int = MESSAGE_STORE_MYSQL_POOL_SIZE) -> None:
+        self._conn_kwargs = conn_kwargs
+        self._max_size = max(1, int(max_size))
+        self._idle: queue.Queue[Any] = queue.Queue(maxsize=self._max_size)
+        self._lock = threading.Lock()
+        self._created = 0
+        self._closed = False
+
+    def acquire(self) -> Any:
+        if self._closed:
+            raise MessageStoreError("mysql connection pool is closed")
+        conn: Any | None = None
+        try:
+            conn = self._idle.get_nowait()
+        except queue.Empty:
+            with self._lock:
+                if self._created < self._max_size:
+                    self._created += 1
+                    create = True
+                else:
+                    create = False
+            if create:
+                try:
+                    conn = self._connect()
+                except Exception:
+                    with self._lock:
+                        self._created -= 1
+                    raise
+            else:
+                conn = self._idle.get()
+        try:
+            conn.ping(reconnect=True)
+        except Exception:
+            # 连接已死且重连失败：丢弃并释放配额，让下次取用时重建。
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._created -= 1
+            raise
+        return conn
+
+    def release(self, conn: Any) -> None:
+        if self._closed:
+            self._discard(conn)
+            return
+        try:
+            self._idle.put_nowait(conn)
+        except queue.Full:
+            self._discard(conn)
+
+    def close(self) -> None:
+        self._closed = True
+        while True:
+            try:
+                conn = self._idle.get_nowait()
+            except queue.Empty:
+                return
+            self._discard(conn)
+
+    def _connect(self) -> Any:
+        import pymysql
+
+        return pymysql.connect(**self._conn_kwargs)
+
+    @staticmethod
+    def _discard(conn: Any) -> None:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +347,7 @@ class MessageStore:
         openid: str = MESSAGE_OPENID,
         http_client: httpx.Client | None = None,
         async_refresh: bool = True,
+        mysql_config: dict[str, Any] | None = None,
     ) -> None:
         self.env_id = str(env_id or "").strip()
         self.token = str(token or "").strip()
@@ -174,6 +356,11 @@ class MessageStore:
         self.openid = str(openid or MESSAGE_OPENID).strip() or MESSAGE_OPENID
         self.timeout = max(0.5, float(timeout or 5.0))
         self.cache_seconds = max(0.0, float(cache_seconds or 0.0))
+        # 直连模式（pymysql → 阿里云 RDS）：传了 mysql_config 即启用，
+        # 与 CloudBase REST 传输完全互斥，直连不使用 httpx client。
+        self._mysql_config = dict(mysql_config) if mysql_config is not None else None
+        self._mysql_pool: _MySqlConnectionPool | None = None
+        self._mysql_pool_lock = threading.Lock()
         self._client = http_client
         # 未注入 client 时共享一个长连接 client：星球消息证据一次读取要点十几次
         # REST 查询，每次新建 client 会重复 TCP+TLS 握手，是详情接口慢的主因。
@@ -201,6 +388,16 @@ class MessageStore:
 
     @classmethod
     def from_settings(cls, settings: Any) -> "MessageStore":
+        backend = str(getattr(settings, "message_store_backend", "cloudbase_mysql") or "cloudbase_mysql")
+        if backend.strip().lower() == "mysql":
+            # pymysql 直连（阿里云 RDS）：构造后立即建表，失败抛错不静默降级。
+            store = cls(
+                cache_seconds=float(getattr(settings, "message_store_cache_seconds", 60.0) or 0.0),
+                openid=str(getattr(settings, "cloudbase_mysql_openid", MESSAGE_OPENID) or MESSAGE_OPENID),
+                mysql_config=dict(getattr(settings, "msg_mysql_config", None) or {}),
+            )
+            store.ensure_schema()
+            return store
         return cls(
             env_id=str(getattr(settings, "cloudbase_env_id", "") or ""),
             token=str(getattr(settings, "cloudbase_api_token", "") or ""),
@@ -222,10 +419,22 @@ class MessageStore:
 
     @property
     def available(self) -> bool:
+        if self._mysql_config is not None:
+            cfg = self._mysql_config
+            return bool(
+                str(cfg.get("host") or "").strip()
+                and str(cfg.get("user") or "").strip()
+                and str(cfg.get("db") or "").strip()
+            )
         return bool(self.env_id and self.token and self.instance and self.schema and self._base_url)
 
     @property
     def db_file(self) -> str:
+        if self._mysql_config is not None:
+            if not self.available:
+                return "mysql://unconfigured"
+            # 只暴露 host/db，密码不出现在状态信息里。
+            return f"mysql://{str(self._mysql_config.get('host') or '').strip()}/{str(self._mysql_config.get('db') or '').strip()}"
         if not self.available:
             return "cloudbase_mysql://unconfigured"
         return f"cloudbase_mysql://{self.env_id}/{self.instance}/{self.schema}"
@@ -1009,8 +1218,13 @@ class MessageStore:
     def _upsert_many(self, table: str, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
-        mutation_timeout = max(float(self.timeout), MESSAGE_STORE_MUTATION_MIN_TIMEOUT)
         chunk_size = max(1, MESSAGE_STORE_UPSERT_CHUNK_SIZE)
+        if self._mysql_config is not None:
+            for offset in range(0, len(rows), chunk_size):
+                sql, args = _build_upsert_sql(table, rows[offset : offset + chunk_size])
+                self._mysql_execute(sql, args)
+            return
+        mutation_timeout = max(float(self.timeout), MESSAGE_STORE_MUTATION_MIN_TIMEOUT)
         for offset in range(0, len(rows), chunk_size):
             chunk = rows[offset : offset + chunk_size]
             response = self._request(
@@ -1031,6 +1245,10 @@ class MessageStore:
         headers: dict[str, str] | None = None,
         request_timeout: float | None = None,
     ) -> list[dict[str, Any]]:
+        if self._mysql_config is not None:
+            # 直连没有网关超时问题，request_timeout 忽略。
+            sql, args = _build_select_sql(table, list(params or []))
+            return self._mysql_query(sql, args)
         extra: dict[str, Any] = {}
         if request_timeout is not None:
             extra["timeout"] = max(0.5, float(request_timeout))
@@ -1047,6 +1265,9 @@ class MessageStore:
         return []
 
     def _count(self, table: str, key_field: str) -> int:
+        if self._mysql_config is not None:
+            rows = self._mysql_query(_build_count_sql(table), [])
+            return int(rows[0].get("cnt") or 0) if rows else 0
         response = self._request(
             "GET",
             self._table_url(table),
@@ -1119,11 +1340,75 @@ class MessageStore:
                 )
             return self._shared_client
 
+    def _mysql_conn_kwargs(self) -> dict[str, Any]:
+        cfg = self._mysql_config or {}
+        return {
+            "host": str(cfg.get("host") or "").strip(),
+            "port": int(cfg.get("port") or 3306),
+            "user": str(cfg.get("user") or "").strip(),
+            "password": str(cfg.get("pwd") or cfg.get("password") or ""),
+            "database": str(cfg.get("db") or "").strip(),
+            "charset": "utf8mb4",
+            "autocommit": True,
+            "connect_timeout": 5,
+        }
+
+    def _get_mysql_pool(self) -> _MySqlConnectionPool:
+        if self._mysql_config is None:
+            raise MessageStoreError("mysql message store is not configured")
+        with self._mysql_pool_lock:
+            if self._mysql_pool is None:
+                self._mysql_pool = _MySqlConnectionPool(self._mysql_conn_kwargs())
+            return self._mysql_pool
+
+    def _mysql_query(self, sql: str, args: list[Any]) -> list[dict[str, Any]]:
+        import pymysql.cursors
+
+        pool = self._get_mysql_pool()
+        conn = pool.acquire()
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                # 空参数传 None：pymysql 对非 None args 会做 % 格式化，
+                # 会把 SQL 里的字面 % 当占位符报错。
+                cur.execute(sql, args if args else None)
+                return [dict(row) for row in cur.fetchall()]
+        except MessageStoreError:
+            raise
+        except Exception as exc:
+            raise MessageStoreError(f"mysql message store query failed: {exc}") from exc
+        finally:
+            pool.release(conn)
+
+    def _mysql_execute(self, sql: str, args: list[Any]) -> None:
+        pool = self._get_mysql_pool()
+        conn = pool.acquire()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, args if args else None)
+        except MessageStoreError:
+            raise
+        except Exception as exc:
+            raise MessageStoreError(f"mysql message store write failed: {exc}") from exc
+        finally:
+            pool.release(conn)
+
+    def ensure_schema(self) -> None:
+        """直连模式建表：逐条执行 CREATE TABLE IF NOT EXISTS（RDS 是普通 MySQL 8.0，
+        没有 CloudBase 的 _openid 特殊处理，直接建即可）。失败抛错，不静默吞。"""
+        if self._mysql_config is None:
+            raise MessageStoreError("ensure_schema is only available in mysql backend mode")
+        for statement in self.schema_statements():
+            self._mysql_execute(statement, [])
+
     def close(self) -> None:
         with self._shared_client_lock:
             if self._shared_client is not None:
                 self._shared_client.close()
                 self._shared_client = None
+        with self._mysql_pool_lock:
+            if self._mysql_pool is not None:
+                self._mysql_pool.close()
+                self._mysql_pool = None
         self._read_pool.shutdown(wait=False, cancel_futures=True)
         self._query_pool.shutdown(wait=False, cancel_futures=True)
         self._refresh_pool.shutdown(wait=False, cancel_futures=True)

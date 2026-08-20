@@ -7,6 +7,7 @@ from app.formula_engine import (
     SIGNAL_VERSION,
     ZuoTDayContext,
     compute_zuot_series,
+    compute_zuot_snapshot,
     compute_zuot_state,
     cross,
     ema,
@@ -219,3 +220,59 @@ def test_point_in_time_and_performance():
         assert prefix["buy_signal"] == full["buy_signal"]
         assert prefix["sell_signal"] == full["sell_signal"]
         assert abs(prefix["vwap"] - full["vwap"]) < 1e-6
+
+
+def test_zuot_snapshot_uptrend_full_score():
+    # 榜单紧凑快照：单边上行 + 外盘>内盘×1.5 + 现价在支撑上方 → 满分强推
+    pcts = [i * 0.05 for i in range(60)]
+    snap = compute_zuot_snapshot(
+        pcts,
+        vwap_pct=1.0,
+        price=10.5,
+        resistance=10.8,
+        support=10.1,
+        outer_volume=15000.0,
+        inner_volume=9000.0,
+        flow_available=True,
+    )
+    assert snap["available"] is True
+    assert snap["trend_text"] == "多头强势"
+    assert snap["trend_bull"] is True
+    assert snap["fund_pct"] == 25.0
+    assert snap["fund_attitude"] == "积极做多"
+    assert snap["position_text"] == "强势区"
+    assert snap["vwap_relation"] == "↑均价"
+    assert snap["score"] == 100
+    assert snap["advice"].startswith("★强推")
+    assert snap["advice_label"] == "强推"
+
+
+def test_zuot_snapshot_downtrend_and_flow_unavailable():
+    # 单边下行 + 内盘主导 + 现价在支撑上方（20 分兜底）→ 减仓
+    pcts = [-i * 0.04 for i in range(60)]
+    snap = compute_zuot_snapshot(
+        pcts,
+        vwap_pct=-1.0,
+        price=9.5,
+        resistance=9.9,
+        support=9.2,
+        outer_volume=5000.0,
+        inner_volume=12000.0,
+        flow_available=True,
+    )
+    assert snap["trend_text"] == "空头弱势"
+    assert snap["fund_attitude"] == "积极做空"
+    assert snap["score"] == 20
+    assert snap["advice_label"] == "减仓"
+    # 盘口不可用：资金维度不计分、不显示
+    snap2 = compute_zuot_snapshot(
+        pcts, price=9.5, resistance=9.9, support=9.2, flow_available=False
+    )
+    assert snap2["fund_available"] is False
+    assert snap2["fund_text"] == "--"
+    assert snap2["score"] == 20
+
+
+def test_zuot_snapshot_requires_two_points():
+    assert compute_zuot_snapshot([], price=10.0)["available"] is False
+    assert compute_zuot_snapshot([1.0], price=10.0)["available"] is False

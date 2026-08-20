@@ -10,7 +10,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from app.models import MiniIntradaySeries, SectorFlowSeries
+from app.models import MiniIntradaySeries, SectorFlowPoint, SectorFlowSeries
 from app.services import BoardEntry, DashboardService
 
 
@@ -95,8 +95,19 @@ def test_mini_charts_serve_stale_entry_while_revalidating() -> None:
 
 def test_frozen_sector_flow_deferred_and_warmed(monkeypatch) -> None:
     service = _service()
-    expected = [SectorFlowSeries(name="PCB", heat_score=70, final_value=70.0, change_pct=0.8, points=[])]
-    monkeypatch.setattr(service, "_sector_flow_from_trajectory", lambda *a, **k: expected)
+    labels = [f"09:{minute:02d}" for minute in range(31, 60)]
+    labels += [f"10:{minute:02d}" for minute in range(50)]
+    labels += ["15:00"]
+    expected = [
+        SectorFlowSeries(
+            name="PCB",
+            heat_score=70,
+            final_value=70.0,
+            change_pct=0.8,
+            points=[SectorFlowPoint(time=label, value=0.1) for label in labels],
+        )
+    ]
+    monkeypatch.setattr(service, "_build_and_cache_sector_flow", lambda *a, **k: expected)
     snapshot = SimpleNamespace(
         source_status={"trade_date": "20260812", "frozen": True},
         data_mode="closed_static",
@@ -120,7 +131,18 @@ def test_frozen_sector_flow_deferred_and_warmed(monkeypatch) -> None:
 
 def test_frozen_sector_flow_stays_synchronous_without_deferred(monkeypatch) -> None:
     service = _service()
-    expected = [SectorFlowSeries(name="PCB", heat_score=70, final_value=70.0, change_pct=0.8, points=[])]
+    labels = [f"09:{minute:02d}" for minute in range(31, 60)]
+    labels += [f"10:{minute:02d}" for minute in range(50)]
+    labels += ["15:00"]
+    expected = [
+        SectorFlowSeries(
+            name="PCB",
+            heat_score=70,
+            final_value=70.0,
+            change_pct=0.8,
+            points=[SectorFlowPoint(time=label, value=0.1) for label in labels],
+        )
+    ]
     monkeypatch.setattr(service, "_sector_flow_from_trajectory", lambda *a, **k: expected)
     snapshot = SimpleNamespace(
         source_status={"trade_date": "20260812", "frozen": True},

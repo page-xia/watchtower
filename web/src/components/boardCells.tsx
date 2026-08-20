@@ -1,7 +1,7 @@
 import { memo } from "react"
 import { Crown, Gem, AlertTriangle, X } from "lucide-react"
 import type { BoardItem, OrderFlow } from "@/types/api"
-import { fmtAmount, fmtPrice, pctClass, fmtPct, signalTone } from "@/lib/format"
+import { fmtPrice, pctClass, fmtPct, signalTone } from "@/lib/format"
 import { SignalBadge, Sparkline } from "@/components/widgets"
 import { cn } from "@/lib/utils"
 
@@ -91,34 +91,65 @@ export function SignalCell({ item }: { item: BoardItem }) {
   )
 }
 
-export function RatioCell({ value }: { value: number | undefined }) {
-  return (
-    <td className="w-[56px] px-1 text-right">
-      {value == null || Number.isNaN(value) ? (
+/** 做T紧凑分析（做T公式.md 榜单口径）：资金（外盘/内盘）+ 趋势多空 + 评分建议，
+ *  一列替代原「量比/大单/成交额」，在列表上一眼看强弱；评分明细与建议详情收进 title。 */
+export function TAnalysisCell({ item }: { item: BoardItem }) {
+  const t = item.t_analysis
+  if (!t?.available) {
+    return (
+      <td className="w-[122px] px-1" title="做T分析加载中（与分时缩略图同生命周期，下一轮刷新补齐）">
         <span className="text-[11px] text-muted-foreground/50">--</span>
-      ) : (
-        <span className={cn("num text-[12px] font-semibold", value >= 2 ? "text-up" : value >= 1 ? "text-foreground" : "text-muted-foreground")}>
-          {value.toFixed(1)}x
-        </span>
-      )}
-    </td>
-  )
-}
-
-/** 活跃股榜单版：单行的主动大单偏离 */
-export function OrderFlowCell({ flow }: { flow: OrderFlow | undefined }) {
+      </td>
+    )
+  }
+  const adviceSymbol = t.score >= 70 ? "★" : t.score >= 50 ? "☆" : t.score >= 30 ? "△" : t.score >= 15 ? "○" : "X"
+  const adviceClass =
+    t.score >= 70
+      ? "bg-up-dim text-up"
+      : t.score >= 50
+        ? "bg-[hsl(var(--gold)/0.12)] text-gold"
+        : t.score >= 30
+          ? "bg-muted text-muted-foreground"
+          : "bg-down-dim text-down"
+  const fundClass = !t.fund_available
+    ? "text-muted-foreground/50"
+    : t.fund_pct > 0
+      ? "text-up"
+      : t.fund_pct < 0
+        ? "text-down"
+        : "text-muted-foreground"
+  const tooltip = [
+    "做T分析（分钟EMA30/强弱线 + 外盘/内盘口径）",
+    [t.trend_text, t.position_text, t.vwap_relation].filter(Boolean).join(" | "),
+    t.fund_available ? `资金 ${t.fund_text} ${t.fund_attitude}` : "资金：盘口不可用",
+    `${t.advice} — ${t.advice_detail}`,
+  ]
+    .filter(Boolean)
+    .join("\n")
   return (
-    <td
-      className="w-[60px] px-1 text-right"
-      title={flow?.available ? `主动买 ${flow.active_buy_volume}手 / 主动卖 ${flow.active_sell_volume}手` : "盘口数据不可用"}
-    >
-      {flow?.available ? (
-        <span className={cn("num text-[12px] font-semibold", pctClass(flow.active_imbalance_pct))}>
-          {fmtPct(flow.active_imbalance_pct, 0)}
+    <td className="w-[122px] px-1" title={tooltip}>
+      <div className="flex items-center gap-1 whitespace-nowrap leading-tight">
+        <span className="text-[10px] text-muted-foreground">资</span>
+        <span className={cn("num text-[12px] font-semibold", fundClass)}>
+          {t.fund_available ? t.fund_text : "--"}
         </span>
-      ) : (
-        <span className="text-[11px] text-muted-foreground/50">--</span>
-      )}
+        {t.fund_attitude && (
+          <span className="text-[9px] text-muted-foreground">{t.fund_attitude}</span>
+        )}
+      </div>
+      <div className="mt-0.5 flex items-center gap-1 whitespace-nowrap leading-tight">
+        <span
+          className={cn(
+            "text-[10px] font-semibold",
+            t.trend_bull == null ? "text-muted-foreground/50" : t.trend_bull ? "text-up" : "text-down",
+          )}
+        >
+          {t.trend_text || "--"}
+        </span>
+        <span className={cn("num rounded px-1 text-[9px] font-bold", adviceClass)}>
+          {adviceSymbol}{t.advice_label} {t.score}
+        </span>
+      </div>
     </td>
   )
 }
@@ -243,18 +274,6 @@ export function HeatCell({ score }: { score: number | undefined }) {
   )
 }
 
-export function AmountCell({ amount }: { amount: number | undefined }) {
-  return (
-    <td className="w-[70px] pl-1 pr-2 text-right">
-      {amount ? (
-        <span className="num text-[12px] text-foreground/85">{fmtAmount(amount)}</span>
-      ) : (
-        <span className="text-[11px] text-muted-foreground/50">--</span>
-      )}
-    </td>
-  )
-}
-
 // ------------------------------------------------------------- 右栏紧凑行
 /** 右栏表头列定义（与 RailStockRow 的单元格一一对应） */
 export const RAIL_COLUMNS: { label: string; className: string }[] = [
@@ -264,7 +283,7 @@ export const RAIL_COLUMNS: { label: string; className: string }[] = [
   { label: "信号", className: "w-[86px] px-1 text-center" },
   { label: "大单", className: "w-[84px] px-1 text-right" },
   { label: "压/支", className: "w-[110px] px-2" },
-  { label: "成交额", className: "w-[70px] pl-1 pr-2 text-right" },
+  { label: "做T分析", className: "w-[122px] px-1" },
 ]
 
 /** 右栏紧凑行：活跃股榜单单元格的子集 + 分笔详情 */
@@ -297,7 +316,7 @@ export const RailStockRow = memo(function RailStockRow({
         lastActionPrice={item.last_action_price}
         lastActionTime={item.last_action_time}
       />
-      <AmountCell amount={item.amount} />
+      <TAnalysisCell item={item} />
       {onRemove && (
         <td className="w-[28px] pl-1 pr-1.5 text-center">
           <button

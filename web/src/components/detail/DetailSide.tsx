@@ -1,5 +1,5 @@
 import type { ConfluenceSnapshot, DailyMainFormula, FormulaState, RiskReward } from "@/types/api"
-import { fmtPct, fmtPrice, pctClass } from "@/lib/format"
+import { fmtPrice, pctClass } from "@/lib/format"
 import { ScoreMeter } from "@/components/widgets"
 import { cn } from "@/lib/utils"
 
@@ -32,15 +32,45 @@ export function FormulaCard({ formula, trend }: { formula: FormulaState | null; 
         : formula.score >= 30
           ? "bg-muted text-muted-foreground"
           : "bg-down-dim text-down"
+  const trendBull = formula.trend_text.startsWith("多头")
   return (
     <div className="terminal-panel flex min-h-0 flex-col overflow-y-auto p-2.5">
-      <div className="mb-2 flex items-center justify-between">
+      <div className="mb-1.5 flex items-center justify-between">
         <div className="panel-title">做T公式</div>
         <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-bold", adviceChip)}>
           {formula.advice || "--"}
         </span>
       </div>
-      <ScoreMeter value={formula.score} className="mb-2" />
+      <ScoreMeter value={formula.score} className="mb-1.5" />
+      {/* 核心盯盘行：趋势多空 / 资金态度 / 位置·均价（与榜单「做T分析」列同口径） */}
+      <div className="mb-1.5 flex flex-wrap items-center gap-1 text-[9px] leading-tight">
+        {formula.trend_text && (
+          <span
+            className={cn(
+              "rounded px-1 py-0.5 font-bold",
+              trendBull ? "bg-up-dim text-up" : "bg-down-dim text-down",
+            )}
+          >
+            {formula.trend_text}
+          </span>
+        )}
+        {(formula.fund_text || formula.fund_attitude) && (
+          <span
+            className={cn(
+              "num rounded bg-muted px-1 py-0.5 font-semibold",
+              pctClass(formula.fund_flow),
+            )}
+            title="大单分钟口径：单分钟成交额>160万按涨跌方向累计（A2/A3）"
+          >
+            资金 {formula.fund_text} {formula.fund_attitude}
+          </span>
+        )}
+        {(formula.position_text || formula.vwap_relation) && (
+          <span className="rounded bg-muted px-1 py-0.5 text-muted-foreground">
+            {formula.position_text} {formula.vwap_relation}
+          </span>
+        )}
+      </div>
       {/* 日线趋势值（趋势公式.md）：M5/M10/M20 + 短期（知行短期趋势线）/长期（知行多空线） */}
       {trend && (
         <div className="mb-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 rounded border border-border/60 bg-background/40 px-1.5 py-1 text-[9px]">
@@ -71,26 +101,21 @@ export function FormulaCard({ formula, trend }: { formula: FormulaState | null; 
           ))}
         </div>
       )}
+      {/* 做T当日常量价位（现价/涨跌见详情头部，量比/换手折叠进下方量能行） */}
       <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
-        <Metric label="现价" value={fmtPrice(formula.price)} className={pctClass(formula.change_pct)} />
-        <Metric label="涨跌" value={fmtPct(formula.change_pct)} className={pctClass(formula.change_pct)} />
         <Metric label="阻力" value={fmtPrice(formula.resistance)} className="text-down" />
         <Metric label="支撑" value={fmtPrice(formula.support)} className="text-up" />
         <Metric label="中轴" value={fmtPrice(formula.mid)} className="text-flat" />
         <Metric label="均价" value={fmtPrice(formula.vwap)} />
-        <Metric label="MA30" value={fmtPrice(formula.ma30)} />
-        <Metric label="强弱线" value={fmtPrice(formula.qs)} />
-        <Metric label="买" value={fmtWan(formula.buy_amount_wan)} className="text-up" />
-        <Metric label="卖" value={fmtWan(formula.sell_amount_wan)} className="text-down" />
-        <Metric label="买卖净" value={fmtWan(formula.net_amount_wan)} className={pctClass(formula.net_amount_wan)} />
-        <Metric label="量比" value={formula.volume_ratio != null ? formula.volume_ratio.toFixed(2) : "--"} />
         <Metric label="大单买" value={fmtWan(formula.big_buy_amount)} className="text-up" />
         <Metric label="大单卖" value={fmtWan(formula.big_sell_amount)} className="text-down" />
         <Metric label="资金流向" value={fmtWan(formula.fund_flow)} className={pctClass(formula.fund_flow)} />
-        <Metric
-          label="换手"
-          value={formula.turnover_rate != null ? `${formula.turnover_rate.toFixed(1)}%` : "--"}
-        />
+        <Metric label="买卖净" value={fmtWan(formula.net_amount_wan)} className={pctClass(formula.net_amount_wan)} />
+      </div>
+      <div className="mt-1 text-[9px] text-muted-foreground/80">
+        量能 {formula.volume_text || "--"}
+        {formula.turnover_rate != null && ` · 换手 ${formula.turnover_rate.toFixed(1)}%`}
+        {` · 买占比 ${formula.buy_pct.toFixed(0)}% / 卖 ${formula.sell_pct.toFixed(0)}%（内外盘口径）`}
       </div>
       {(formula.buy_signal || formula.sell_signal) && (
         <div
@@ -102,14 +127,10 @@ export function FormulaCard({ formula, trend }: { formula: FormulaState | null; 
           {formula.buy_signal ? "▲ 买信号：回踩支撑确认" : "▼ 卖信号：冲高阻力兑现"}
         </div>
       )}
-      {(formula.line_a || formula.line_b) && (
-        <div className="mt-1.5 space-y-0.5 border-t border-border/60 pt-1.5 text-[9px] leading-snug text-muted-foreground">
-          {formula.line_a && <div>{formula.line_a}</div>}
-          {formula.line_b && <div>{formula.line_b}</div>}
-        </div>
-      )}
       {formula.advice_detail && (
-        <div className="mt-1 text-[9px] leading-snug text-muted-foreground/70">{formula.advice_detail}</div>
+        <div className="mt-1 border-t border-border/60 pt-1 text-[9px] leading-snug text-muted-foreground/70">
+          {formula.advice_detail}
+        </div>
       )}
     </div>
   )
