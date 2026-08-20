@@ -24,8 +24,8 @@ interface StockDetailProps {
 
 export function StockDetail({ code, onClose, onToggleWatch, watchlisted, watchlistCodes }: StockDetailProps) {
   const watchlistKey = watchlistCodes.join(",")
-  const chartState = useLiveChannel<SignalChartResponse>("detail_chart", { code, watchlistCodes })
-  const overlayState = useLiveChannel<SignalOverlayResponse>("detail_overlay", { code, watchlistCodes })
+  const chartState = useLiveChannel<SignalChartResponse>("detail_chart", { code })
+  const overlayState = useLiveChannel<SignalOverlayResponse>("detail_overlay", { code })
   const coreExtrasState = usePolling(
     () =>
       getDetailExtras(code, watchlistCodes, {

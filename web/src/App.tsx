@@ -3,7 +3,6 @@ import { syncPushCodes } from "@/lib/pushSubscription"
 import { addWatchlist, importLegacyWatchlist, listWatchlist, removeWatchlist } from "@/lib/api"
 import {
   loadLocalWatchlist,
-  localWatchlistPlaceholders,
   watchlistCodes,
 } from "@/lib/localWatchlist"
 import { useLiveChannel } from "@/hooks/useLiveChannel"
@@ -33,8 +32,38 @@ export default function App() {
   const [detailCode, setDetailCode] = useState<string | null>(null)
   const [serverWatchlist, setServerWatchlist] = useState<WatchlistEntry[]>([])
   const [personalizationRevision, setPersonalizationRevision] = useState(0)
+  const [personalizationStatus, setPersonalizationStatus] = useState("loading")
+  const [personalizationError, setPersonalizationError] = useState<string | null>(null)
+  const [personalizationHydrated, setPersonalizationHydrated] = useState(false)
   const localWatchlist = useMemo(() => serverWatchlist, [serverWatchlist])
   const localWatchlistCodes = useMemo(() => watchlistCodes(localWatchlist), [localWatchlist])
+
+  // 全页共用一条持久 /ws/live：终端、指数分钟线、暗盘资金都在同一连接上
+  // 订阅/切换；页面交互只换频道，不关闭浏览器 WebSocket。
+  const stream = useTerminalStream({ sector, boardLevel, sort, page, pageSize: 40, nearTrend, pinBuy })
+  const refreshStream = stream.refresh
+  const indexMinutes = useLiveChannel<IndexMinutesResponse>("index_minutes", {})
+
+  const installCanonicalWatchlist = useCallback((response: { items: WatchlistEntry[]; revision: number; personalization_status: string }) => {
+    setServerWatchlist(response.items)
+    setPersonalizationRevision(response.revision)
+    setPersonalizationStatus(response.personalization_status)
+    setPersonalizationError(response.personalization_status === "unavailable" ? "个人数据暂不可用，请稍后重试。" : null)
+    setPersonalizationHydrated(true)
+  }, [])
+
+  const refreshCanonicalWatchlist = useCallback(async () => {
+    try {
+      const response = await listWatchlist()
+      installCanonicalWatchlist(response)
+      return response
+    } catch (error) {
+      setPersonalizationStatus("unavailable")
+      setPersonalizationError(`个人数据暂不可用：${error instanceof Error ? error.message : "请稍后重试。"}`)
+      setPersonalizationHydrated(true)
+      throw error
+    }
+  }, [installCanonicalWatchlist])
 
   useEffect(() => {
     let cancelled = false
@@ -43,36 +72,57 @@ export default function App() {
         const response = await listWatchlist()
         if (cancelled) return
         let canonical = response
-        const hasLegacy = localStorage.getItem("watchtower.watchlist.v1") !== null
+        let hasLegacy = false
+        try {
+          hasLegacy = localStorage.getItem("watchtower.watchlist.v1") !== null
+        } catch {
+          // Legacy migration is optional when browser storage is unavailable.
+        }
         const legacy = loadLocalWatchlist()
         if (hasLegacy) {
           const migration = await importLegacyWatchlist(legacy as WatchlistEntry[])
           if (!cancelled) canonical = migration
-          localStorage.removeItem("watchtower.watchlist.v1")
+          try {
+            localStorage.removeItem("watchtower.watchlist.v1")
+          } catch {
+            // Server-side import is idempotent; cleanup is best-effort only.
+          }
         }
         if (!cancelled) {
-          setServerWatchlist(canonical.items)
-          setPersonalizationRevision(canonical.revision)
+          installCanonicalWatchlist(canonical)
+          if (hasLegacy) refreshStream()
         }
-      } catch {
-        // An unavailable personal store leaves the stream's unavailable status authoritative.
+      } catch (error) {
+        if (!cancelled) {
+          setPersonalizationStatus("unavailable")
+          setPersonalizationError(`个人数据暂不可用：${error instanceof Error ? error.message : "请稍后重试。"}`)
+          setPersonalizationHydrated(true)
+        }
       }
     })()
     return () => { cancelled = true }
-  }, [])
+  }, [installCanonicalWatchlist, refreshStream])
 
   // 已开启飞书推送时，自选股变化自动同步到后端监听池（内部按签名去抖）
   useEffect(() => {
+    if (!personalizationHydrated || personalizationStatus !== "ready") return
     void syncPushCodes(localWatchlistCodes)
-  }, [localWatchlistCodes])
-
-  // 全页共用一条持久 /ws/live：终端、指数分钟线、暗盘资金都在同一连接上
-  // 订阅/切换；页面交互只换频道，不关闭浏览器 WebSocket。
-  const stream = useTerminalStream({ sector, boardLevel, sort, page, pageSize: 40, nearTrend, pinBuy })
-  const refreshStream = stream.refresh
-  const indexMinutes = useLiveChannel<IndexMinutesResponse>("index_minutes", {})
+  }, [localWatchlistCodes, personalizationHydrated, personalizationStatus])
 
   const data = stream.data
+  useEffect(() => {
+    if (!data?.personalization_status) return
+    setPersonalizationStatus(data.personalization_status)
+    if (data.personalization_status === "unavailable") {
+      setPersonalizationError("个人数据暂不可用，请稍后重试。")
+      return
+    }
+    setPersonalizationError(null)
+    if (data.personalization_revision != null && data.personalization_revision !== personalizationRevision) {
+      setPersonalizationRevision(data.personalization_revision)
+      void refreshCanonicalWatchlist().catch(() => undefined)
+    }
+  }, [data?.personalization_revision, data?.personalization_status, personalizationRevision, refreshCanonicalWatchlist])
   // 休市判定：盘后/非交易日后端会冻结并停流，此时断线属正常“休息中”而非连接异常
   const marketClosed = useMemo(() => {
     if (!data) return false
@@ -81,8 +131,8 @@ export default function App() {
   }, [data])
   const boardData = data?.stock_board ?? null
   const watchlistForRail = useMemo(
-    () => (data ? data.watchlist_preview : localWatchlistPlaceholders(localWatchlist)),
-    [data, localWatchlist],
+    () => data?.watchlist_preview ?? [],
+    [data],
   )
 
   // 当前选中板块的领涨锚（龙头），传给榜单头部展示
@@ -141,39 +191,45 @@ export default function App() {
     (item: BoardItem) => {
       void (item.watchlisted ? removeWatchlist(item.code, personalizationRevision) : addWatchlist({ code: item.code, name: item.name }, personalizationRevision))
         .then((response) => {
-          setServerWatchlist(response.items)
-          setPersonalizationRevision(response.revision)
+          installCanonicalWatchlist(response)
           refreshStream()
         })
-        .catch(() => undefined)
+        .catch((error) => {
+          setPersonalizationError(`自选更新失败：${error instanceof Error ? error.message : "请稍后重试。"}`)
+          void refreshCanonicalWatchlist().catch(() => undefined)
+        })
     },
-    [personalizationRevision, refreshStream],
+    [installCanonicalWatchlist, personalizationRevision, refreshCanonicalWatchlist, refreshStream],
   )
 
   const handleDetailToggleWatch = useCallback(
     (code: string, name: string, watchlisted: boolean) => {
       void (watchlisted ? removeWatchlist(code, personalizationRevision) : addWatchlist({ code, name }, personalizationRevision))
         .then((response) => {
-          setServerWatchlist(response.items)
-          setPersonalizationRevision(response.revision)
+          installCanonicalWatchlist(response)
           refreshStream()
         })
-        .catch(() => undefined)
+        .catch((error) => {
+          setPersonalizationError(`自选更新失败：${error instanceof Error ? error.message : "请稍后重试。"}`)
+          void refreshCanonicalWatchlist().catch(() => undefined)
+        })
     },
-    [personalizationRevision, refreshStream],
+    [installCanonicalWatchlist, personalizationRevision, refreshCanonicalWatchlist, refreshStream],
   )
 
   const handleRemoveWatch = useCallback(
     (code: string) => {
       void removeWatchlist(code, personalizationRevision)
         .then((response) => {
-          setServerWatchlist(response.items)
-          setPersonalizationRevision(response.revision)
+          installCanonicalWatchlist(response)
           refreshStream()
         })
-        .catch(() => undefined)
+        .catch((error) => {
+          setPersonalizationError(`自选更新失败：${error instanceof Error ? error.message : "请稍后重试。"}`)
+          void refreshCanonicalWatchlist().catch(() => undefined)
+        })
     },
-    [personalizationRevision, refreshStream],
+    [installCanonicalWatchlist, personalizationRevision, refreshCanonicalWatchlist, refreshStream],
   )
 
   const fatalError = stream.error && !data ? stream.error : null
@@ -249,6 +305,18 @@ export default function App() {
       {fatalError && (
         <div className="fixed bottom-3 left-1/2 z-40 -translate-x-1/2 rounded-md border border-destructive/50 bg-destructive/15 px-3 py-1.5 text-[11px] text-destructive">
           后端连接异常：{fatalError}（请确认 127.0.0.1:8788 盯盘后端已启动）
+        </div>
+      )}
+
+      {!personalizationHydrated && (
+        <div className="fixed bottom-3 left-1/2 z-40 -translate-x-1/2 rounded-md border border-border bg-card/95 px-3 py-1.5 text-[11px] text-muted-foreground shadow-lg">
+          正在加载个人自选数据…
+        </div>
+      )}
+
+      {personalizationError && (
+        <div className="fixed bottom-10 left-1/2 z-40 -translate-x-1/2 rounded-md border border-destructive/50 bg-destructive/15 px-3 py-1.5 text-[11px] text-destructive">
+          {personalizationError}
         </div>
       )}
 

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { build } from "esbuild"
+import { readFile } from "node:fs/promises"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const projectRoot = path.resolve(__dirname, "..")
@@ -54,6 +55,14 @@ try {
   assert.equal(requests[0].headers.has("X-Client-ID"), true)
   assert.equal(requests[0].input.includes("watchlist_codes"), false)
   assert.equal(requests[1].input.includes("watchlist_codes"), false)
+
+  const [appSource, detailSource] = await Promise.all([
+    readFile(path.join(projectRoot, "src", "App.tsx"), "utf8"),
+    readFile(path.join(projectRoot, "src", "components", "detail", "StockDetail.tsx"), "utf8"),
+  ])
+  assert.match(appSource, /personalizationHydrated/)
+  assert.match(appSource, /personalization_status === "unavailable"/)
+  assert.doesNotMatch(detailSource, /\{ code, watchlistCodes \}/)
 } finally {
   await rm(tempDir, { recursive: true, force: true })
 }
