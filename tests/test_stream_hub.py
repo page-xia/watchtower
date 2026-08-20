@@ -7,6 +7,7 @@ import json
 
 import pytest
 
+from app.data_update_buffer import DataUpdateBuffer
 from app.stream_hub import RESYNC, ChannelLimitExceeded, ChannelSpec, StreamHub
 
 
@@ -165,5 +166,43 @@ def test_unsubscribed_channel_stops_building():
         await asyncio.sleep(0.3)
         assert counter["count"] == frozen
         await hub.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_event_driven_channel_rebuilds_only_for_relevant_updates_and_refresh():
+    async def scenario():
+        update_buffer = DataUpdateBuffer()
+        hub = StreamHub(
+            queue_size=8,
+            channel_idle_seconds=30,
+            update_buffer=update_buffer,
+        )
+        counter = {"count": 0}
+
+        def factory() -> ChannelSpec:
+            spec = make_spec(counter, interval=30.0)
+            spec.interests = frozenset({"terminal", "mini_chart"})
+            return spec
+
+        sub = hub.subscribe(("view", 1), factory)
+        try:
+            assert await collect(sub.queue, 1) == ["m1"]
+            await asyncio.sleep(0.05)
+            assert counter["count"] == 1
+
+            update_buffer.commit({"dark_pool": 1}, reason="irrelevant")
+            await asyncio.sleep(0.05)
+            assert counter["count"] == 1
+
+            update_buffer.commit({"mini_chart": 1}, reason="warm_complete")
+            assert await collect(sub.queue, 1) == ["m2"]
+            assert counter["count"] == 2
+
+            hub.refresh(sub)
+            assert await collect(sub.queue, 1) == ["m3"]
+            assert counter["count"] == 3
+        finally:
+            await hub.aclose()
 
     asyncio.run(scenario())

@@ -10,6 +10,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+from app.data_update_buffer import DataUpdateBuffer
 from app.models import MiniIntradaySeries, SectorFlowPoint, SectorFlowSeries
 from app.services import BoardEntry, DashboardService
 
@@ -21,6 +22,11 @@ def _service() -> DashboardService:
     service._sector_flow_names_by_key = {}
     service._sector_flow_refresh_threads = {}
     service._terminal_cache_by_key = {}
+    service._terminal_cache_lock = threading.Lock()
+    service._terminal_build_locks = {}
+    service._dashboard_cache_by_key = {}
+    service._dashboard_cache_lock = threading.Lock()
+    service._dashboard_build_locks = {}
     service._stock_mini_chart_cache = {}
     service._sector_mini_chart_cache = {}
     service._mini_chart_warm_lock = threading.Lock()
@@ -29,6 +35,7 @@ def _service() -> DashboardService:
     service._last_stock_mini_chart_elapsed_ms = 0.0
     service._last_stock_mini_chart_missing_count = 0
     service._last_stock_mini_chart_loaded_count = 0
+    service.data_update_buffer = DataUpdateBuffer()
     service.settings = SimpleNamespace(
         terminal_context_frozen_cache_seconds=300,
         sector_flow_refresh_seconds=10,
@@ -69,6 +76,9 @@ def test_mini_charts_defer_and_warm_in_background() -> None:
     assert thread is not None
     thread.join(timeout=10)
     assert calls == [["300476"]]
+    commit = service.data_update_buffer.snapshot()
+    assert commit.reason == "mini_chart_warm_complete"
+    assert {"mini_chart", "terminal", "detail"} == set(commit.changed_sections)
 
     cached = service._stock_mini_charts_by_code(_context(), ["300476"])
     assert cached["300476"].source_quality not in {"deferred", "unavailable"}
@@ -127,6 +137,9 @@ def test_frozen_sector_flow_deferred_and_warmed(monkeypatch) -> None:
 
     cached = service._sector_flow_for_context(snapshot, sectors, allow_deferred=True)
     assert [series.name for series in cached] == ["PCB"]
+    commit = service.data_update_buffer.snapshot()
+    assert commit.reason == "sector_flow_refresh"
+    assert commit.changed_sections == frozenset({"sector_flow", "terminal"})
 
 
 def test_frozen_sector_flow_stays_synchronous_without_deferred(monkeypatch) -> None:

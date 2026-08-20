@@ -18,7 +18,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -132,8 +132,13 @@ def fetch_full_market() -> dict[str, dict[str, Any]]:
 class EMMoneyflowCache:
     """东财资金流快照缓存：请求路径只读；过期时后台一次性线程补齐。"""
 
-    def __init__(self, enabled: bool | None = None) -> None:
+    def __init__(
+        self,
+        enabled: bool | None = None,
+        on_update: Callable[[], None] | None = None,
+    ) -> None:
         self._enabled = _EM_ENABLED if enabled is None else enabled
+        self._on_update = on_update
         self._lock = threading.Lock()
         self._rows: dict[str, dict[str, Any]] = {}
         self._fetched_at: float = 0.0  # time.monotonic 戳
@@ -194,3 +199,9 @@ class EMMoneyflowCache:
                     self._fetched_at = time.monotonic() - self._ttl() + 30
                 self._error = str(exc)[:120]
                 self._fetching = False
+        finally:
+            if self._on_update is not None:
+                try:
+                    self._on_update()
+                except Exception:  # noqa: BLE001 - 通知失败不得影响缓存刷新
+                    logger.exception("em moneyflow update callback failed")
