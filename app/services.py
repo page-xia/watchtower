@@ -2119,6 +2119,8 @@ class DashboardService:
         """Import browser watchlist state through the canonical repository."""
         if not isinstance(principal, Principal):
             raise ValueError("principal is required")
+        if items is None:
+            raise ValueError("items are required")
         store = getattr(self, "user_state_store", None)
         if store is None:
             raise UserStateUnavailable("principal state store is unavailable")
@@ -2249,10 +2251,13 @@ class DashboardService:
         expected_revision: int | None = None,
     ) -> bool:
         if isinstance(principal, Principal):
-            if code is None or self.user_state_store is None:
-                raise ValueError("code and principal state store are required")
+            if code is None:
+                raise ValueError("code is required")
+            store = getattr(self, "user_state_store", None)
+            if store is None:
+                raise UserStateUnavailable("principal state store is unavailable")
             current = self._principal_state(principal)
-            mutation = self.user_state_store.delete_watchlist(principal, code, expected_revision=expected_revision)
+            mutation = store.delete_watchlist(principal, code, expected_revision=expected_revision)
             self._invalidate_principal_state(principal)
             self._principal_state(principal, refresh=True)
             self._publish_data_update("watchlist", "terminal", "detail", reason="watchlist_delete", metadata={"code": str(code).zfill(6), "principal": principal.log_digest})
@@ -2312,9 +2317,12 @@ class DashboardService:
             self._invalidate_context()
             self._publish_data_update("positions", "terminal", "detail", reason="position_upsert", metadata={"code": saved.code})
             return saved
-        if not isinstance(principal, Principal) or item is None or self.user_state_store is None:
+        if not isinstance(principal, Principal) or item is None:
             raise ValueError("principal is required")
-        mutation = self.user_state_store.upsert_position(principal, item, expected_revision=expected_revision)
+        store = getattr(self, "user_state_store", None)
+        if store is None:
+            raise UserStateUnavailable("principal state store is unavailable")
+        mutation = store.upsert_position(principal, item, expected_revision=expected_revision)
         saved = mutation.item if isinstance(mutation.item, PositionRecord) else item
         self._invalidate_principal_state(principal)
         self._principal_state(principal, refresh=True)
@@ -2329,10 +2337,13 @@ class DashboardService:
         expected_revision: int | None = None,
     ) -> bool:
         if isinstance(principal, Principal):
-            if code is None or self.user_state_store is None:
-                raise ValueError("code and principal state store are required")
+            if code is None:
+                raise ValueError("code is required")
+            store = getattr(self, "user_state_store", None)
+            if store is None:
+                raise UserStateUnavailable("principal state store is unavailable")
             current = self._principal_state(principal)
-            mutation = self.user_state_store.delete_position(principal, code, expected_revision=expected_revision)
+            mutation = store.delete_position(principal, code, expected_revision=expected_revision)
             normalized = str(code).zfill(6)
             self._invalidate_principal_state(principal)
             self._principal_state(principal, refresh=True)

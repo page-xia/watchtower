@@ -435,6 +435,52 @@ def test_principal_state_wrapper_and_legacy_import_use_canonical_repository(tmp_
     assert [item.code for item in state.watchlist] == ["300476"]
 
 
+@pytest.mark.parametrize(
+    ("operation", "args"),
+    [
+        ("upsert_watchlist", (WatchlistItem(code="300476", name="胜宏科技"),)),
+        ("delete_watchlist", ("300476",)),
+        ("upsert_position", (PositionRecord(code="300476"),)),
+        ("delete_position", ("300476",)),
+        ("import_legacy_watchlist_once", ([WatchlistItem(code="300476", name="胜宏科技")],)),
+    ],
+)
+def test_principal_mutations_report_unavailable_when_repository_is_missing(
+    tmp_path,
+    operation,
+    args,
+) -> None:
+    service = make_principal_service(tmp_path)
+    service.user_state_store = None
+    principal = Principal("anonymous_client", "alice-0001")
+
+    with pytest.raises(UserStateUnavailable):
+        getattr(service, operation)(principal, *args)
+
+
+@pytest.mark.parametrize(
+    ("operation", "args"),
+    [
+        ("upsert_watchlist", ()),
+        ("delete_watchlist", ()),
+        ("upsert_position", ()),
+        ("delete_position", ()),
+        ("import_legacy_watchlist_once", (None,)),
+    ],
+)
+def test_principal_mutations_validate_arguments_before_store_availability(
+    tmp_path,
+    operation,
+    args,
+) -> None:
+    service = make_principal_service(tmp_path)
+    service.user_state_store = None
+    principal = Principal("anonymous_client", "alice-0001")
+
+    with pytest.raises(ValueError):
+        getattr(service, operation)(principal, *args)
+
+
 def test_watchlist_mutation_publishes_terminal_update(tmp_path) -> None:
     update_buffer = DataUpdateBuffer()
     service = make_service(tmp_path, data_update_buffer=update_buffer)
