@@ -9,8 +9,14 @@ export interface PushSubscription {
   updated_at: string
 }
 
+function clientHeaders(extra: HeadersInit = {}): Headers {
+  const headers = new Headers(extra)
+  headers.set("X-Client-ID", getClientId())
+  return headers
+}
+
 async function doFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(path, init)
+  const resp = await fetch(path, { ...init, headers: clientHeaders(init?.headers) })
   if (!resp.ok) {
     const text = await resp.text().catch(() => "")
     let detail = `${resp.status} ${resp.statusText}`
@@ -26,14 +32,14 @@ async function doFetch<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function fetchPushSubscription(): Promise<PushSubscription> {
-  return doFetch<PushSubscription>(`/api/push/subscription?client_id=${encodeURIComponent(getClientId())}`)
+  return doFetch<PushSubscription>("/api/push/subscription")
 }
 
 export function savePushSubscription(input: { webhook_url: string; enabled: boolean; codes: string[] }): Promise<PushSubscription> {
   return doFetch<PushSubscription>(`/api/push/subscription`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ client_id: getClientId(), ...input }),
+    body: JSON.stringify(input),
   })
 }
 

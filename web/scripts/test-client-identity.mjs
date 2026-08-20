@@ -34,6 +34,14 @@ try {
   assert.equal(module.CLIENT_ID_KEY, "watchtower.client-id.v1")
   assert.match(first, /^[A-Za-z0-9_-]{8,64}$/)
   assert.equal(first, second)
+  globalThis.window = {
+    localStorage: {
+      getItem: () => { throw new Error("storage disabled") },
+      setItem: () => { throw new Error("storage disabled") },
+    },
+  }
+  assert.equal(module.getClientId(), module.getClientId())
+  delete globalThis.window
 
   const apiOutfile = path.join(tempDir, "api.mjs")
   await build({
@@ -47,7 +55,7 @@ try {
   assert.match(api.clientHeaders().get("X-Client-ID"), /^[A-Za-z0-9_-]{8,64}$/)
   const requests = []
   globalThis.fetch = async (input, init) => {
-    requests.push({ input: String(input), headers: new Headers(init?.headers) })
+    requests.push({ input: String(input), headers: new Headers(init?.headers), body: init?.body })
     return new Response(JSON.stringify({}), { status: 200 })
   }
   await api.getTerminal({ watchlistCodes: ["300476"] })
@@ -55,6 +63,24 @@ try {
   assert.equal(requests[0].headers.has("X-Client-ID"), true)
   assert.equal(requests[0].input.includes("watchlist_codes"), false)
   assert.equal(requests[1].input.includes("watchlist_codes"), false)
+
+  const pushOutfile = path.join(tempDir, "pushSubscription.mjs")
+  await build({
+    entryPoints: [path.join(projectRoot, "src", "lib", "pushSubscription.ts")],
+    bundle: true,
+    format: "esm",
+    platform: "browser",
+    outfile: pushOutfile,
+  })
+  const push = await import(pathToFileURL(pushOutfile).href)
+  await push.fetchPushSubscription()
+  await push.savePushSubscription({ webhook_url: "https://example.test/hook", enabled: true, codes: ["300476"] })
+  await push.sendTestPush("https://example.test/hook")
+  for (const request of requests.slice(2)) {
+    assert.equal(request.headers.has("X-Client-ID"), true)
+    assert.equal(request.input.includes("client_id"), false)
+    assert.equal(String(request.body ?? "").includes("client_id"), false)
+  }
 
   const [appSource, detailSource] = await Promise.all([
     readFile(path.join(projectRoot, "src", "App.tsx"), "utf8"),
