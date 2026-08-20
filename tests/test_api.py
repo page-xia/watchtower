@@ -891,6 +891,44 @@ def test_personal_state_write_failures_map_to_service_errors(monkeypatch) -> Non
     assert migration.status_code == 503
 
 
+def test_push_subscription_owner_comes_only_from_client_header(monkeypatch) -> None:
+    class FakeStore:
+        def __init__(self) -> None:
+            self.items = {}
+
+        def get(self, client_id):
+            return self.items.get(client_id)
+
+        def upsert(self, item):
+            self.items[item.client_id] = item
+            return item
+
+    store = FakeStore()
+    monkeypatch.setattr(main_module, "service", SimpleNamespace(push_pool=SimpleNamespace(store=store)))
+    client = TestClient(app)
+    owner = {"X-Client-ID": "client-push-0001"}
+
+    missing_get = client.get("/api/push/subscription?client_id=client-push-evil")
+    missing_put = client.put(
+        "/api/push/subscription",
+        json={"client_id": "client-push-evil", "webhook_url": "", "enabled": False, "codes": []},
+    )
+    saved = client.put(
+        "/api/push/subscription",
+        headers=owner,
+        json={"client_id": "client-push-evil", "webhook_url": "", "enabled": False, "codes": ["300476"]},
+    )
+    loaded = client.get("/api/push/subscription?client_id=client-push-evil", headers=owner)
+
+    assert missing_get.status_code == 422
+    assert missing_put.status_code == 422
+    assert saved.status_code == 200
+    assert saved.json()["client_id"] == "client-push-0001"
+    assert loaded.status_code == 200
+    assert loaded.json()["client_id"] == "client-push-0001"
+    assert "client-push-evil" not in store.items
+
+
 def test_opening_decision_endpoint_returns_checkpoint_and_reasons(monkeypatch) -> None:
     class FakeService:
         def opening_decision(self, sector=None):

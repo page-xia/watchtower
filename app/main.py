@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.data_sources import china_now, is_trading_window, market_session, normalize_board_level
 from app.config import ROOT_DIR, settings
@@ -827,16 +827,28 @@ def import_legacy_watchlist(
 
 
 @app.get("/api/push/subscription")
-def get_push_subscription(client_id: str) -> dict:
-    item = service.push_pool.store.get(client_id)
+def get_push_subscription(principal: Principal = Depends(require_principal)) -> dict:
+    item = service.push_pool.store.get(principal.id)
     if item is None:
-        return {"client_id": client_id, "webhook_url": "", "enabled": False, "codes": [], "updated_at": ""}
+        return {"client_id": principal.id, "webhook_url": "", "enabled": False, "codes": [], "updated_at": ""}
     return item.model_dump(mode="json")
 
 
+class PushSubscriptionRequest(BaseModel):
+    """Mutable push settings; subscription ownership comes from the header."""
+
+    webhook_url: str = ""
+    enabled: bool = False
+    codes: list[str] = Field(default_factory=list)
+
+
 @app.put("/api/push/subscription")
-def upsert_push_subscription(item: WebhookSubscription) -> dict:
+def upsert_push_subscription(
+    payload: PushSubscriptionRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict:
     try:
+        item = WebhookSubscription(client_id=principal.id, **payload.model_dump())
         saved = service.push_pool.store.upsert(item)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
