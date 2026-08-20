@@ -5,6 +5,7 @@ import {
   type LiveChannelPayload,
   type LiveSocketStatus,
 } from "@/lib/liveSocket"
+import { getClientId } from "@/lib/clientIdentity"
 
 export interface LiveChannelState<T> {
   data: T | null
@@ -44,6 +45,9 @@ export function useLiveChannel<T>(
     }
 
     const parsedParams = JSON.parse(paramsKey) as Record<string, unknown>
+    if (channel === "detail_chart" || channel === "detail_overlay" || channel === "detail_daily" || channel === "terminal") {
+      parsedParams.client_id = getClientId()
+    }
     return liveSocket.subscribe(channel, parsedParams, handleMessage)
   }, [channel, paramsKey])
 

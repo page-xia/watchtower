@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import type { BoardItem, StockBoard, TerminalPayload } from "@/types/api"
 import { liveSocket, type LiveChannelPayload } from "@/lib/liveSocket"
 import { useLiveStatus } from "@/hooks/useLiveChannel"
+import { getClientId } from "@/lib/clientIdentity"
 
 export interface TerminalStreamParams {
   sector?: string | null
@@ -108,7 +109,7 @@ export function useTerminalStream(params: TerminalStreamParams): TerminalStreamS
       }
     }
 
-    const streamParams = JSON.parse(paramsKey) as TerminalStreamParams
+    const streamParams = { ...(JSON.parse(paramsKey) as TerminalStreamParams), client_id: getClientId() }
     return liveSocket.subscribe(
       "terminal",
       streamParams as unknown as Record<string, unknown>,

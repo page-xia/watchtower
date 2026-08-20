@@ -1,18 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { syncPushCodes } from "@/lib/pushSubscription"
+import { addWatchlist, importLegacyWatchlist, listWatchlist, removeWatchlist } from "@/lib/api"
 import {
-  applyLocalWatchlistToPayload,
   loadLocalWatchlist,
   localWatchlistPlaceholders,
-  removeLocalWatchlist,
-  saveLocalWatchlist,
-  upsertLocalWatchlist,
   watchlistCodes,
 } from "@/lib/localWatchlist"
 import { useLiveChannel } from "@/hooks/useLiveChannel"
 import { useTerminalStream } from "@/hooks/useTerminalStream"
 import { refreshPolicyFromPayload } from "@/lib/marketRefresh"
-import type { BoardItem, IndexMinutesResponse } from "@/types/api"
+import type { BoardItem, IndexMinutesResponse, WatchlistEntry } from "@/types/api"
 import { TopBar } from "@/components/TopBar"
 import { MarketStrip } from "@/components/MarketStrip"
 import { SectorPanel } from "@/components/SectorPanel"
@@ -34,8 +31,35 @@ export default function App() {
   const [nearTrend, setNearTrend] = useState(() => localStorage.getItem("board-near-trend") === "1")
   const [pinBuy, setPinBuy] = useState(() => localStorage.getItem("board-pin-buy") === "1")
   const [detailCode, setDetailCode] = useState<string | null>(null)
-  const [localWatchlist, setLocalWatchlist] = useState(() => loadLocalWatchlist())
+  const [serverWatchlist, setServerWatchlist] = useState<WatchlistEntry[]>([])
+  const [personalizationRevision, setPersonalizationRevision] = useState(0)
+  const localWatchlist = useMemo(() => serverWatchlist, [serverWatchlist])
   const localWatchlistCodes = useMemo(() => watchlistCodes(localWatchlist), [localWatchlist])
+
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const response = await listWatchlist()
+        if (cancelled) return
+        let canonical = response
+        const hasLegacy = localStorage.getItem("watchtower.watchlist.v1") !== null
+        const legacy = loadLocalWatchlist()
+        if (hasLegacy) {
+          const migration = await importLegacyWatchlist(legacy as WatchlistEntry[])
+          if (!cancelled) canonical = migration
+          localStorage.removeItem("watchtower.watchlist.v1")
+        }
+        if (!cancelled) {
+          setServerWatchlist(canonical.items)
+          setPersonalizationRevision(canonical.revision)
+        }
+      } catch {
+        // An unavailable personal store leaves the stream's unavailable status authoritative.
+      }
+    })()
+    return () => { cancelled = true }
+  }, [])
 
   // 已开启飞书推送时，自选股变化自动同步到后端监听池（内部按签名去抖）
   useEffect(() => {
@@ -44,11 +68,11 @@ export default function App() {
 
   // 全页共用一条持久 /ws/live：终端、指数分钟线、暗盘资金都在同一连接上
   // 订阅/切换；页面交互只换频道，不关闭浏览器 WebSocket。
-  const stream = useTerminalStream({ sector, boardLevel, sort, page, pageSize: 40, nearTrend, pinBuy, watchlistCodes: localWatchlistCodes })
+  const stream = useTerminalStream({ sector, boardLevel, sort, page, pageSize: 40, nearTrend, pinBuy })
   const refreshStream = stream.refresh
   const indexMinutes = useLiveChannel<IndexMinutesResponse>("index_minutes", {})
 
-  const data = useMemo(() => applyLocalWatchlistToPayload(stream.data, localWatchlist), [stream.data, localWatchlist])
+  const data = stream.data
   // 休市判定：盘后/非交易日后端会冻结并停流，此时断线属正常“休息中”而非连接异常
   const marketClosed = useMemo(() => {
     if (!data) return false
@@ -115,38 +139,41 @@ export default function App() {
 
   const handleToggleWatch = useCallback(
     (item: BoardItem) => {
-      setLocalWatchlist((current) => {
-        const next = item.watchlisted ? removeLocalWatchlist(current, item.code) : upsertLocalWatchlist(current, item)
-        saveLocalWatchlist(next)
-        return next
-      })
-      refreshStream()
+      void (item.watchlisted ? removeWatchlist(item.code, personalizationRevision) : addWatchlist({ code: item.code, name: item.name }, personalizationRevision))
+        .then((response) => {
+          setServerWatchlist(response.items)
+          setPersonalizationRevision(response.revision)
+          refreshStream()
+        })
+        .catch(() => undefined)
     },
-    [refreshStream],
+    [personalizationRevision, refreshStream],
   )
 
   const handleDetailToggleWatch = useCallback(
     (code: string, name: string, watchlisted: boolean) => {
-      setLocalWatchlist((current) => {
-        const next = watchlisted ? removeLocalWatchlist(current, code) : upsertLocalWatchlist(current, { code, name })
-        saveLocalWatchlist(next)
-        return next
-      })
-      refreshStream()
+      void (watchlisted ? removeWatchlist(code, personalizationRevision) : addWatchlist({ code, name }, personalizationRevision))
+        .then((response) => {
+          setServerWatchlist(response.items)
+          setPersonalizationRevision(response.revision)
+          refreshStream()
+        })
+        .catch(() => undefined)
     },
-    [refreshStream],
+    [personalizationRevision, refreshStream],
   )
 
   const handleRemoveWatch = useCallback(
     (code: string) => {
-      setLocalWatchlist((current) => {
-        const next = removeLocalWatchlist(current, code)
-        saveLocalWatchlist(next)
-        return next
-      })
-      refreshStream()
+      void removeWatchlist(code, personalizationRevision)
+        .then((response) => {
+          setServerWatchlist(response.items)
+          setPersonalizationRevision(response.revision)
+          refreshStream()
+        })
+        .catch(() => undefined)
     },
-    [refreshStream],
+    [personalizationRevision, refreshStream],
   )
 
   const fatalError = stream.error && !data ? stream.error : null

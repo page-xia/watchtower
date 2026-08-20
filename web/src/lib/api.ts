@@ -14,11 +14,18 @@ import type {
   TransactionFlow,
   WatchlistEntry,
 } from "@/types/api"
+import { getClientId } from "@/lib/clientIdentity"
 
 const BASE = ""
 
+export function clientHeaders(extra: HeadersInit = {}): Headers {
+  const headers = new Headers(extra)
+  headers.set("X-Client-ID", getClientId())
+  return headers
+}
+
 async function doFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(`${BASE}${path}`, init)
+  const resp = await fetch(`${BASE}${path}`, { ...init, headers: clientHeaders(init?.headers) })
   if (!resp.ok) {
     const text = await resp.text().catch(() => "")
     throw new Error(`${resp.status} ${resp.statusText}${text ? ` · ${text.slice(0, 120)}` : ""}`)
@@ -34,12 +41,13 @@ const inflightGet = new Map<string, Promise<unknown>>()
 async function fetchJSON<T>(path: string, init?: RequestInit): Promise<T> {
   const isGet = !init || !init.method || init.method.toUpperCase() === "GET"
   if (!isGet) return doFetch<T>(path, init)
-  const existing = inflightGet.get(path)
+  const key = `${path}::${getClientId()}`
+  const existing = inflightGet.get(key)
   if (existing) return existing as Promise<T>
   const promise = doFetch<T>(path, init).finally(() => {
-    inflightGet.delete(path)
+    inflightGet.delete(key)
   })
-  inflightGet.set(path, promise)
+  inflightGet.set(key, promise)
   return promise
 }
 
@@ -64,7 +72,6 @@ export function getTerminal(params: TerminalParams = {}): Promise<TerminalPayloa
   if (params.sector) q.set("sector", params.sector)
   if (params.nearTrend) q.set("near_trend", "1")
   if (params.pinBuy) q.set("pin_buy", "1")
-  q.set("watchlist_codes", (params.watchlistCodes ?? []).join(","))
   return fetchJSON<TerminalPayload>(`/api/dashboard?${q.toString()}`)
 }
 
@@ -77,20 +84,25 @@ export function getStockBoard(params: TerminalParams = {}): Promise<StockBoard> 
   if (params.sector) q.set("sector", params.sector)
   if (params.nearTrend) q.set("near_trend", "1")
   if (params.pinBuy) q.set("pin_buy", "1")
-  q.set("watchlist_codes", (params.watchlistCodes ?? []).join(","))
   return fetchJSON<StockBoard>(`/api/stocks/board?${q.toString()}`)
 }
 
-export function getSignalChart(code: string, watchlistCodes: string[] = []): Promise<SignalChartResponse> {
+export interface PersonalStateEnvelope<T> {
+  items: T[]
+  revision: number
+  personalization_status: "ready" | "missing_identity" | "unavailable" | string
+}
+
+export function getSignalChart(code: string, _watchlistCodes: string[] = []): Promise<SignalChartResponse> {
+  void _watchlistCodes
   const q = new URLSearchParams()
-  q.set("watchlist_codes", watchlistCodes.join(","))
   const suffix = q.toString() ? `?${q.toString()}` : ""
   return fetchJSON(`/api/signals/${code}/detail/chart${suffix}`)
 }
 
-export function getSignalOverlay(code: string, watchlistCodes: string[] = []): Promise<SignalOverlayResponse> {
+export function getSignalOverlay(code: string, _watchlistCodes: string[] = []): Promise<SignalOverlayResponse> {
+  void _watchlistCodes
   const q = new URLSearchParams()
-  q.set("watchlist_codes", watchlistCodes.join(","))
   const suffix = q.toString() ? `?${q.toString()}` : ""
   return fetchJSON(`/api/signals/${code}/detail/overlay${suffix}`)
 }
@@ -118,9 +130,10 @@ export function getDetailDaily(code: string, count = 240): Promise<DailyDetailRe
 
 export function getDetailExtras(
   code: string,
-  watchlistCodes: string[] = [],
+  _watchlistCodes: string[] = [],
   options: DetailExtrasOptions = {},
 ): Promise<DetailExtrasResponse> {
+  void _watchlistCodes
   const {
     includeFundamentals = true,
     includeCapitalFlow = true,
@@ -136,7 +149,6 @@ export function getDetailExtras(
   q.set("include_chanlun", String(includeChanlun))
   q.set("include_auction_history", String(includeAuctionHistory))
   q.set("include_messages", String(includeMessages))
-  q.set("watchlist_codes", watchlistCodes.join(","))
   return fetchJSON(`/api/signals/${code}/detail/extras?${q.toString()}`)
 }
 
@@ -144,11 +156,11 @@ export function getMessageDetail(eventId: string): Promise<MessageDetailResponse
   return fetchJSON(`/api/messages/${encodeURIComponent(eventId)}`)
 }
 
-export function searchStocks(q: string, watchlistCodes: string[] = []): Promise<StockSearchResult[]> {
+export function searchStocks(q: string, _watchlistCodes: string[] = []): Promise<StockSearchResult[]> {
+  void _watchlistCodes
   const params = new URLSearchParams()
   params.set("q", q)
   params.set("limit", "12")
-  params.set("watchlist_codes", watchlistCodes.join(","))
   return fetchJSON(`/api/stocks/search?${params.toString()}`)
 }
 
@@ -168,20 +180,24 @@ export function getDarkPoolStock(code: string): Promise<DarkPoolStockPayload> {
   return fetchJSON(`/api/dark-pool/stock/${code}`)
 }
 
-export function addWatchlist(item: { code: string; name: string; themes?: string[] }): Promise<unknown> {
+export function addWatchlist(item: { code: string; name: string; themes?: string[] }, expectedRevision?: number): Promise<PersonalStateEnvelope<WatchlistEntry>> {
   return fetchJSON(`/api/watchlist`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(expectedRevision == null ? {} : { "X-Expected-Revision": String(expectedRevision) }) },
     body: JSON.stringify({ code: item.code, name: item.name, themes: item.themes ?? [], core: false, position: false, notes: "" }),
   })
 }
 
-export function removeWatchlist(code: string): Promise<unknown> {
-  return fetchJSON(`/api/watchlist/${code}`, { method: "DELETE" })
+export function removeWatchlist(code: string, expectedRevision?: number): Promise<PersonalStateEnvelope<WatchlistEntry> & { deleted?: boolean; code?: string }> {
+  return fetchJSON(`/api/watchlist/${code}`, { method: "DELETE", headers: expectedRevision == null ? undefined : { "X-Expected-Revision": String(expectedRevision) } })
 }
 
-export function listWatchlist(): Promise<WatchlistEntry[]> {
+export function listWatchlist(): Promise<PersonalStateEnvelope<WatchlistEntry>> {
   return fetchJSON(`/api/watchlist`)
+}
+
+export function importLegacyWatchlist(items: WatchlistEntry[]): Promise<PersonalStateEnvelope<WatchlistEntry> & { migration?: { applied: boolean; reason: string } }> {
+  return fetchJSON(`/api/watchlist/import-legacy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }) })
 }
 
 export function runAiAnalysis(code: string): Promise<unknown> {

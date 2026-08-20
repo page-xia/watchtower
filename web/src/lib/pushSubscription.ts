@@ -1,6 +1,5 @@
-/** 飞书 webhook 信号推送订阅：client_id 本地持久化，订阅状态保存在后端。 */
-
-const CLIENT_ID_KEY = "watchtower.client-id.v1"
+/** 飞书 webhook 信号推送订阅：状态保存在后端。 */
+import { getClientId } from "@/lib/clientIdentity"
 
 export interface PushSubscription {
   client_id: string
@@ -8,21 +7,6 @@ export interface PushSubscription {
   enabled: boolean
   codes: string[]
   updated_at: string
-}
-
-export function getClientId(): string {
-  try {
-    const existing = window.localStorage.getItem(CLIENT_ID_KEY)
-    if (existing && /^[A-Za-z0-9_-]{8,64}$/.test(existing)) return existing
-    const id =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `client-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-    window.localStorage.setItem(CLIENT_ID_KEY, id)
-    return id
-  } catch {
-    return `client-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-  }
 }
 
 async function doFetch<T>(path: string, init?: RequestInit): Promise<T> {

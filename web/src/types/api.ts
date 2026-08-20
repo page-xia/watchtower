@@ -282,6 +282,8 @@ export interface TerminalPayload {
   board_level: number
   board_source: string
   watchlist_codes: string[]
+  personalization_status?: "ready" | "missing_identity" | "unavailable" | string
+  personalization_revision?: number
 }
 
 // ---- 个股详情 ----
