@@ -46,7 +46,7 @@ from app.services import DashboardContext, DashboardService
 from app.storage import AnalysisStore
 from app.trajectory_store import IntradayWatchtowerStore
 from app.principal import Principal
-from app.user_state import PrincipalMutation, PrincipalState, UserStateUnavailable
+from app.user_state import LegacyImportResult, PrincipalMutation, PrincipalState, UserStateUnavailable
 
 
 class MemoryWatchlistStore:
@@ -234,6 +234,38 @@ class MemoryPrincipalStateStore:
         self.states[principal.storage_key] = next_state
         return PrincipalMutation(next_state.revision)
 
+    def import_legacy_watchlist_once(self, principal, items):
+        state = self.get_state(principal)
+        if state.watchlist:
+            return LegacyImportResult(False, "existing_state", state.revision, state.watchlist)
+        imported = list(items)
+        next_state = PrincipalState(state.revision + 1, imported, state.positions)
+        self.states[principal.storage_key] = next_state
+        return LegacyImportResult(True, "applied", next_state.revision, imported)
+
+
+class InterleavingPrincipalStateStore(MemoryPrincipalStateStore):
+    """Commit revision 2 before the revision-1 call returns to its caller."""
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self.first_committed = threading.Event()
+        self.second_committed = threading.Event()
+
+    def upsert_watchlist(self, principal, item, *, expected_revision=None):
+        with self._lock:
+            state = self.get_state(principal)
+            rows = [row for row in state.watchlist if row.code != item.code] + [item]
+            next_state = PrincipalState(state.revision + 1, rows, state.positions)
+            self.states[principal.storage_key] = next_state
+        if next_state.revision == 1:
+            self.first_committed.set()
+            assert self.second_committed.wait(2)
+        else:
+            self.second_committed.set()
+        return PrincipalMutation(next_state.revision, item)
+
 
 class FakeAIClient:
     available = True
@@ -355,6 +387,52 @@ def test_public_activity_score_does_not_change_when_a_user_adds_watchlist(tmp_pa
     assert [(item.code, item.activity_score) for item in public.stock_board.items] == [
         (item.code, item.activity_score) for item in after.stock_board.items
     ]
+
+
+def test_concurrent_principal_mutations_cannot_downgrade_cached_revision(tmp_path) -> None:
+    service = make_principal_service(tmp_path)
+    store = InterleavingPrincipalStateStore()
+    service.user_state_store = store
+    service._principal_state_cache.clear()
+    principal = Principal("anonymous_client", "alice-0001")
+    failures: list[BaseException] = []
+
+    def write(item: WatchlistItem) -> None:
+        try:
+            service.upsert_watchlist(principal, item)
+        except BaseException as exc:  # pragma: no cover - assertion reports worker failures
+            failures.append(exc)
+
+    first = threading.Thread(target=write, args=(WatchlistItem(code="300476", name="胜宏科技"),))
+    second = threading.Thread(target=write, args=(WatchlistItem(code="300308", name="中际旭创"),))
+    first.start()
+    assert store.first_committed.wait(2)
+    second.start()
+    first.join(2)
+    second.join(2)
+
+    assert failures == []
+    state = service._principal_state(principal)
+    assert state.revision == 2
+    assert {item.code for item in state.watchlist} == {"300476", "300308"}
+
+
+def test_principal_state_wrapper_and_legacy_import_use_canonical_repository(tmp_path) -> None:
+    service = make_principal_service(tmp_path)
+    principal = Principal("anonymous_client", "alice-0001")
+
+    missing = service.principal_state(None)
+    result = service.import_legacy_watchlist_once(
+        principal,
+        [WatchlistItem(code="300476", name="胜宏科技")],
+    )
+    state = service.principal_state(principal)
+
+    assert missing.personalization_status == "missing_identity"
+    assert result.applied is True
+    assert result.revision == 1
+    assert state.revision == 1
+    assert [item.code for item in state.watchlist] == ["300476"]
 
 
 def test_watchlist_mutation_publishes_terminal_update(tmp_path) -> None:

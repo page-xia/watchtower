@@ -24,7 +24,7 @@ from app.data_update_buffer import DataUpdateBuffer
 from app.market_schedule import market_refresh_policy
 from app.message_store import MessageStore
 from app.principal import Principal
-from app.user_state import PrincipalState, PrincipalStateRepository, UserStateUnavailable
+from app.user_state import LegacyImportResult, PrincipalState, PrincipalStateRepository, UserStateUnavailable
 from app.user_state_json import JsonPrincipalStateRepository
 from app.user_state_mysql import MySqlPrincipalStateRepository
 from app.webhook_push import SignalPushPool, WebhookSubscriptionStore
@@ -380,7 +380,12 @@ class DashboardService:
     def _empty_principal_state(status: str = "missing_identity") -> PrincipalState:
         return PrincipalState(revision=0, watchlist=[], positions=[], personalization_status=status)
 
-    def _principal_state(self, principal: Principal | None) -> PrincipalState:
+    def _principal_state(
+        self,
+        principal: Principal | None,
+        *,
+        refresh: bool = False,
+    ) -> PrincipalState:
         """Return cached principal state; never fall back to global JSON state."""
         if principal is None:
             if self._legacy_user_state_enabled:
@@ -399,10 +404,11 @@ class DashboardService:
             return self._empty_principal_state("unavailable")
         key = principal.storage_key
         now = time.monotonic()
-        with self._principal_state_cache_lock:
-            cached = self._principal_state_cache.get(key)
-            if cached is not None and now - cached[0] < 30.0:
-                return cached[1]
+        if not refresh:
+            with self._principal_state_cache_lock:
+                cached = self._principal_state_cache.get(key)
+                if cached is not None and now - cached[0] < 30.0:
+                    return cached[1]
         try:
             state = store.get_state(principal)
             if not isinstance(state, PrincipalState):
@@ -426,8 +432,13 @@ class DashboardService:
             logger.warning("principal state read failed (%s): %r", principal.log_digest, exc)
             state = self._empty_principal_state("unavailable")
         with self._principal_state_cache_lock:
+            cached = self._principal_state_cache.get(key)
+            # Concurrent reads/mutations can complete out of order.  A late
+            # revision-1 read must never hide a revision-2 state for 30s.
+            if cached is not None and cached[1].revision > state.revision:
+                return cached[1]
             self._principal_state_cache[key] = (time.monotonic(), state)
-        return state
+            return state
 
     def _principal_payload_cache_key(self, principal: Principal | None) -> str:
         return principal.storage_key if principal is not None else "__public__"
@@ -2090,6 +2101,43 @@ class DashboardService:
             raise ValueError("principal is required")
         return list(self._principal_state(principal).watchlist)
 
+    def principal_state(self, principal: Principal | None) -> PrincipalState:
+        """Expose safe personal-state metadata to HTTP adapters.
+
+        A missing identity is always empty and never consults a legacy global
+        store, even when this service was constructed in compatibility mode.
+        """
+        if principal is None:
+            return self._empty_principal_state()
+        return self._principal_state(principal)
+
+    def import_legacy_watchlist_once(
+        self,
+        principal: Principal,
+        items: list[WatchlistItem],
+    ) -> LegacyImportResult:
+        """Import browser watchlist state through the canonical repository."""
+        if not isinstance(principal, Principal):
+            raise ValueError("principal is required")
+        store = getattr(self, "user_state_store", None)
+        if store is None:
+            raise UserStateUnavailable("principal state store is unavailable")
+        result = store.import_legacy_watchlist_once(principal, items)
+        self._invalidate_principal_state(principal)
+        self._principal_state(principal, refresh=True)
+        self._publish_data_update(
+            "watchlist",
+            "terminal",
+            "detail",
+            reason="legacy_watchlist_import",
+            metadata={
+                "principal": principal.log_digest,
+                "applied": bool(result.applied),
+                "revision": int(result.revision),
+            },
+        )
+        return result
+
     def search_stocks(
         self,
         query: str,
@@ -2186,16 +2234,10 @@ class DashboardService:
         store = getattr(self, "user_state_store", None)
         if store is None:
             raise UserStateUnavailable("principal state store is unavailable")
-        current = self._principal_state(principal)
         mutation = store.upsert_watchlist(principal, item, expected_revision=expected_revision)
         saved = mutation.item if isinstance(mutation.item, WatchlistItem) else item
-        state = PrincipalState(
-            revision=int(mutation.revision),
-            watchlist=[row for row in current.watchlist if row.code != saved.code] + [saved],
-            positions=list(current.positions),
-            personalization_status="ready",
-        )
-        self._invalidate_principal_state(principal, state)
+        self._invalidate_principal_state(principal)
+        self._principal_state(principal, refresh=True)
         self._publish_data_update("watchlist", "terminal", "detail", reason="watchlist_upsert", metadata={"code": saved.code, "principal": principal.log_digest})
         return saved
 
@@ -2211,13 +2253,8 @@ class DashboardService:
                 raise ValueError("code and principal state store are required")
             current = self._principal_state(principal)
             mutation = self.user_state_store.delete_watchlist(principal, code, expected_revision=expected_revision)
-            next_state = PrincipalState(
-                int(mutation.revision),
-                [row for row in current.watchlist if row.code != str(code).zfill(6)],
-                list(current.positions),
-                "ready",
-            )
-            self._invalidate_principal_state(principal, next_state)
+            self._invalidate_principal_state(principal)
+            self._principal_state(principal, refresh=True)
             self._publish_data_update("watchlist", "terminal", "detail", reason="watchlist_delete", metadata={"code": str(code).zfill(6), "principal": principal.log_digest})
             return any(row.code == str(code).zfill(6) for row in current.watchlist)
         if not self._legacy_user_state_enabled:
@@ -2277,14 +2314,10 @@ class DashboardService:
             return saved
         if not isinstance(principal, Principal) or item is None or self.user_state_store is None:
             raise ValueError("principal is required")
-        current = self._principal_state(principal)
         mutation = self.user_state_store.upsert_position(principal, item, expected_revision=expected_revision)
         saved = mutation.item if isinstance(mutation.item, PositionRecord) else item
-        state = PrincipalState(
-            int(mutation.revision), list(current.watchlist),
-            [row for row in current.positions if row.code != saved.code] + [saved], "ready"
-        )
-        self._invalidate_principal_state(principal, state)
+        self._invalidate_principal_state(principal)
+        self._principal_state(principal, refresh=True)
         self._publish_data_update("positions", "terminal", "detail", reason="position_upsert", metadata={"code": saved.code, "principal": principal.log_digest})
         return saved
 
@@ -2301,8 +2334,8 @@ class DashboardService:
             current = self._principal_state(principal)
             mutation = self.user_state_store.delete_position(principal, code, expected_revision=expected_revision)
             normalized = str(code).zfill(6)
-            next_state = PrincipalState(int(mutation.revision), list(current.watchlist), [row for row in current.positions if row.code != normalized], "ready")
-            self._invalidate_principal_state(principal, next_state)
+            self._invalidate_principal_state(principal)
+            self._principal_state(principal, refresh=True)
             self._publish_data_update("positions", "terminal", "detail", reason="position_delete", metadata={"code": normalized, "principal": principal.log_digest})
             return any(row.code == normalized for row in current.positions)
         if not self._legacy_user_state_enabled:
