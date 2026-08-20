@@ -21,6 +21,8 @@ def _payload(price: float = 10.0, amount: float = 1e8, total: int = 5213, update
         "board_level": 3,
         "board_source": "test",
         "watchlist_codes": [],
+        "personalization_status": "ready",
+        "personalization_revision": 1,
         "stock_board": {
             "scope": "full_market",
             "selected_sector": None,
@@ -92,3 +94,23 @@ def test_meta_only_change() -> None:
     assert message is not None
     assert message["sections"]["meta"]["data_mode"] == "close_snapshot"
     assert "board" not in message["sections"]
+
+
+def test_personalization_revision_change_is_a_meta_delta() -> None:
+    tracker = TerminalDeltaTracker()
+    tracker.next_message(_payload())
+    payload = _payload()
+    payload["personalization_revision"] = 2
+    message = tracker.next_message(payload)
+    assert message is not None
+    assert message["sections"]["meta"] == {
+        "data_mode": "live",
+        "source_status": {"updated_at": "09:31:00"},
+        "selected_sector": None,
+        "sector_focus": None,
+        "board_level": 3,
+        "board_source": "test",
+        "watchlist_codes": [],
+        "personalization_status": "ready",
+        "personalization_revision": 2,
+    }

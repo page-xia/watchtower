@@ -654,7 +654,7 @@ def test_terminal_stream_forwards_current_page(monkeypatch) -> None:
     assert calls[0]["fast"] is True
 
 
-def test_terminal_stream_forwards_client_watchlist_codes(monkeypatch) -> None:
+def test_terminal_stream_uses_client_principal_not_watchlist_codes(monkeypatch) -> None:
     client = TestClient(app)
     calls: list[dict] = []
 
@@ -683,11 +683,14 @@ def test_terminal_stream_forwards_client_watchlist_codes(monkeypatch) -> None:
 
     monkeypatch.setattr(main_module, "service", FakeService())
 
-    with client.websocket_connect("/ws/stream?view=terminal&fast=1&page_size=20&watchlist_codes=300476,000001") as websocket:
+    with client.websocket_connect(
+        "/ws/stream?view=terminal&fast=1&page_size=20&client_id=client-api-0001&watchlist_codes=300476,000001"
+    ) as websocket:
         payload = websocket.receive_json()
 
-    assert payload["watchlist_codes"] == ["300476", "000001"]
-    assert [item.code for item in calls[0]["client_watchlist"]] == ["300476", "000001"]
+    assert payload["watchlist_codes"] == []
+    assert "client_watchlist" not in calls[0]
+    assert calls[0]["principal"].id == "client-api-0001"
 
 
 def test_stock_board_endpoint_keeps_sector_paging_contract() -> None:

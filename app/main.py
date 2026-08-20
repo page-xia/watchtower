@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from app.data_sources import china_now, is_trading_window, market_session, normalize_board_level
 from app.config import ROOT_DIR, settings
+from app.data_update_buffer import DataUpdateBuffer
 from app.market_schedule import market_refresh_policy
 from app.live_delta import PayloadDeltaTracker
 from app.message_store import MessageStoreError
@@ -40,10 +41,12 @@ from app.webhook_push import WebhookSubscription
 
 WEB_DIST_DIR = ROOT_DIR / "web" / "dist"
 
+data_update_buffer = DataUpdateBuffer()
 stream_hub = StreamHub(
     queue_size=settings.stream_queue_size,
     channel_idle_seconds=settings.stream_channel_idle_seconds,
     max_channels=settings.stream_max_channels,
+    update_buffer=data_update_buffer,
 )
 
 
@@ -127,7 +130,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 if (WEB_DIST_DIR / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=WEB_DIST_DIR / "assets"), name="assets")
 
-service = DashboardService(settings)
+service = DashboardService(settings, data_update_buffer=data_update_buffer)
 
 
 _COMPACT_REPLAY_POINT_FIELDS = {
@@ -317,25 +320,6 @@ def _parse_watchlist_codes(raw: str | None) -> tuple[str, ...]:
         seen.add(code)
         codes.append(code)
     return tuple(codes)
-
-
-def _client_watchlist_from_codes(codes: tuple[str, ...]) -> list[WatchlistItem]:
-    return [
-        WatchlistItem(code=code, name="", themes=[], core=False, position=False, notes="")
-        for code in codes
-    ]
-
-
-def _client_watchlist_kwargs(raw: str | None) -> dict[str, list[WatchlistItem]]:
-    if raw is None:
-        return {}
-    return {"client_watchlist": _client_watchlist_from_codes(_parse_watchlist_codes(raw))}
-
-
-def _stream_client_watchlist_kwargs(params: StreamParams) -> dict[str, list[WatchlistItem]]:
-    if not params.watchlist_codes_provided:
-        return {}
-    return {"client_watchlist": _client_watchlist_from_codes(params.watchlist_codes)}
 
 
 def read_principal(
@@ -945,7 +929,12 @@ def analyze_watchlist_item(code: str, sector: str | None = None, trade_date: str
 @app.websocket("/ws/stream")
 async def stream(websocket: WebSocket) -> None:
     await websocket.accept()
-    params = _stream_params(websocket)
+    try:
+        params = _stream_params(websocket)
+    except PrincipalValidationError as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=1008)
+        return
     if not _stream_refresh_policy()["should_stream"]:
         await _stream_send_once_and_close(websocket, params)
         return
@@ -1035,6 +1024,16 @@ async def live_stream(websocket: WebSocket) -> None:
         await asyncio.gather(task, return_exceptions=True)
 
     async def replace_subscription(channel: str, params: dict) -> None:
+        try:
+            _live_principal(params)
+        except PrincipalValidationError as exc:
+            await outgoing.put(
+                json.dumps(
+                    {"type": "error", "channel": channel, "message": str(exc)},
+                    ensure_ascii=False,
+                )
+            )
+            return
         current = subscriptions.pop(channel, None)
         if current is not None:
             sub, task, _ = current
@@ -1101,7 +1100,7 @@ async def live_stream(websocket: WebSocket) -> None:
                     await cancel_task(current[1])
             elif kind == "refresh":
                 if channel in subscriptions:
-                    await replace_subscription(channel, subscriptions[channel][2])
+                    stream_hub.refresh(subscriptions[channel][0])
             else:
                 await outgoing.put(
                     json.dumps(
@@ -1131,8 +1130,8 @@ class StreamParams(NamedTuple):
     page_size: int
     near_trend: bool
     pin_buy: bool
-    watchlist_codes: tuple[str, ...]
-    watchlist_codes_provided: bool
+    client_id: str | None
+    principal: Principal | None
 
 
 def _stream_params(websocket: WebSocket) -> StreamParams:
@@ -1157,8 +1156,8 @@ def _stream_params(websocket: WebSocket) -> StreamParams:
         page_size = int(websocket.query_params.get("page_size", "80"))
     except ValueError:
         page_size = 80
-    watchlist_codes_provided = "watchlist_codes" in websocket.query_params
-    watchlist_codes = _parse_watchlist_codes(websocket.query_params.get("watchlist_codes"))
+    client_id = websocket.query_params.get("client_id")
+    principal = _live_principal({"client_id": client_id})
     return StreamParams(
         sector=sector,
         view=view,
@@ -1170,8 +1169,8 @@ def _stream_params(websocket: WebSocket) -> StreamParams:
         page_size=page_size,
         near_trend=near_trend,
         pin_buy=pin_buy,
-        watchlist_codes=watchlist_codes,
-        watchlist_codes_provided=watchlist_codes_provided,
+        client_id=principal.id if principal is not None else None,
+        principal=principal,
     )
 
 
@@ -1194,8 +1193,7 @@ def _stream_channel_key(params: StreamParams) -> tuple:
         bool(params.fast),
         bool(params.near_trend),
         bool(params.pin_buy),
-        bool(params.watchlist_codes_provided),
-        params.watchlist_codes,
+        params.principal.storage_key if params.principal is not None else "",
     )
 
 
@@ -1234,7 +1232,7 @@ async def _stream_send_once_and_close(websocket: WebSocket, params: StreamParams
                 fast=params.fast,
                 near_trend=params.near_trend,
                 pin_buy=params.pin_buy,
-                **_stream_client_watchlist_kwargs(params),
+                **_principal_kwargs(params.principal),
             ).model_dump(mode="json")
 
         payload = await asyncio.to_thread(build_terminal_payload)
@@ -1268,7 +1266,7 @@ async def _stream_send_once_and_close(websocket: WebSocket, params: StreamParams
             await asyncio.to_thread(
                 service.dashboard,
                 sector=params.sector,
-                **_stream_client_watchlist_kwargs(params),
+                **_principal_kwargs(params.principal),
             )
         ).model_dump(mode="json")
         await websocket.send_json(payload)
@@ -1314,6 +1312,8 @@ def _terminal_payload_key(payload: dict) -> str:
             str(payload.get("stock_board", {}).get("total", "")),
             str(payload.get("selected_sector", "")),
             str(payload.get("board_level", "")),
+            str(payload.get("personalization_status", "")),
+            str(payload.get("personalization_revision", "")),
             board_signature,
             sector_flow_signature,
             watch_signature,
@@ -1341,7 +1341,7 @@ def _stream_channel_spec(params: StreamParams) -> ChannelSpec:
                     fast=params.fast,
                     near_trend=params.near_trend,
                     pin_buy=params.pin_buy,
-                    **_stream_client_watchlist_kwargs(params),
+                    **_principal_kwargs(params.principal),
                 )
             ).model_dump(mode="json")
             if tracker is not None:
@@ -1358,7 +1358,22 @@ def _stream_channel_spec(params: StreamParams) -> ChannelSpec:
                 return json.dumps({"type": "snapshot", "seq": tracker.seq, "data": payload})
             return json.dumps(payload)
 
-        return ChannelSpec(build=build_terminal, snapshot_text=terminal_snapshot, interval=_stream_interval)
+        return ChannelSpec(
+            build=build_terminal,
+            snapshot_text=terminal_snapshot,
+            interval=_stream_interval,
+            interests=frozenset(
+                {
+                    "terminal",
+                    "market",
+                    "sectors",
+                    "sector_flow",
+                    "watchlist",
+                    "positions",
+                    "mini_chart",
+                }
+            ),
+        )
 
     last_key = ""
 
@@ -1368,10 +1383,16 @@ def _stream_channel_spec(params: StreamParams) -> ChannelSpec:
             await asyncio.to_thread(
                 service.dashboard,
                 sector=params.sector,
-                **_stream_client_watchlist_kwargs(params),
+                **_principal_kwargs(params.principal),
             )
         ).model_dump(mode="json")
-        key = str(payload.get("source_status", {}).get("updated_at", ""))
+        key = "|".join(
+            [
+                str(payload.get("source_status", {}).get("updated_at", "")),
+                str(payload.get("personalization_status", "")),
+                str(payload.get("personalization_revision", "")),
+            ]
+        )
         if key == last_key:
             return payload, None
         last_key = key
@@ -1381,6 +1402,7 @@ def _stream_channel_spec(params: StreamParams) -> ChannelSpec:
         build=build_dashboard,
         snapshot_text=lambda payload: json.dumps(payload),
         interval=_stream_interval,
+        interests=frozenset({"terminal", "market", "sectors", "sector_flow", "watchlist", "positions"}),
     )
 
 
@@ -1415,16 +1437,17 @@ def _live_str(params: dict, key: str) -> str | None:
     return str(value) if value is not None else None
 
 
-def _live_watchlist_codes(params: dict) -> tuple[str, ...]:
-    value = params.get("watchlist_codes")
-    if isinstance(value, list):
-        return _parse_watchlist_codes(",".join(str(item) for item in value))
-    if value is None:
-        return ()
-    return _parse_watchlist_codes(str(value))
+def _live_principal(params: dict) -> Principal | None:
+    """Validate the optional subscription identity without accepting body ownership."""
+
+    raw_client_id = params.get("client_id")
+    if raw_client_id is None:
+        return None
+    return principal_from_client_id(raw_client_id)
 
 
 def _live_terminal_params(params: dict) -> StreamParams:
+    principal = _live_principal(params)
     return StreamParams(
         sector=_live_str(params, "sector"),
         view="terminal",
@@ -1436,13 +1459,15 @@ def _live_terminal_params(params: dict) -> StreamParams:
         page_size=_live_int(params, "pageSize", 40),
         near_trend=bool(params.get("nearTrend", False)),
         pin_buy=bool(params.get("pinBuy", False)),
-        watchlist_codes=_live_watchlist_codes(params),
-        watchlist_codes_provided="watchlist_codes" in params,
+        client_id=principal.id if principal is not None else None,
+        principal=principal,
     )
 
 
 def _live_channel_key(channel: str, params: dict) -> tuple:
     """Namespace live channels so they never reuse legacy /ws/stream specs."""
+    principal = _live_principal(params)
+    principal_key = principal.storage_key if principal is not None else ""
     if channel == "terminal":
         return ("live", "terminal", *_stream_channel_key(_live_terminal_params(params)))
     if channel == "index_minutes":
@@ -1462,7 +1487,6 @@ def _live_channel_key(channel: str, params: dict) -> tuple:
             max(1.0, _live_float(params, "intervalSeconds", 60.0)),
         )
 
-    watchlist = _live_watchlist_codes(params)
     return (
         "live",
         channel,
@@ -1470,7 +1494,7 @@ def _live_channel_key(channel: str, params: dict) -> tuple:
         _live_str(params, "sector") or "",
         _live_str(params, "trade_date") or "",
         _live_int(params, "count", 240),
-        watchlist,
+        principal_key,
     )
 
 
@@ -1493,6 +1517,7 @@ def _wrap_live_channel_spec(channel: str, spec: ChannelSpec) -> ChannelSpec:
         build=build,
         snapshot_text=lambda payload: encode(spec.snapshot_text(payload)),
         interval=spec.interval,
+        interests=spec.interests,
     )
 
 
@@ -1501,6 +1526,7 @@ def _live_channel_spec(channel: str, params: dict) -> ChannelSpec:
         return _wrap_live_channel_spec("terminal", _stream_channel_spec(_live_terminal_params(params)))
 
     tracker = PayloadDeltaTracker()
+    principal = _live_principal(params)
 
     def encode(message: dict | None) -> str | None:
         if message is None:
@@ -1513,12 +1539,14 @@ def _live_channel_spec(channel: str, params: dict) -> ChannelSpec:
 
     if channel == "index_minutes":
         interval = 10.0
+        interests = frozenset({"index_minutes", "market"})
 
         def build_payload() -> dict:
             return service.index_minutes(trade_date=_live_str(params, "trade_date"))
 
     elif channel == "dark_pool":
         interval = 60.0
+        interests = frozenset({"dark_pool"})
 
         def build_payload() -> dict:
             return service.dark_pool_payload(
@@ -1528,46 +1556,31 @@ def _live_channel_spec(channel: str, params: dict) -> ChannelSpec:
 
     elif channel == "detail_chart":
         interval = 10.0
-        watchlist_raw = params.get("watchlist_codes")
-        watchlist_arg = (
-            ",".join(str(item) for item in watchlist_raw)
-            if isinstance(watchlist_raw, list)
-            else (None if watchlist_raw is None else str(watchlist_raw))
-        )
+        interests = frozenset({"detail", "market", "mini_chart", "watchlist", "positions"})
 
         def build_payload() -> dict:
             return service.signal_detail_chart(
                 str(params.get("code") or ""),
                 sector=_live_str(params, "sector"),
                 trade_date=_live_str(params, "trade_date"),
-                **_client_watchlist_kwargs(watchlist_arg),
+                principal=principal,
             ).model_dump(mode="json")
 
     elif channel == "detail_overlay":
         interval = 10.0
-        watchlist_raw = params.get("watchlist_codes")
-        watchlist_arg = (
-            ",".join(str(item) for item in watchlist_raw)
-            if isinstance(watchlist_raw, list)
-            else (None if watchlist_raw is None else str(watchlist_raw))
-        )
+        interests = frozenset({"detail", "market", "mini_chart", "watchlist", "positions"})
 
         def build_payload() -> dict:
             return service.signal_detail_overlay(
                 str(params.get("code") or ""),
                 sector=_live_str(params, "sector"),
                 trade_date=_live_str(params, "trade_date"),
-                **_client_watchlist_kwargs(watchlist_arg),
+                principal=principal,
             ).model_dump(mode="json")
 
     elif channel == "detail_daily":
         interval = 30.0
-        watchlist_raw = params.get("watchlist_codes")
-        watchlist_arg = (
-            ",".join(str(item) for item in watchlist_raw)
-            if isinstance(watchlist_raw, list)
-            else (None if watchlist_raw is None else str(watchlist_raw))
-        )
+        interests = frozenset({"detail", "market", "mini_chart", "watchlist", "positions"})
 
         def build_payload() -> dict:
             return service.signal_detail_daily(
@@ -1575,11 +1588,12 @@ def _live_channel_spec(channel: str, params: dict) -> ChannelSpec:
                 sector=_live_str(params, "sector"),
                 trade_date=_live_str(params, "trade_date"),
                 count=_live_int(params, "count", 240),
-                **_client_watchlist_kwargs(watchlist_arg),
+                principal=principal,
             )
 
     elif channel == "dark_pool_stock":
         interval = max(1.0, _live_float(params, "intervalSeconds", 60.0))
+        interests = frozenset({"dark_pool"})
 
         def build_payload() -> dict:
             return service.dark_pool_stock_payload(str(params.get("code") or ""))
@@ -1596,6 +1610,7 @@ def _live_channel_spec(channel: str, params: dict) -> ChannelSpec:
         build=build,
         snapshot_text=lambda payload: encode(tracker.snapshot_message(payload)),
         interval=lambda: interval,
+        interests=interests,
     )
 
 
@@ -1621,7 +1636,7 @@ async def _stream_legacy(websocket: WebSocket, params: StreamParams) -> None:
                     fast=params.fast,
                     near_trend=params.near_trend,
                     pin_buy=params.pin_buy,
-                    **_stream_client_watchlist_kwargs(params),
+                    **_principal_kwargs(params.principal),
                 )
                 payload = payload_model.model_dump(mode="json")
                 if tracker is not None:
@@ -1637,10 +1652,16 @@ async def _stream_legacy(websocket: WebSocket, params: StreamParams) -> None:
                     await asyncio.to_thread(
                         service.dashboard,
                         sector=params.sector,
-                        **_stream_client_watchlist_kwargs(params),
+                        **_principal_kwargs(params.principal),
                     )
                 ).model_dump(mode="json")
-                payload_key = str(payload.get("source_status", {}).get("updated_at", ""))
+                payload_key = "|".join(
+                    [
+                        str(payload.get("source_status", {}).get("updated_at", "")),
+                        str(payload.get("personalization_status", "")),
+                        str(payload.get("personalization_revision", "")),
+                    ]
+                )
             if payload_key != last_payload_key:
                 await websocket.send_json(payload)
                 last_payload_key = payload_key

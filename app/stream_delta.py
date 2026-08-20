@@ -36,6 +36,8 @@ _META_FIELDS = (
     "board_level",
     "board_source",
     "watchlist_codes",
+    "personalization_status",
+    "personalization_revision",
 )
 
 _BOARD_META_FIELDS = (
